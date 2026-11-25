@@ -223,7 +223,7 @@ def select_role(
     role = spec["roles"][role_key]
     enabled = _refs(role["allowed_tools"], ceiling=_READ_TOOL_CEILINGS[role_key])
     if role_key == "specialist":
-        enabled = _refs(role["specialties"][specialty],
+        enabled &= _refs(role["specialties"][specialty],
                         ceiling=_SPECIALTY_CEILINGS[specialty])
     if task_kind is not None:
         enabled &= _refs(spec["task_kinds"][task_kind], ceiling=_TASK_CEILINGS[task_kind])

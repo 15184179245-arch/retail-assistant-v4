@@ -305,6 +305,38 @@ def _unavailable(status: str) -> dict:
             "citations": []}
 
 
+def _own_citations(own, evidence, citations):
+    # Only a historical null predates the per-answer display distinction.
+    if own is None:
+        return citations
+    if type(own) is not list or len(own) > MAX_EVIDENCE:
+        return []
+    own_refs = {tuple(sorted(reference.items())) for reference in own
+                if _reference_shape(reference)}
+    if not own_refs:
+        return []
+
+    # validate_evidence emits one citation per source in this same list order.
+    sources = [reference for reference in evidence
+               if reference["kind"] not in ("permission", "message")]
+    if len(sources) != len(citations):
+        return []
+    shown = []
+    for reference, citation in zip(sources, citations):
+        kind = reference["kind"]
+        version_ref = (reference["snapshot_id"] if kind == "catalog"
+                       else reference["revision_id"] if kind == "knowledge"
+                       else str(reference["version"]) if kind in ("memory", "memory_change")
+                       else reference["sha256"])
+        expected = ("memory" if kind == "memory_change" else kind, reference["id"], version_ref)
+        if type(citation) is not dict or (citation.get("kind"), citation.get("object_id"),
+                                          citation.get("version_ref")) != expected:
+            return []
+        if tuple(sorted(reference.items())) in own_refs:
+            shown.append(citation)
+    return shown
+
+
 def read_answer(session: Session, actor: AuthenticatedSubject, run: AgentRun) -> dict:
     """Caller checks agents.run; this read additionally checks every source."""
     session.flush()
@@ -324,27 +356,11 @@ def read_answer(session: Session, actor: AuthenticatedSubject, run: AgentRun) ->
             or conversation is None or conversation.subject_id != actor.subject_id
             or conversation.status != "active"):
         return _unavailable("unavailable")
-    valid, citations = validate_evidence(session, actor, receipt.evidence)
+    evidence, own = receipt.evidence, receipt.own_evidence
+    valid, citations = validate_evidence(session, actor, evidence)
     if (not valid or message.state != "active" or conversation.status != "active"):
         return _unavailable("unavailable")
-    # Display what this answer actually saw: receipts written with own_evidence
-    # show only the sources captured from this run's tool calls, while the full
-    # evidence list above still decides availability (fail-closed, unchanged).
-    own = receipt.own_evidence
-    if isinstance(own, list):
-        identities = set()
-        for reference in own:
-            if not isinstance(reference, dict):
-                continue
-            if reference.get("kind") not in ("catalog", "knowledge", "memory", "memory_change", "guanjia_observation", "guanjia_category", "guanjia_sales_ranking", "research"):
-                continue
-            version_ref = (str(reference['version']) if reference['kind'] in ('memory', 'memory_change')
-                           else reference.get("snapshot_id") or reference.get("revision_id") or reference.get('sha256'))
-            if version_ref:
-                identities.add(("memory" if reference["kind"] == "memory_change" else reference["kind"], reference["id"], version_ref))
-        own_citations = [c for c in citations
-                         if (c["kind"], c["object_id"], c["version_ref"]) in identities]
-        citations = own_citations
+    citations = _own_citations(own, evidence, citations)
     return {"answer": message.content, "answer_status": "available",
             "answer_unavailable_reason": None, "citations": citations}
 

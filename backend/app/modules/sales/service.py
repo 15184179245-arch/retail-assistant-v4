@@ -368,6 +368,12 @@ def _receipt_response(receipt: SalesReceipt) -> HandoffOut:
     )
 
 
+def _receipt_terminal(draft: SalesDraft, handoff: SalesHandoff) -> bool:
+    # Older reconciliation could demote a confirmed handoff without unpaying
+    # the draft. The paid fact still forbids any fresh settlement in that state.
+    return draft.status == "paid" or handoff.handoff_state in ("confirmed", "failed")
+
+
 def record_receipt(session: Session, actor: AuthenticatedSubject, handoff_id: str,
                    payload: ReceiptCreate, *, idempotency_key: str,
                    receipt_source: str = "manual",
@@ -407,7 +413,7 @@ def record_receipt(session: Session, actor: AuthenticatedSubject, handoff_id: st
         if replay.handoff_id != handoff.id or replay.digest != digest:
             raise SalesError("sales_idempotency_conflict")
         return _receipt_response(replay)
-    if handoff.handoff_state in ("confirmed", "failed"):
+    if _receipt_terminal(draft, handoff):
         raise SalesError("sales_receipt_conflict")
     receipt = SalesReceipt(
         id=str(uuid4()), organization_id=actor.organization_id, store_id=actor.store_id,

@@ -327,6 +327,17 @@ def _aggregate(batch, rows, now):
     batch.version += 1
 
 
+def _readback_observation_keys(evidence):
+    """Use canonical line order only for lookup; keep the original evidence bytes."""
+    legacy_key = "receipt:" + canonical_digest(evidence)
+    lines = evidence.get("lines", [])
+    ordered = sorted(lines, key=lambda line: line["line_no"])
+    if ordered == lines:
+        return (legacy_key,)
+    canonical_key = "receipt:" + canonical_digest({**evidence, "lines": ordered})
+    return canonical_key, legacy_key
+
+
 def apply_readback(db, actor, snapshot, receipt):
     now = _guard(db, actor, "erp.sandbox.reconcile")
     batch = _batch(db, actor, snapshot.batch_id)
@@ -356,9 +367,11 @@ def apply_readback(db, actor, snapshot, receipt):
                 _fail("erp_sandbox_receipt_invalid")
         # Authentication nonce/signature vary for each GET; persist only business facts.
         evidence = receipt.model_dump(exclude={"nonce", "signature"})
-    evidence_key = "receipt:" + canonical_digest(evidence)
+    evidence_keys = _readback_observation_keys(evidence)
+    evidence_key = evidence_keys[0]
     existing = db.scalar(select(ERPSandboxObservation.id).where(*_scope(ERPSandboxObservation, actor),
-        ERPSandboxObservation.batch_id == batch.id, ERPSandboxObservation.observation_key == evidence_key))
+        ERPSandboxObservation.batch_id == batch.id, ERPSandboxObservation.observation_key.in_(evidence_keys))
+        .limit(1))
     if existing is not None:
         return _receipt(db, actor, batch, rows, replayed=True)
     for line in rows:

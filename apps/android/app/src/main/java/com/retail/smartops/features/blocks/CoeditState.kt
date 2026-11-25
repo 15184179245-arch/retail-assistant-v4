@@ -36,10 +36,19 @@ data class CommandConfirmModel(
     val outcome: L2ConfirmationResult? = null,
 )
 
+/** A locally witnessed field state. A missing map entry is not a witnessed absence. */
+sealed interface CoeditBeforeValue {
+    data object Absent : CoeditBeforeValue
+    data class Present(val value: Any?) : CoeditBeforeValue
+}
+
+private fun Map<String, Any?>.fieldPresence(field: String): CoeditBeforeValue =
+    if (containsKey(field)) CoeditBeforeValue.Present(this[field]) else CoeditBeforeValue.Absent
+
 data class ArtifactCoeditUiState(
     val artifact: WorkspaceArtifact,
     val opsHistory: List<ArtifactOpRecord> = emptyList(),
-    val previousValuesByOp: Map<String, Map<String, Any?>> = emptyMap(),
+    val previousValuesByOp: Map<String, Map<String, CoeditBeforeValue>> = emptyMap(),
     val partialUndoNotice: String? = null,
     val conflictNotice: String? = null,
     val activeEditorNotice: String? = null,
@@ -65,9 +74,11 @@ object ArtifactCoeditEngine {
     ): ArtifactCoeditUiState = ArtifactCoeditUiState(
         artifact = artifact,
         opsHistory = if (ops.isNotEmpty()) ops else listOfNotNull(artifact.lastOp),
-        partialUndoNotice = artifact.skippedFields.takeIf { it.isNotEmpty() }?.let {
-            "${it.size} 个字段已被人工修改，未撤销"
-        },
+        partialUndoNotice = artifact.lastOp
+            ?.takeIf { it.opType == "undo" && it.artifactId == artifact.id &&
+                it.versionAfter == artifact.version && !it.undoOfOpId.isNullOrBlank() }
+            ?.skippedFields?.takeIf { it.isNotEmpty() }
+            ?.let { "${it.size} 个字段已被人工修改，未撤销" },
         activeEditorNotice = artifact.activeEditorNotice,
     )
 
@@ -79,7 +90,7 @@ object ArtifactCoeditEngine {
         opId: String = "op-${state.opsHistory.size + 1}",
     ): ArtifactCoeditUiState {
         val current = state.artifact
-        val prevMap = mapOf(field to current.payload[field])
+        val prevMap = mapOf(field to current.payload.fieldPresence(field))
         val nextPayload = current.payload.toMutableMap().apply { put(field, newValue) }
         val nextLocks = (current.lockedFields + field).distinct()
         val nextAiFields = current.aiModifiedFields.filterNot { it == field }
@@ -119,7 +130,7 @@ object ArtifactCoeditEngine {
     ): ArtifactCoeditUiState {
         val current = state.artifact
         val nextPayload = current.payload.toMutableMap()
-        val prevValues = linkedMapOf<String, Any?>()
+        val prevValues = linkedMapOf<String, CoeditBeforeValue>()
         val appliedPatch = linkedMapOf<String, Any?>()
         val addedAiFields = mutableListOf<String>()
         val nextSuggestions = current.pendingSuggestions.toMutableList()
@@ -137,7 +148,7 @@ object ArtifactCoeditEngine {
                     ),
                 )
             } else {
-                prevValues[field] = current.payload[field]
+                prevValues[field] = current.payload.fieldPresence(field)
                 nextPayload[field] = value
                 appliedPatch[field] = value
                 addedAiFields.add(field)
@@ -237,7 +248,7 @@ object ArtifactCoeditEngine {
         val suggestion = current.pendingSuggestions.firstOrNull {
             it.field == field && (opId.isBlank() || it.opId == opId)
         } ?: return state
-        val prevMap = mapOf(field to current.payload[field])
+        val prevMap = mapOf(field to current.payload.fieldPresence(field))
         val nextPayload = current.payload.toMutableMap().apply { put(field, suggestion.suggestedValue) }
         val newOpId = "op-${state.opsHistory.size + 1}"
         val op = ArtifactOpRecord(
@@ -315,31 +326,48 @@ object ArtifactCoeditEngine {
         val nextPayload = current.payload.toMutableMap()
         val revertedFields = mutableListOf<String>()
         val skippedFields = mutableListOf<String>()
+        var blockedByLaterEdit = 0
+        var missingBeforeValue = 0
 
         for (field in targetOp.patch.keys) {
+            val beforeValue = prevValues[field]
             val touchedLaterByOther = laterOps.any { later ->
                 later.opType in setOf("patch", "accept_suggestion") &&
                     later.patch.containsKey(field) &&
                     later.actorType != targetOp.actorType
             }
             val humanLockedAfterAi = targetOp.actorType == "agent" && field in current.lockedFields
-            if (touchedLaterByOther || humanLockedAfterAi) {
-                skippedFields.add(field)
-            } else {
-                if (prevValues.containsKey(field)) {
-                    val oldVal = prevValues[field]
-                    if (oldVal == null) nextPayload.remove(field) else nextPayload[field] = oldVal
+            when {
+                touchedLaterByOther || humanLockedAfterAi -> {
+                    skippedFields.add(field)
+                    blockedByLaterEdit++
                 }
-                revertedFields.add(field)
+                beforeValue == null -> {
+                    skippedFields.add(field)
+                    missingBeforeValue++
+                }
+                beforeValue != current.payload.fieldPresence(field) -> {
+                    when (beforeValue) {
+                        CoeditBeforeValue.Absent -> nextPayload.remove(field)
+                        is CoeditBeforeValue.Present -> nextPayload[field] = beforeValue.value
+                    }
+                    revertedFields.add(field)
+                }
             }
         }
 
-        val notice = when {
-            skippedFields.isNotEmpty() && targetOp.actorType == "agent" ->
-                "${skippedFields.size} 个字段已被人工修改，未撤销"
-            skippedFields.isNotEmpty() ->
-                "${skippedFields.size} 个字段已被后续操作修改，未撤销"
-            else -> null
+        val notice = buildList {
+            if (blockedByLaterEdit > 0) {
+                val actor = if (targetOp.actorType == "agent") "人工" else "后续操作"
+                add("$blockedByLaterEdit 个字段已被${actor}修改，未撤销")
+            }
+            if (missingBeforeValue > 0) {
+                add("$missingBeforeValue 个字段无法核对原值，未撤销；请联网核对后再试")
+            }
+        }.joinToString("；").takeIf { it.isNotEmpty() }
+        // A completed local undo requires an actual payload change, not just an attempt.
+        if (revertedFields.isEmpty()) {
+            return if (notice == null) state else state.copy(partialUndoNotice = notice)
         }
 
         val nextAiFields = current.aiModifiedFields.filterNot { it in revertedFields }

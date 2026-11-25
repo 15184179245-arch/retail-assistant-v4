@@ -206,6 +206,10 @@ PI_SOURCE_ONLINE_PROTOCOL = 'v4.pi-source/2'
 PI_SOURCE_ONLINE_PROFILE = 'pi-source-online-v1'
 PI_SOURCE_PROFILE = 'pi-source-v1'
 PI_SOURCE_NAMES = PI_DISCOVERY_NAMES | frozenset({'v4_guanjia_read_prices_v1', 'v4_guanjia_read_stock_v1', 'v4_guanjia_sales_ranking_v1', 'v4_guanjia_sales_ranking_v2', 'v4_guanjia_local_sales_v1','v4_guanjia_category_discovery_v1','v4_guanjia_category_products_v1','v4_guanjia_category_products_status_v1', 'v4_research_search_v1', 'v4_research_read_v1', 'v4_research_describe_v1', 'v4_research_propose_v1', 'v4_research_probe_v1'})
+PI_WORKBENCH_ONLINE_PROTOCOL = 'v4.pi-workbench/2'
+PI_WORKBENCH_PROFILE = 'pi-workbench-v1'
+PI_WORKBENCH_ONLINE_PROFILE = 'pi-workbench-online-v1'
+PI_WORKBENCH_NAMES = PI_SOURCE_NAMES | frozenset('v4_artifact_' + op + '_v1' for op in ('read', 'create', 'patch'))
 PI_PURPOSES = frozenset(("inference", "retry", "compaction"))
 
 
@@ -217,8 +221,8 @@ def _pi_digest(value, *, prefixed=False):
         fail("digest")
 
 
-def _pi_name_version(name, version, memory=False, discovery=False, source=False):
-    if type(name) is not str or name not in (PI_SOURCE_NAMES if source else PI_DISCOVERY_NAMES if discovery else PI_MEMORY_NAMES if memory else PI_NAMES) or version != ("3" if name == "v4_guanjia_local_sales_v1" else "2" if name == "v4_guanjia_sales_ranking_v2" else "1"):
+def _pi_name_version(name, version, memory=False, discovery=False, source=False, workbench=False):
+    if type(name) is not str or name not in (PI_WORKBENCH_NAMES if workbench else PI_SOURCE_NAMES if source else PI_DISCOVERY_NAMES if discovery else PI_MEMORY_NAMES if memory else PI_NAMES) or version != ("3" if name == "v4_guanjia_local_sales_v1" else "2" if name == "v4_guanjia_sales_ranking_v2" else "1"):
         fail("tool_profile")
 
 
@@ -228,7 +232,9 @@ def _pi_native_id(value):
         fail("native_call_id")
 
 
-def _validate_pi_wire(frame, online=False, memory=False, discovery=False, source=False):
+def _validate_pi_wire(frame, online=False, memory=False, discovery=False, source=False, workbench=False):
+    if workbench and not (online and memory and discovery and source):
+        fail("tool_profile")
     if source and (not discovery or not memory):
         fail('tool_profile')
     protocol = (PI_MEMORY_ONLINE_PROTOCOL if online else PI_MEMORY_PROTOCOL) if memory else (PI_ONLINE_PROTOCOL if online else PI_PROTOCOL)
@@ -242,7 +248,9 @@ def _validate_pi_wire(frame, online=False, memory=False, discovery=False, source
         protocol = PI_SOURCE_ONLINE_PROTOCOL if online else PI_SOURCE_PROTOCOL
         profile = PI_SOURCE_PROFILE
         hello_profile = PI_SOURCE_ONLINE_PROFILE if online else PI_SOURCE_PROFILE
-    names = PI_SOURCE_NAMES if source else PI_DISCOVERY_NAMES if discovery else PI_MEMORY_NAMES if memory else PI_NAMES
+    if workbench:
+        protocol, profile, hello_profile = PI_WORKBENCH_ONLINE_PROTOCOL, PI_WORKBENCH_PROFILE, PI_WORKBENCH_ONLINE_PROFILE
+    names = PI_WORKBENCH_NAMES if workbench else PI_SOURCE_NAMES if source else PI_DISCOVERY_NAMES if discovery else PI_MEMORY_NAMES if memory else PI_NAMES
     exact(frame, {"protocol", "nonce", "run_id", "epoch", "seq", "type", "reply_to", "body"})
     if frame["protocol"] != protocol:
         fail("protocol")
@@ -284,7 +292,7 @@ def _validate_pi_wire(frame, online=False, memory=False, discovery=False, source
         seen = set()
         for tool in body["tools"]:
             exact(tool, {"name", "version", "description", "parameters"})
-            _pi_name_version(tool["name"], tool["version"], memory, discovery, source)
+            _pi_name_version(tool["name"], tool["version"], memory, discovery, source, workbench)
             if (tool["name"] in seen or type(tool["description"]) is not str
                     or type(tool["parameters"]) is not dict):
                 fail("tool_profile")
@@ -325,7 +333,7 @@ def _validate_pi_wire(frame, online=False, memory=False, discovery=False, source
                     or any(type(name) is not str or name not in names - {'tool_search'} for name in args['selection'])):
                 fail('tool_profile')
             _pi_native_id(args["call_id"])
-            _pi_name_version(args["name"], args["version"], memory, discovery, source)
+            _pi_name_version(args["name"], args["version"], memory, discovery, source, workbench)
             _pi_digest(args["toolset_version"], prefixed=True)
             if type(args["arguments"]) is not dict:
                 fail("arguments")
@@ -359,7 +367,7 @@ def _validate_pi_wire(frame, online=False, memory=False, discovery=False, source
             else:
                 exact(result, {"call_id", "name", "version", "toolset_version", "receipt_id", "step_id", "output_ref", "result"})
                 _pi_native_id(result["call_id"])
-                _pi_name_version(result["name"], result["version"], memory, discovery, source)
+                _pi_name_version(result["name"], result["version"], memory, discovery, source, workbench)
                 _pi_digest(result["toolset_version"], prefixed=True)
                 _pi_digest(result["output_ref"], prefixed=True)
                 identifier(result["receipt_id"])
@@ -374,7 +382,7 @@ def _validate_pi_wire(frame, online=False, memory=False, discovery=False, source
             fail("status")
     elif t == "error":
         exact(body, {"code"})
-        if type(body["code"]) is not str or body["code"] not in CODES:
+        if type(body["code"]) is not str or body["code"] not in CODES | {PI_PROVIDER_CAPACITY_CODE}:
             fail("error_code")
     else:
         fail("unsupported_type")
@@ -385,6 +393,7 @@ PI_ONLINE_PROTOCOL = "v4.pi-readonly/2"
 PI_ONLINE_PROFILE = "pi-readonly-online-v1"
 PI_PROVIDER_PATH = "/inference/go/openai/v1/chat/completions"
 PI_PROVIDER_BYTES = 131072
+PI_PROVIDER_CAPACITY_CODE = 'provider_capacity_exceeded'
 
 
 def _pi_provider_body(value):
@@ -486,6 +495,15 @@ def validate_pi_memory(frame):
 
 def validate_pi_memory_online(frame):
     _validate_pi_wire(frame, online=True, memory=True)
+
+
+def validate_pi_workbench_online(frame):
+    _validate_pi_wire(frame, online=True, memory=True, discovery=True, source=True, workbench=True)
+
+
+class PiWorkbenchOnlinePeer(PiPeer):
+    protocol = PI_WORKBENCH_ONLINE_PROTOCOL
+    validator = staticmethod(validate_pi_workbench_online)
 
 
 class PiMemoryPeer(PiPeer):

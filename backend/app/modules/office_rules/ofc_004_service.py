@@ -10,10 +10,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from backend.app.application import commit_guard
 from backend.app.core.security import AuthenticatedSubject, require_authenticated_subject
 from backend.app.core.idempotency import require_idempotency_key
 from backend.app.db.session import get_session
 from backend.app.modules.audit.service import record_event
+from backend.app.modules.identity.command_guard import check_command_authority, lock_command_authority
 from backend.app.modules.identity.service import authorize_scope
 from backend.app.modules.office_intake.ofc_002_models import OfficeEvidence
 from backend.app.modules.office_rules.ofc_004_models import OfficeRuleVersion, OfficeRuleDecision
@@ -65,6 +67,24 @@ def _employee(db, actor, permission):
     db.expire_all()
     authorize_scope(db,actor,organization_id=actor.organization_id,
                     store_id=actor.store_id,permission=permission)
+
+
+def _check_employee_command(db, actor, permission, epoch):
+    check_command_authority(db, actor, permission=permission, epoch=epoch, now=commit_guard._db_clock(db))
+
+
+def _begin_employee_command(db, actor, permission):
+    # The generic command helper additionally serves non-employee principals.
+    # Rule decisions and proposals remain employee-only.
+    if type(actor) is not AuthenticatedSubject or actor.account_id is None or actor.session_id is None:
+        raise HTTPException(403, "office_rule_employee_required")
+    epoch = lock_command_authority(db, actor)
+    _check_employee_command(db, actor, permission, epoch)
+    # Preserve the original rule command's pending-domain flush and refresh,
+    # but never perform either until the command rights/hold were verified.
+    db.flush()
+    db.expire_all()
+    return epoch
 
 
 def _valid_body(kind, scope, body):
@@ -165,7 +185,8 @@ def _verified_evidence(db,actor,source_ref,source_sha256):
 
 
 def propose_rule(db:Session,actor:AuthenticatedSubject,body:RuleSubmit,request_key:str):
-    _employee(db,actor,"office.rules.manage")
+    permission = "office.rules.manage"
+    epoch = _begin_employee_command(db, actor, permission)
     _valid_string(request_key,"request_key")
     if not _SHA.fullmatch(body.source_sha256):_fail("office_rule_source_invalid")
     _verified_evidence(db,actor,body.source_ref,body.source_sha256)
@@ -185,13 +206,16 @@ def propose_rule(db:Session,actor:AuthenticatedSubject,body:RuleSubmit,request_k
         OfficeRuleVersion.submit_key==request_key))
     if prior:
         if prior.submit_digest!=digest:_fail("office_rule_idempotency_conflict")
-        return _out_rule(db,actor,prior,True)
+        result = _out_rule(db, actor, prior, True)
+        _check_employee_command(db, actor, permission, epoch)
+        return result
     latest=db.scalar(select(OfficeRuleVersion.version).where(
         OfficeRuleVersion.organization_id==actor.organization_id,
         OfficeRuleVersion.store_id==actor.store_id,
         OfficeRuleVersion.rule_key==body.rule_key
     ).order_by(OfficeRuleVersion.version.desc()).limit(1))
     if body.version!=(latest or 0)+1:_fail("office_rule_version_conflict")
+    _check_employee_command(db, actor, permission, epoch)
     row=OfficeRuleVersion(id=str(uuid4()),organization_id=actor.organization_id,
         store_id=actor.store_id,rule_key=body.rule_key,version=body.version,
         kind=body.kind,scope_key=body.scope_key,rule_body=body.rule_body,
@@ -203,7 +227,9 @@ def propose_rule(db:Session,actor:AuthenticatedSubject,body:RuleSubmit,request_k
     db.flush()
     _audit(db,actor,"office.rules.proposed",row.id,request_key,
            {"version":row.version,"body_sha256":row.body_sha256})
-    return _out_rule(db,actor,row)
+    result = _out_rule(db, actor, row)
+    _check_employee_command(db, actor, permission, epoch)
+    return result
 
 
 def get_rule(db,actor,rule_id):
@@ -213,7 +239,8 @@ def get_rule(db,actor,rule_id):
 
 def decide_rule(db:Session,actor:AuthenticatedSubject,rule_id:str,
                 body:RuleDecide,request_key:str):
-    _employee(db,actor,"office.rules.review")
+    permission = "office.rules.review"
+    epoch = _begin_employee_command(db, actor, permission)
     _valid_string(request_key,"request_key")
     _valid_string(body.reason,"reason",2000)
     if not _SHA.fullmatch(body.input_sha256):_fail("office_rule_input_invalid")
@@ -230,13 +257,16 @@ def decide_rule(db:Session,actor:AuthenticatedSubject,rule_id:str,
         OfficeRuleDecision.request_key==request_key))
     if prev:
         if prev.request_digest!=digest:_fail("office_rule_idempotency_conflict")
-        return _out_decision(prev,True)
+        result = _out_decision(prev, True)
+        _check_employee_command(db, actor, permission, epoch)
+        return result
     state,version,_=_status(db,actor,row)
     if body.expected_version!=version:_fail("office_rule_version_conflict")
     if body.input_sha256!=row.body_sha256:_fail("office_rule_input_changed")
     if (state=="draft" and body.decision not in ("approved","rejected")) or (
         state=="approved" and body.decision!="revoked") or state in ("rejected","revoked"):
         _fail("office_rule_decision_invalid")
+    _check_employee_command(db, actor, permission, epoch)
     receipt=OfficeRuleDecision(id=str(uuid4()),organization_id=actor.organization_id,
         store_id=actor.store_id,rule_id=row.id,rule_version=row.version,
         decision_version=version+1,decision=body.decision,
@@ -248,7 +278,9 @@ def decide_rule(db:Session,actor:AuthenticatedSubject,rule_id:str,
     _audit(db,actor,"office.rules.decided",row.id,request_key,
            {"decision":receipt.decision,"version":receipt.decision_version,
             "receipt_id":receipt.id})
-    return _out_decision(receipt)
+    result = _out_decision(receipt)
+    _check_employee_command(db, actor, permission, epoch)
+    return result
 
 
 def resolve_rule(db:Session,actor:AuthenticatedSubject,*,kind:str,scope_key:str,

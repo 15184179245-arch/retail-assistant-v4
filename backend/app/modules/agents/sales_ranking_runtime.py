@@ -116,5 +116,14 @@ def response_schemas(binding, active_names):
     if type(active_names) not in (list,tuple,set,frozenset):raise ValueError()
     names=set(active_names)
     if len(names)!=len(active_names) or not names or not names<={x['name'] for x in frozen['tools']}:raise ValueError()
-    return {entry['name']:registry.resolve_tool(entry['tool_key'],entry['version']).input_model
-            for entry in frozen['tools'] if entry['name'] in names}
+    # WORKSPACE_TOOLS pairs are registry-resident but deliberately outside the
+    # ordinary catalog (resolve_tool never resolves them); workbench bindings
+    # resolve them directly from the identity-checked group instead.
+    schemas={}
+    for entry in frozen['tools']:
+        if entry['name'] not in names:continue
+        definition=registry.WORKSPACE_TOOLS.get((entry['tool_key'],entry['version']))
+        if definition is None:
+            definition=registry.resolve_tool(entry['tool_key'],entry['version'])
+        schemas[entry['name']]=definition.input_model
+    return schemas

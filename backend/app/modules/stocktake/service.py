@@ -54,6 +54,12 @@ def _event(session, actor, sid, event_id):
     return row
 
 
+def _same_correction_target(parent: StocktakeObservation,
+                            candidate: StocktakeObservation | ObservationCreate) -> bool:
+    return (parent.product_id, parent.location_id, parent.unit) == (
+        candidate.product_id, candidate.location_id, candidate.unit)
+
+
 def _cmd(session, actor, operation, key, payload, handler):
     connection = session.connection()
     if connection.dialect.name == "sqlite" and not connection.connection.driver_connection.in_transaction:
@@ -161,6 +167,8 @@ def observe(session: Session, actor: AuthenticatedSubject, sid: str,
                 StocktakeObservation.supersedes_id == prior.id))
             if already is not None:
                 raise HTTPException(409, "stocktake_observation_superseded")
+            if not _same_correction_target(prior, data):
+                raise HTTPException(409, "stocktake_correction_invalid")
         count = session.execute(update(StocktakeSession).where(
             *_scope(StocktakeSession, actor), StocktakeSession.id == sid,
             StocktakeSession.status == "open",

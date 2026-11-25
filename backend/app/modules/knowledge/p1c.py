@@ -43,12 +43,13 @@ STALE_REASON = 'knowledge_source_changed'
 HEAD_CHANGED_REASON = 'projection_head_changed'
 AUTHORIZATION_CHANGED = 'knowledge_authorization_changed'
 DEADLINE_REASON = 'tool_deadline_exceeded'
+CLEANUP_REASON = 'worker_cleanup_unconfirmed'
 DEFAULT_DEADLINE_SECONDS = 3.0
 UNAVAILABLE_REASONS = frozenset({
     'projection_missing', 'build_missing', 'build_not_published', 'build_version',
     'generation_missing', 'generation_format', 'stale', 'entry_count_mismatch',
     'row_count_mismatch', 'projection_row_integrity', 'source_window_expired',
-    'stale_during_read', DEADLINE_REASON,
+    'stale_during_read', DEADLINE_REASON, CLEANUP_REASON,
 })
 
 
@@ -415,14 +416,19 @@ def compute_search(session_factory, actor, *, query: str, limit: int = 5,
             worker = score_prepared(prepared, deadline=deadline,
                                     cancel_event=cancel_event, limit=limit)
         except readonly_compute.WorkerError as error:
-            if error.code in ('worker_timeout', 'worker_cancelled'):
-                reason = (DEADLINE_REASON if error.code == 'worker_timeout'
-                          else 'worker_cancelled')
-                timings['b_ms'] = round((time.monotonic() - b_started) * 1000, 1)
-                timings['total_ms'] = round((time.monotonic() - started) * 1000, 1)
-                return _unavailable(reason, query=text,
-                                    input_sha256=prepared.input_sha256, timings=timings)
-            raise
+            if error.code == 'worker_timeout':
+                reason = DEADLINE_REASON
+            elif error.code == 'worker_cancelled':
+                reason = 'worker_cancelled'
+            elif (error.code == 'worker_transport_failed'
+                  and error.detail == 'transport_cleanup_unconfirmed'):
+                reason = CLEANUP_REASON
+            else:
+                raise
+            timings['b_ms'] = round((time.monotonic() - b_started) * 1000, 1)
+            timings['total_ms'] = round((time.monotonic() - started) * 1000, 1)
+            return _unavailable(reason, query=text,
+                                input_sha256=prepared.input_sha256, timings=timings)
         timings['b_ms'] = round((time.monotonic() - b_started) * 1000, 1)
         c_started = time.monotonic()
         try:

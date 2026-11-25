@@ -1,0 +1,5 @@
+.ar-product-barcode { min-width: 0; overflow-wrap: anywhere; }
+.ar-product-barcode-rows { padding-inline-start: 1.35rem; }
+.ar-product-barcode-rows li { margin-block: .35rem; }
+.ar-product-barcode-code { font-family: ui-monospace, monospace; white-space: break-spaces; }
+.ar-product-barcode-nav { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }

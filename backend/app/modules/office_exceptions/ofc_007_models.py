@@ -321,13 +321,5 @@ def install_exception_receipt_guards(target, connection, **_kw) -> None:
         connection.exec_driver_sql(statement)
 
 
-def drop_exception_receipt_guards(target, connection, **_kw) -> None:
-    """Remove the guards; used by the downgrade before dropping the table."""
-    table_name = target if isinstance(target, str) else target.name
-    for statement in exception_receipt_guard_drop_statements(
-            connection.dialect.name, table_name):
-        connection.exec_driver_sql(statement)
-
-
 event.listen(OfficeExceptionReceipt.__table__, "after_create",
              install_exception_receipt_guards)

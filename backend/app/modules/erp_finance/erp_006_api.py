@@ -5,9 +5,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.core.security import AuthenticatedSubject, require_authenticated_subject
 from backend.app.db.session import get_session
-from backend.app.modules.erp_commands.erp_003_wire import LoopbackSandboxConfig
 from backend.app.modules.erp_finance import erp_006_service as service
-from backend.app.modules.erp_finance.erp_006_adapter import SyntheticSettlementHTTPAdapter
 from backend.app.modules.erp_finance.erp_006_schemas import (
     SettlementApprovalCreate,
     SettlementEnvelope,
@@ -29,15 +27,12 @@ def _ok(data: Any, message: str = "ok") -> SettlementEnvelope:
     )
 
 
-def _get_adapter(actor: Any) -> SyntheticSettlementHTTPAdapter:
-    cfg = LoopbackSandboxConfig(
-        host="127.0.0.1",
-        port=8000,
-        organization_id=actor.organization_id,
-        store_id=actor.store_id,
-        secret="sandbox_0123456789abcdef0123456789abcdef",
-    )
-    return SyntheticSettlementHTTPAdapter(cfg)
+def _unavailable(db, actor, permission) -> SettlementEnvelope:
+    service._require_permission(db, actor, permission)
+    return SettlementEnvelope(success=False, data=None,
+        code="ERP_SETTLEMENT_ADAPTER_UNAVAILABLE", error="settlement_adapter_unavailable",
+        user_message="结算执行适配器尚未接入，未执行或推进结算状态。",
+        hint="本地提案、审批和暂存保留；不可将其视为真实ERP或资金结算。")
 
 
 @router.post("/proposals", response_model=SettlementEnvelope)
@@ -73,43 +68,21 @@ def stage_command(
     return _ok({"attempt_id": attempt.id, "state": attempt.state}, "settlement command staged")
 
 
-@router.post("/attempts/{attempt_id}/dispatch", response_model=SettlementEnvelope)
+@router.post("/attempts/{attempt_id}/dispatch", response_model=SettlementEnvelope, status_code=503,
+             response_description="Settlement integration unavailable; no state transition performed")
 def dispatch_attempt(
     attempt_id: str,
     actor: AuthenticatedSubject = Depends(require_authenticated_subject),
     db: Session = Depends(get_session),
 ) -> SettlementEnvelope:
-    adapter = _get_adapter(actor)
-    attempt = service.dispatch_settlement_attempt(db, actor, attempt_id, adapter)
-    db.commit()
-    return _ok(
-        {
-            "attempt_id": attempt.id,
-            "state": attempt.state,
-            "delivery_ref": attempt.delivery_ref,
-            "external_ref": attempt.external_ref,
-            "receipt_digest": attempt.receipt_digest,
-        },
-        "settlement attempt dispatched",
-    )
+    return _unavailable(db, actor, "erp.settlement.dispatch")
 
 
-@router.post("/attempts/{attempt_id}/reconcile", response_model=SettlementEnvelope)
+@router.post("/attempts/{attempt_id}/reconcile", response_model=SettlementEnvelope, status_code=503,
+             response_description="Settlement integration unavailable; no state transition performed")
 def reconcile_attempt(
     attempt_id: str,
     actor: AuthenticatedSubject = Depends(require_authenticated_subject),
     db: Session = Depends(get_session),
 ) -> SettlementEnvelope:
-    adapter = _get_adapter(actor)
-    attempt = service.reconcile_settlement_attempt(db, actor, attempt_id, adapter)
-    db.commit()
-    return _ok(
-        {
-            "attempt_id": attempt.id,
-            "state": attempt.state,
-            "delivery_ref": attempt.delivery_ref,
-            "external_ref": attempt.external_ref,
-            "receipt_digest": attempt.receipt_digest,
-        },
-        "settlement attempt reconciled",
-    )
+    return _unavailable(db, actor, "erp.settlement.reconcile")

@@ -244,11 +244,19 @@ def claim_one(
     return event
 
 
+def _claim_identity(expected_attempt: int, expected_lease_until: datetime) -> datetime:
+    if type(expected_attempt) is not int or expected_attempt < 1 or not isinstance(expected_lease_until, datetime):
+        raise ValueError("original claim attempt and lease deadline are required")
+    return _as_utc(expected_lease_until)
+
+
 def record_failure(
     session: Session,
     *,
     event_id: str,
     worker_id: str,
+    expected_attempt: int,
+    expected_lease_until: datetime,
     error: str,
     max_attempts: int = 8,
     now: datetime | None = None,
@@ -258,9 +266,10 @@ def record_failure(
         raise ValueError("error must be a stable error code")
     if max_attempts <= 0:
         raise ValueError("positive max_attempts is required")
+    lease_until = _claim_identity(expected_attempt, expected_lease_until)
     timestamp = _normalize_input_time(now, "now")
     event = session.get(OutboxEvent, event_id)
-    if event is None or event.status != "leased" or event.lease_owner != worker_id or event.lease_until is None or _as_utc(event.lease_until) <= timestamp:
+    if event is None or event.status != "leased" or event.lease_owner != worker_id or event.lease_until is None or _as_utc(event.lease_until) <= timestamp or event.attempts != expected_attempt or _as_utc(event.lease_until) != lease_until:
         raise ValueError("active unexpired lease not owned by worker")
     if event.attempts >= max_attempts:
         values = {"status": "dead"}
@@ -271,9 +280,9 @@ def record_failure(
         OutboxEvent.id == event_id,
         OutboxEvent.status == "leased",
         OutboxEvent.lease_owner == worker_id,
-        OutboxEvent.lease_until == event.lease_until,
+        OutboxEvent.lease_until == lease_until,
         OutboxEvent.lease_until > timestamp,
-        OutboxEvent.attempts == event.attempts,
+        OutboxEvent.attempts == expected_attempt,
     ).values(**values, last_error=error, lease_owner=None, lease_until=None).execution_options(synchronize_session=False))
     if not result.rowcount:
         raise ValueError("active unexpired lease not owned by worker")
@@ -287,23 +296,26 @@ def acknowledge_receipt(
     *,
     event_id: str,
     worker_id: str,
+    expected_attempt: int,
+    expected_lease_until: datetime,
     external_receipt: str,
     now: datetime | None = None,
 ) -> OutboxEvent:
     """Mark delivered with a receipt only under the worker's unexpired lease."""
     if not external_receipt.strip():
         raise ValueError("external receipt is required")
+    lease_until = _claim_identity(expected_attempt, expected_lease_until)
     timestamp = _normalize_input_time(now, "now")
     event = session.get(OutboxEvent, event_id)
-    if event is None or event.status != "leased" or event.lease_owner != worker_id or event.lease_until is None or _as_utc(event.lease_until) <= timestamp:
+    if event is None or event.status != "leased" or event.lease_owner != worker_id or event.lease_until is None or _as_utc(event.lease_until) <= timestamp or event.attempts != expected_attempt or _as_utc(event.lease_until) != lease_until:
         raise ValueError("active unexpired lease not owned by worker")
     result = session.execute(update(OutboxEvent).where(
         OutboxEvent.id == event_id,
         OutboxEvent.status == "leased",
         OutboxEvent.lease_owner == worker_id,
-        OutboxEvent.lease_until == event.lease_until,
+        OutboxEvent.lease_until == lease_until,
         OutboxEvent.lease_until > timestamp,
-        OutboxEvent.attempts == event.attempts,
+        OutboxEvent.attempts == expected_attempt,
     ).values(
         status="delivered",
         external_receipt=external_receipt[:500],

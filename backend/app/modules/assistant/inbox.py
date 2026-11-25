@@ -44,7 +44,7 @@ class Scope:
     subject_id: str
 
 
-def _source(db, actor, root_id, parent_id, *, latest=False, active=False):
+def _source(db, actor, root_id, parent_id, *, latest=False, active=False, verify_parent=None):
     root = db.scalar(select(AssistantWork).where(*service._scope(actor), AssistantWork.task_id == root_id)
                      .execution_options(populate_existing=True))
     if root is None: fail('assistant_work_not_found', 404)
@@ -63,7 +63,10 @@ def _source(db, actor, root_id, parent_id, *, latest=False, active=False):
         parent = db.scalar(select(AssistantTurn).where(*turns._scope(actor), AssistantTurn.id == parent_id,
                           AssistantTurn.root_work_id == root_id).execution_options(populate_existing=True))
         if parent is None: fail('assistant_inbox_parent_unavailable')
-        turns.source_view(db, actor, parent)
+        if verify_parent is None:
+            turns.source_view(db, actor, parent)
+        else:
+            verify_parent(root, view, parent)
         run_id, parent_sha, parent_request = parent.run_id, parent.snapshot_sha256, parent.request_digest
     return run_id, digest(dict(root=root.snapshot_sha256, root_request=root.request_digest, parent=parent_sha,
                                parent_request=parent_request, parent_id=parent_id, run_id=run_id))
@@ -76,13 +79,14 @@ def _seal(row):
     return digest(value)
 
 
-def _verify(db, row, *, active=False):
+def _verify(db, row, *, active=False, verify_parent=None):
     if (row.binding_sha256 != _seal(row) or row.request_digest != digest({'text': row.text})
             or type(row.permissions) is not list or any(type(p) is not str for p in row.permissions)
             or row.permissions != sorted(set(row.permissions))
             or not REQUIRED <= set(row.permissions) <= CAPABILITIES): fail()
     actor = Scope(row.organization_id, row.store_id, row.owner_id)
-    if _source(db, actor, row.root_work_id, row.parent_id, active=active) != (row.parent_run_id, row.parent_source_sha256): fail()
+    if _source(db, actor, row.root_work_id, row.parent_id, active=active,
+               verify_parent=verify_parent) != (row.parent_run_id, row.parent_source_sha256): fail()
     previous = db.get(AssistantInbox, row.previous_message_id, populate_existing=True) if row.previous_message_id else None
     if row.sequence == 1:
         if row.previous_message_id is not None: fail()
@@ -104,6 +108,10 @@ def _view(row, *, replayed=False):
 def _full_view(db, actor, row, *, replayed=False):
     from backend.app.modules.assistant.inbox_execution import converted
     value = _view(row, replayed=replayed)
+    from backend.app.modules.assistant.workspace_binding import root_context, context_view
+    root = db.get(AssistantWork, row.root_work_id, populate_existing=True)
+    if root is None: fail()
+    value['workspace_context'] = context_view(root_context(db, root))
     turn = converted(db, row)
     if turn is not None:
         execution = turns._full_view(db, actor, turns._validate(db, actor, turn))
@@ -137,6 +145,10 @@ def receive(db, actor, *, root_work_id, parent_id, text, request_id, policy):
     if (db.scalar(select(AssistantWork.task_id).where(*service._scope(actor), AssistantWork.request_id == request_id))
             or db.scalar(select(AssistantTurn.id).where(*turns._scope(actor), AssistantTurn.request_id == request_id))):
         fail('assistant_inbox_request_conflict')
+    from backend.app.modules.assistant.workspace_binding import root_context, augment_policy
+    root = db.scalar(select(AssistantWork).where(*service._scope(actor), AssistantWork.task_id == root_work_id))
+    if root is None: fail('assistant_work_not_found', 404)
+    policy = augment_policy(db, actor, policy, root_context(db, root))
     now = commit_guard._db_clock(db)
     if (type(policy) is not WorkAuthorityPolicy or type(policy.permissions) is not tuple
             or any(type(p) is not str for p in policy.permissions)

@@ -2065,30 +2065,12 @@ def succeed_pi_tool_receipt(session: Session, claim: AgentClaim, *,
 
 def validate_pi_runtime_record(value: object) -> dict:
     """Validate a Host-selected non-secret creation record, never authenticate it."""
-    if (type(value) is not dict
-            or set(value) != {"contract_version", "wire_protocol", "launch_profile", "source_manifest_sha256"}
-            or type(value["contract_version"]) is not int
-            or (value["contract_version"], value["wire_protocol"], value["launch_profile"]) not in (
-                (1, "v4.pi-readonly/1", "host-pi-readonly-node24-linux-v1"),
-                (1, "v4.pi-readonly/1", "host-pi-readonly-node24-darwin-v1"),
-                (2, "v4.pi-readonly/2", "host-pi-readonly-node24-linux-online-v1"),
-                (2, "v4.pi-readonly/2", "host-pi-readonly-node24-darwin-online-v1"),
-                (3, "v4.pi-readonly/3", "host-pi-readonly-node24-darwin-online-stream-v1"),
-                (3, "v4.pi-readonly/3", "host-pi-readonly-node24-linux-online-stream-v1"),
-                (3, "v4.pi-readonly/3", "host-pi-readonly-node24-darwin-online-stream-result-v1"),
-                (3, "v4.pi-readonly/3", "host-pi-readonly-node24-linux-online-stream-result-v1"),
-                (1, 'v4.pi-memory/1', 'host-pi-memory-node24-linux-v1'),
-                (1, 'v4.pi-memory/1', 'host-pi-memory-node24-darwin-v1'),
-                (2, 'v4.pi-memory/2', 'host-pi-memory-node24-linux-online-v1'),
-                (2, 'v4.pi-memory/2', 'host-pi-memory-node24-darwin-online-v1'),
-                (1, 'v4.pi-discovery/1', 'host-pi-discovery-node24-linux-v1'),
-                (1, 'v4.pi-discovery/1', 'host-pi-discovery-node24-darwin-v1'),
-                (2, 'v4.pi-discovery/2', 'host-pi-discovery-node24-linux-online-v1'),
-                (2, 'v4.pi-discovery/2', 'host-pi-discovery-node24-darwin-online-v1'),
-                (1, 'v4.pi-source/1', 'host-pi-source-node24-linux-v1'),
-                (1, 'v4.pi-source/1', 'host-pi-source-node24-darwin-v1'),
-                (2, 'v4.pi-source/2', 'host-pi-source-node24-linux-online-v1'),
-                (2, 'v4.pi-source/2', 'host-pi-source-node24-darwin-online-v1'))
+    from .pi_runtime_contract import contract_for_record
+    try:
+        contract_for_record(value)
+    except ValueError:
+        _fail("agent_pi_runtime_record_invalid")
+    if (set(value) != {"contract_version", "wire_protocol", "launch_profile", "source_manifest_sha256"}
             or type(value["source_manifest_sha256"]) is not str
             or re.fullmatch(r"[a-f0-9]{64}", value["source_manifest_sha256"]) is None):
         _fail("agent_pi_runtime_record_invalid")
@@ -2097,9 +2079,8 @@ def validate_pi_runtime_record(value: object) -> dict:
 
 def pi_record_tool_profile(record):
     validated = validate_pi_runtime_record(record)
-    return ('pi-source-v1' if validated['wire_protocol'].startswith('v4.pi-source/') else
-            'pi-discovery-v1' if validated['wire_protocol'].startswith('v4.pi-discovery/') else
-            'pi-memory-v1' if validated['wire_protocol'].startswith('v4.pi-memory/') else 'pi-readonly-v1')
+    from .pi_runtime_contract import contract_for_record
+    return contract_for_record(validated).tool_profile
 
 
 def pi_provider_receipt(session: Session, claim: AgentClaim, step_id: str):
@@ -2331,10 +2312,24 @@ def pi_provider_receipt_facts(session: Session, organization_id: str, store_id: 
     inside persistence. Ambiguous or broken Step/ledger relations fail closed.
     """
     from backend.app.modules.agents.models import CostLedger
-    rows = list(session.scalars(select(AgentPiProviderReceipt).where(
+    statement = select(AgentPiProviderReceipt, CostLedger).select_from(AgentPiProviderReceipt).outerjoin(
+        CostLedger, and_(
+            CostLedger.organization_id == AgentPiProviderReceipt.organization_id,
+            CostLedger.store_id == AgentPiProviderReceipt.store_id,
+            CostLedger.run_id == AgentPiProviderReceipt.run_id,
+            CostLedger.step_id == AgentPiProviderReceipt.model_step_id,
+        ),
+    ).where(
         AgentPiProviderReceipt.organization_id == organization_id,
-        AgentPiProviderReceipt.store_id == store_id, AgentPiProviderReceipt.run_id == run_id
-    ).order_by(AgentPiProviderReceipt.created_at, AgentPiProviderReceipt.id)))
+        AgentPiProviderReceipt.store_id == store_id, AgentPiProviderReceipt.run_id == run_id,
+    ).order_by(AgentPiProviderReceipt.created_at, AgentPiProviderReceipt.id)
+    rows = {}
+    # Do not filter or deduplicate matches by call key or authority: every
+    # physical ledger on this step counts, and the LEFT JOIN preserves zero.
+    for row, ledger in session.execute(statement):
+        _, ledgers = rows.setdefault(row.id, (row, []))
+        if ledger is not None:
+            ledgers.append(ledger)
     steps = list_steps(session, organization_id, store_id, run_id)
     by_id = {step.id: step for step in steps}
     run = get_run(session, organization_id, store_id, run_id)
@@ -2345,10 +2340,7 @@ def pi_provider_receipt_facts(session: Session, organization_id: str, store_id: 
     if record['contract_version'] not in (2, 3) or run.provider_key != 'opencode-go':
         _fail('agent_runtime_receipt_inconsistent')
     result, seen = [], set()
-    for row in rows:
-        ledgers = list(session.scalars(select(CostLedger).where(
-            CostLedger.organization_id == organization_id, CostLedger.store_id == store_id,
-            CostLedger.run_id == run_id, CostLedger.step_id == row.model_step_id)))
+    for row, ledgers in rows.values():
         step = by_id.get(row.model_step_id)
         if (step is None or step.kind != 'model' or row.model_kind != 'model'
                 or row.model_step_id in seen or len(ledgers) != 1

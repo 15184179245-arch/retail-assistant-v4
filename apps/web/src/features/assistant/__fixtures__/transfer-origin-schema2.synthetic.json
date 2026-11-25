@@ -1,0 +1,196 @@
+{
+  "fixture_origin": "only_synthetic_values_exact_frozen_python_host_reader_no_ERP_or_actual_business_values",
+  "historical_layout_with_private_values_removed": {
+    "target": {
+      "workId": "00000000-0000-0000-0000-000000000c1c",
+      "runId": "00000000-0000-0000-0000-000000000c1d"
+    },
+    "legacy_schema": {
+      "version": 1,
+      "work_id": "00000000-0000-0000-0000-000000000c1c",
+      "run_id": "00000000-0000-0000-0000-000000000c1d",
+      "sequence_no": 2,
+      "state": "available",
+      "blocks": [
+        {
+          "type": "operational_receipt_page",
+          "action": "purchase_orders_query",
+          "block_id": "00000000-0000-0000-0000-000000000064",
+          "sequence_no": 1,
+          "offset": 0,
+          "returned_count": 5,
+          "reported_total": null,
+          "items": [
+            {
+              "bill_code": "SOURCE-CODE-0",
+              "bill_date": "2026-11-17T00:00:00",
+              "bill_state": 12
+            },
+            {
+              "bill_code": "SOURCE-CODE-1",
+              "bill_date": "2026-11-17T00:00:00",
+              "bill_state": 12
+            },
+            {
+              "bill_code": "SOURCE-CODE-2",
+              "bill_date": "2026-11-17T00:00:00",
+              "bill_state": 12
+            },
+            {
+              "bill_code": "SOURCE-CODE-3",
+              "bill_date": "2026-11-17T00:00:00",
+              "bill_state": 12
+            },
+            {
+              "bill_code": "SOURCE-CODE-4",
+              "bill_date": "2026-11-17T00:00:00",
+              "bill_state": 12
+            }
+          ]
+        }
+      ],
+      "snapshot_sha256": "0feb0ff34299b9c2b0ccf57a5b5da487f2dd13e847fd3dfe4f4758ce655d26e3"
+    },
+    "v2": {
+      "version": 1,
+      "work_id": "00000000-0000-0000-0000-000000000c1c",
+      "run_id": "00000000-0000-0000-0000-000000000c1d",
+      "sequence_no": 2,
+      "state": "available",
+      "blocks": [
+        {
+          "type": "operational_receipt_page",
+          "action": "purchase_orders_query",
+          "block_id": "00000000-0000-0000-0000-000000000064",
+          "sequence_no": 1,
+          "offset": 0,
+          "returned_count": 5,
+          "reported_total": null,
+          "items": [
+            {
+              "bill_code": "SOURCE-CODE-0",
+              "bill_date": "2026-11-17T00:00:00",
+              "bill_state": 12
+            },
+            {
+              "bill_code": "SOURCE-CODE-1",
+              "bill_date": "2026-11-17T00:00:00",
+              "bill_state": 12
+            },
+            {
+              "bill_code": "SOURCE-CODE-2",
+              "bill_date": "2026-11-17T00:00:00",
+              "bill_state": 12
+            },
+            {
+              "bill_code": "SOURCE-CODE-3",
+              "bill_date": "2026-11-17T00:00:00",
+              "bill_state": 12
+            },
+            {
+              "bill_code": "SOURCE-CODE-4",
+              "bill_date": "2026-11-17T00:00:00",
+              "bill_state": 12
+            }
+          ]
+        },
+        {
+          "type": "operational_transfer_page",
+          "action": "stock_transfers",
+          "block_id": "00000000-0000-0000-0000-000000000065",
+          "sequence_no": 2,
+          "returned_count": 0,
+          "offset": 0,
+          "reported_total": null,
+          "items": []
+        }
+      ],
+      "snapshot_sha256": "6dfb633f89e1f118bfd49ed4f79d80dd5b59500a47e54bc2682def195cebbb74"
+    }
+  },
+  "synthetic_positive_detail_and_current_revocation": {
+    "target": {
+      "workId": "00000000-0000-0000-0000-000000000c80",
+      "runId": "00000000-0000-0000-0000-000000000c81"
+    },
+    "v2_running": {
+      "version": 1,
+      "work_id": "00000000-0000-0000-0000-000000000c80",
+      "run_id": "00000000-0000-0000-0000-000000000c81",
+      "sequence_no": 2,
+      "state": "available",
+      "blocks": [
+        {
+          "type": "operational_transfer_page",
+          "action": "stock_transfers",
+          "block_id": "00000000-0000-0000-0000-000000000064",
+          "sequence_no": 1,
+          "returned_count": 1,
+          "offset": 0,
+          "reported_total": null,
+          "items": [
+            {
+              "bill_code": "TRANSFER-ONE",
+              "bill_date": "2026-11-17",
+              "bill_state": 12,
+              "bill_type": 201,
+              "out_warehouse_name": "固定源仓",
+              "in_warehouse_name": "固定目标仓"
+            }
+          ]
+        },
+        {
+          "type": "operational_transfer_detail",
+          "action": "stock_transfer_detail",
+          "block_id": "00000000-0000-0000-0000-000000000065",
+          "sequence_no": 2,
+          "returned_count": 1,
+          "bill_code": "TRANSFER-ONE",
+          "bill_date": "2026-11-17",
+          "bill_state": 12,
+          "bill_type": 201,
+          "out_warehouse_name": "固定源仓",
+          "in_warehouse_name": "固定目标仓",
+          "items": [
+            {
+              "product_code": "SYNTH-SKU",
+              "product_name": "物料名称",
+              "reported_quantity": "-1.2300E-7",
+              "reported_unit": "盒"
+            }
+          ]
+        }
+      ],
+      "snapshot_sha256": "398ce9ad6b9c7d05a50061d2d46f905aa203555549fb39af2065e2d72b2f6a6a"
+    },
+    "v2_after_detail_revocation": {
+      "version": 1,
+      "work_id": "00000000-0000-0000-0000-000000000c80",
+      "run_id": "00000000-0000-0000-0000-000000000c81",
+      "sequence_no": 2,
+      "state": "available",
+      "blocks": [
+        {
+          "type": "operational_transfer_page",
+          "action": "stock_transfers",
+          "block_id": "00000000-0000-0000-0000-000000000064",
+          "sequence_no": 1,
+          "returned_count": 1,
+          "offset": 0,
+          "reported_total": null,
+          "items": [
+            {
+              "bill_code": "TRANSFER-ONE",
+              "bill_date": "2026-11-17",
+              "bill_state": 12,
+              "bill_type": 201,
+              "out_warehouse_name": "固定源仓",
+              "in_warehouse_name": "固定目标仓"
+            }
+          ]
+        }
+      ],
+      "snapshot_sha256": "b2b2518116d902f9c9f36519f37ca6d413fc757d85a3bc5a8c393f6a581011f3"
+    }
+  }
+}

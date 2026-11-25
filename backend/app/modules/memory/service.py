@@ -11,6 +11,8 @@ from backend.app.modules.audit.service import record_event
 from backend.app.modules.auth.service import validate_actor_session
 from backend.app.modules.auth.models import LoginSession
 from backend.app.modules.identity.service import authorize_scope
+from backend.app.modules.identity.command_guard import lock_command_authority, check_command_authority
+from backend.app.application import commit_guard
 from backend.app.modules.knowledge.commands import execute_command
 from backend.app.modules.knowledge.models import KnowledgeEntry, KnowledgeRevision
 from backend.app.modules.knowledge import access_policy
@@ -43,7 +45,10 @@ def _now(value=None):
     value = value or datetime.now(timezone.utc)
     if value.utcoffset() is None:
         raise MemoryError("memory_time_invalid")
-    return value.astimezone(timezone.utc)
+    try:
+        return value.astimezone(timezone.utc)
+    except OverflowError:
+        raise MemoryError("memory_time_invalid") from None
 
 def _require(session, actor, permission, now):
     session.flush()
@@ -60,6 +65,16 @@ def _require(session, actor, permission, now):
         if error.status_code == 401:
             raise
         raise MemoryError("memory_permission_denied") from error
+
+
+def _write_authority(session, actor, current):
+    # Same canonical fence/epoch as logout and other application commands.
+    # No command effects or explicit flush happen before this lock.
+    with session.no_autoflush:
+        epoch = lock_command_authority(session, actor)
+        _require(session, actor, WRITE, current)
+    return epoch
+
 
 def _out(row):
     return MemoryOut.model_validate(row, from_attributes=True).model_dump()
@@ -116,7 +131,7 @@ def _row(session, actor, identity, current, *, withdrawn=False):
         raise MemoryError("memory_not_found")
     return row
 
-def _command(session, actor, operation, key, payload, execute, current):
+def _command(session, actor, operation, key, payload, execute, current, epoch):
     connection = session.connection()
     if connection.dialect.name == "sqlite" and not connection.connection.driver_connection.in_transaction:
         connection.exec_driver_sql("BEGIN")
@@ -134,6 +149,8 @@ def _command(session, actor, operation, key, payload, execute, current):
                                      execute=execute, receipt_model=MemoryCommand)
             # A receipt never restores visibility of revoked/sessionless content.
             _row(session, actor, result["id"], current, withdrawn=operation == "withdraw")
+            commit_guard.enlist(session, action=WRITE, check=lambda db, instant:
+                check_command_authority(db, actor, permission=WRITE, epoch=epoch, now=instant))
         return MemoryOut.model_validate(result).model_dump()
     except HTTPException as error:
         code = {"idempotency_conflict": "memory_idempotency_conflict",
@@ -153,7 +170,7 @@ def save_memory(session, actor, *, content, purpose=None, source="explicit", per
     from backend.app.modules.assistant.principal import WorkPrincipal
     if type(actor) is WorkPrincipal and persist is not True:
         raise MemoryError('memory_policy_required')
-    _require(session, actor, WRITE, current)
+    epoch = _write_authority(session, actor, current)
     content = content.strip()
     if not 1 <= len(content) <= 5000:
         raise MemoryError("memory_content_invalid")
@@ -195,7 +212,7 @@ def save_memory(session, actor, *, content, purpose=None, source="explicit", per
         session.flush()
         _audit(session, actor, row, "saved", idempotency_key, current)
         return MemoryOut.model_validate(_out(row)).model_dump(mode="json")
-    return _command(session, actor, "save", idempotency_key, payload, execute, current)
+    return _command(session, actor, "save", idempotency_key, payload, execute, current, epoch)
 
 def list_memories(session, actor, *, now=None):
     current = _now(now)
@@ -247,7 +264,7 @@ def _invalidate_linked_knowledge(session, actor, memory_id, reason, current):
 def correct_memory(session, actor, memory_id, *, content, expected_version, idempotency_key,
                    purpose=None, expires_at=None, now=None):
     current = _now(now)
-    _require(session, actor, WRITE, current)
+    epoch = _write_authority(session, actor, current)
     content = content.strip()
     if not 1 <= len(content) <= 5000:
         raise MemoryError("memory_content_invalid")
@@ -272,11 +289,11 @@ def correct_memory(session, actor, memory_id, *, content, expected_version, idem
         _invalidate_linked_knowledge(session, actor, row.id, "原个人记忆已被作者更正，经验候选自动撤回", current)
         _audit(session, actor, row, "corrected", idempotency_key, current)
         return MemoryOut.model_validate(_out(row)).model_dump(mode="json")
-    return _command(session, actor, "correct", idempotency_key, payload, execute, current)
+    return _command(session, actor, "correct", idempotency_key, payload, execute, current, epoch)
 
 def withdraw_memory(session, actor, memory_id, *, expected_version, idempotency_key, now=None):
     current = _now(now)
-    _require(session, actor, WRITE, current)
+    epoch = _write_authority(session, actor, current)
     def execute():
         row = _row(session, actor, memory_id, current)
         _cas(session, actor, row, expected_version,
@@ -285,7 +302,7 @@ def withdraw_memory(session, actor, memory_id, *, expected_version, idempotency_
         _audit(session, actor, row, "withdrawn", idempotency_key, current)
         return MemoryOut.model_validate(_out(row)).model_dump(mode="json")
     return _command(session, actor, "withdraw", idempotency_key,
-                    dict(id=memory_id, expected_version=expected_version), execute, current)
+                    dict(id=memory_id, expected_version=expected_version), execute, current, epoch)
 
 
 def promote_memory_to_candidate(session, actor, memory_id, *, expected_version, title,

@@ -13,7 +13,7 @@ class PurchaseIntentCreate(BaseModel):
     source_kind: Literal["wechat_paste", "delivery_note_text"]
     supplier_name: str = Field(min_length=1, max_length=200)
     original_text: str = Field(min_length=1, max_length=10000)
-    consent_confirmed: bool
+    consent_confirmed: bool = Field(strict=True)
     line_descriptions: list[str] = Field(min_length=1, max_length=30)
 
     @field_validator("supplier_name", "original_text")
@@ -29,6 +29,13 @@ class PurchaseIntentCreate(BaseModel):
         if any(not value.strip() or len(value) > 500 for value in values):
             raise ValueError("purchase_line_description_invalid")
         return values
+
+
+def canonical_quantity(value: Decimal) -> str:
+    """Render a validated quantity without rounding or insignificant zeros."""
+    whole, _, fraction = format(value, "f").partition(".")
+    fraction = fraction.rstrip("0")
+    return f"{whole}.{fraction}" if fraction else whole
 
 
 class PurchaseLineConfirm(BaseModel):

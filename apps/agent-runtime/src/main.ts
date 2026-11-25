@@ -1,3 +1,5 @@
+import {WorkbenchPeer, WORKBENCH_PROFILE, WORKBENCH_ONLINE_PROFILE, WORKBENCH_ONLINE_PROTOCOL} from './protocol.js';
+import {PROVIDER_CAPACITY_CODE} from './protocol.js';
 import {CanonicalPeer,RESULT_PROFILE,RESULT_ABI} from './protocol.js';
 import {StreamPeer, STREAM_PROFILE, STREAM_PROTOCOL, STREAM_SESSION_MS, streamBytes} from './protocol.js';
 /** Formal package stdio entry. No fixture bootstrap, provider path or old wire. */
@@ -41,10 +43,10 @@ export class Channel implements HostChannel {
     catch (error) { this.fail(error instanceof Error ? error : new ProtocolError('stream_error')); }
   };
   private readonly onError = (): void => this.fail(new ProtocolError('stream_error'));
-  constructor(online = false, memory = false, discovery = false, source = false, readonly streaming = false, readonly resultRecord?:JsonObject) {
+  constructor(online = false, memory = false, discovery = false, source = false, readonly streaming = false, readonly resultRecord?:JsonObject, workbench = false) {
     this.framer=new Framer(streaming);
     if (source && !discovery) throw new ProtocolError('tool_profile');
-    this.peer = resultRecord ? new CanonicalPeer('sdk') : streaming ? new StreamPeer('sdk') : source ? new SourcePeer('sdk',null,online) : discovery ? new DiscoveryPeer('sdk',null,online) : memory ? new MemoryPeer('sdk', null, online) : online ? new OnlinePeer('sdk') : new Peer('sdk');
+    this.peer = workbench ? new WorkbenchPeer('sdk') : resultRecord ? new CanonicalPeer('sdk') : streaming ? new StreamPeer('sdk') : source ? new SourcePeer('sdk',null,online) : discovery ? new DiscoveryPeer('sdk',null,online) : memory ? new MemoryPeer('sdk', null, online) : online ? new OnlinePeer('sdk') : new Peer('sdk');
     if (!['linux','darwin'].includes(process.platform) || process.stdout.isTTY || process.stdout.fd !== 1) throw new ProtocolError('stdio_profile');
     process.stdin.on('data', this.onData); process.stdin.on('end', this.onEnd);
     process.stdin.on('error', this.onError); process.stdout.on('error', this.onError);
@@ -148,6 +150,7 @@ export class Channel implements HostChannel {
     try{await this.send('request',{op:'provider_call',arguments:args});const response=await responsePromise;const terminalResult=terminalPromise.finally(()=>{s.detachAbort();});void terminalResult.catch(()=>{});return {response,terminal:terminalResult};}
     catch(e){s.detachAbort();this.fail(e instanceof Error?e:new ProtocolError('provider_unknown'));throw e;}
   }
+  async reportInputCapacity():Promise<void>{await this.send('error',{code:PROVIDER_CAPACITY_CODE});}
   finishProvider():void{this.stream?.detachAbort();this.stream=null;}
   async cancelProvider():Promise<void>{const s=this.stream;if(!s||s.ended||this.error)return;s.cancelled=true;try{await this.send('provider_cancel',{stream_id:s.id,reason:'runtime_abort'},s.requestSeq);}catch(e){this.fail(e instanceof Error?e:new ProtocolError('provider_unknown'));}}
   close(): void {
@@ -161,7 +164,7 @@ export class Channel implements HostChannel {
 }
 
 export type Launch = {root: string; privateRoot: string; provider: string; model: string;
-  syntheticCase: 'tasks' | 'knowledge' | 'catalog' | 'memory' | 'memory-save' | 'memory-correct' | 'memory-withdraw' | 'source-prices' | 'source-stock'; online?: boolean; streaming?:boolean; resultProfile?:boolean; manifestSha?:string; memory?: boolean; discovery?:boolean; source?:boolean};
+  syntheticCase: 'tasks' | 'knowledge' | 'catalog' | 'memory' | 'memory-save' | 'memory-correct' | 'memory-withdraw' | 'source-prices' | 'source-stock'; online?: boolean; streaming?:boolean; resultProfile?:boolean; manifestSha?:string; memory?: boolean; discovery?:boolean; source?:boolean; workbench?:boolean};
 function verifiedLaunch(): Launch {
   if (process.argv.length !== 4 || !['linux','darwin'].includes(process.platform) || process.arch !== 'x64'
       || process.versions.node.split('.')[0] !== '24') throw new ProtocolError('launch_profile');
@@ -173,15 +176,16 @@ function verifiedLaunch(): Launch {
   if (bytes.length > 16*1024*1024 || createHash('sha256').update(bytes).digest('hex') !== expected) throw new ProtocolError('launch_digest');
   const data: unknown = JSON.parse(bytes.toString('utf8'));
   if (!object(data)) throw new ProtocolError('launch_profile');
+  const workbench = data['profile'] === `host-pi-workbench-node24-${process.platform}-online-v1`;
   const memory = data['profile'] === `host-pi-memory-node24-${process.platform}-v1` || data['profile'] === `host-pi-memory-node24-${process.platform}-online-v1`;
   const sourceProfile = data['profile'] === `host-pi-source-node24-${process.platform}-v1` || data['profile'] === `host-pi-source-node24-${process.platform}-online-v1`;
-  const discovery = sourceProfile || data['profile'] === `host-pi-discovery-node24-${process.platform}-v1` || data['profile'] === `host-pi-discovery-node24-${process.platform}-online-v1`;
-  const family = sourceProfile ? 'source' : discovery ? 'discovery' : memory ? 'memory' : 'readonly';
+  const discovery = workbench || sourceProfile || data['profile'] === `host-pi-discovery-node24-${process.platform}-v1` || data['profile'] === `host-pi-discovery-node24-${process.platform}-online-v1`;
+  const family = workbench ? 'workbench' : sourceProfile ? 'source' : discovery ? 'discovery' : memory ? 'memory' : 'readonly';
   const resultProfile=data['profile']===`host-pi-readonly-node24-${process.platform}-online-stream-result-v1`;
   const streaming=resultProfile||data['profile']===`host-pi-readonly-node24-${process.platform}-online-stream-v1`;
   const online = streaming || data['profile'] === `host-pi-${family}-node24-${process.platform}-online-v1`;
   if (data['profile'] !== `host-pi-${family}-node24-${process.platform}-${resultProfile ? 'online-stream-result-v1' : streaming ? 'online-stream-v1' : online ? 'online-v1' : 'v1'}`
-      || data['wire_protocol'] !== (streaming ? STREAM_PROTOCOL : sourceProfile ? (online ? SOURCE_ONLINE_PROTOCOL : SOURCE_PROTOCOL) : discovery ? (online ? DISCOVERY_ONLINE_PROTOCOL : DISCOVERY_PROTOCOL) : memory ? (online ? MEMORY_ONLINE_PROTOCOL : MEMORY_PROTOCOL) : (online ? ONLINE_PROTOCOL : 'v4.pi-readonly/1'))) throw new ProtocolError('launch_profile');
+      || data['wire_protocol'] !== (workbench ? WORKBENCH_ONLINE_PROTOCOL : streaming ? STREAM_PROTOCOL : sourceProfile ? (online ? SOURCE_ONLINE_PROTOCOL : SOURCE_PROTOCOL) : discovery ? (online ? DISCOVERY_ONLINE_PROTOCOL : DISCOVERY_PROTOCOL) : memory ? (online ? MEMORY_ONLINE_PROTOCOL : MEMORY_PROTOCOL) : (online ? ONLINE_PROTOCOL : 'v4.pi-readonly/1'))) throw new ProtocolError('launch_profile');
   const sdk = exact(data['sdk'], ['engine','version','adapter_contract']);
   if (Object.entries(SDK).some(([key, value]) => sdk[key] !== value)) throw new ProtocolError('sdk_identity');
   const provider = exact(data['provider'], online ? ['kind','provider','model'] : ['kind','case']);
@@ -226,16 +230,16 @@ function verifiedLaunch(): Launch {
   }
   // Host verifies the full installed SDK closure. Child rechecks only the fixed
   // loaded release modules; neither check eliminates replacement races.
-  return {root, privateRoot, provider: providerKey, model, syntheticCase: selected as Launch['syntheticCase'], online, streaming, resultProfile, manifestSha:expected, memory, discovery, source:sourceProfile};
+  return {root, privateRoot, provider: providerKey, model, syntheticCase: selected as Launch['syntheticCase'], online, streaming, resultProfile, manifestSha:expected, memory, discovery, source:sourceProfile, workbench};
 }
 
 async function main(): Promise<void> {
   const launch = verifiedLaunch();
-  const channel = new Channel(launch.online, launch.memory, launch.discovery, launch.source,launch.streaming,launch.resultProfile?{contract_version:3,wire_protocol:STREAM_PROTOCOL,launch_profile:`host-pi-readonly-node24-${process.platform}-online-stream-result-v1`,source_manifest_sha256:launch.manifestSha!}:undefined);
+  const channel = new Channel(launch.online, launch.memory, launch.discovery, launch.source,launch.streaming,launch.resultProfile?{contract_version:3,wire_protocol:STREAM_PROTOCOL,launch_profile:`host-pi-readonly-node24-${process.platform}-online-stream-result-v1`,source_manifest_sha256:launch.manifestSha!}:undefined,launch.workbench);
   try {
     const hello = await channel.next();
     if (hello.type !== 'hello') throw new ProtocolError('hello_required');
-    await channel.send('ready', {sdk: SDK, profile: launch.resultProfile ? RESULT_PROFILE : launch.streaming ? STREAM_PROFILE : launch.source ? (launch.online ? SOURCE_ONLINE_PROFILE : SOURCE_PROFILE) : launch.discovery ? (launch.online ? DISCOVERY_ONLINE_PROFILE : DISCOVERY_PROFILE) : launch.memory ? (launch.online ? MEMORY_ONLINE_PROFILE : MEMORY_PROFILE) : (launch.online ? ONLINE_PROFILE : PROFILE)});
+    await channel.send('ready', {sdk: SDK, profile: launch.workbench ? WORKBENCH_ONLINE_PROFILE : launch.resultProfile ? RESULT_PROFILE : launch.streaming ? STREAM_PROFILE : launch.source ? (launch.online ? SOURCE_ONLINE_PROFILE : SOURCE_PROFILE) : launch.discovery ? (launch.online ? DISCOVERY_ONLINE_PROFILE : DISCOVERY_PROFILE) : launch.memory ? (launch.online ? MEMORY_ONLINE_PROFILE : MEMORY_PROFILE) : (launch.online ? ONLINE_PROFILE : PROFILE)});
     const frame = await channel.next();
     if (frame.type !== 'start') throw new ProtocolError('start_required');
     const start = frame.body; shape(start);

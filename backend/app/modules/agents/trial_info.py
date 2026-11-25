@@ -75,7 +75,8 @@ def read_trial_info(request: Request, actor, session: Session) -> PiTrialInfo:
             raise service.AgentRuntimeError("pi_trial_scope_unavailable", 403)
         return PiTrialInfo(mode=campaign.mode, run_id=campaign.run_id,
             sample_text=SAMPLE, sample_sha256=SAMPLE_SHA256,
-            expires_at=expiry.isoformat(), start_available=not expired and existing is None)
+            expires_at=expiry.isoformat(),
+            start_available=not expired and existing is None and campaign.dispatch_window_open())
     finally:
         session.rollback()
         session.close()

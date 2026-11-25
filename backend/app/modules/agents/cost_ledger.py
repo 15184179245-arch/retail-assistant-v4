@@ -21,6 +21,7 @@ after a private rollback.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from decimal import Context, Decimal, ROUND_CEILING, ROUND_HALF_UP, localcontext
 import os
@@ -192,6 +193,23 @@ def _row_occupancy(row: CostLedger) -> Decimal:
     raise CostLedgerError("cost_ledger_conflict")
 
 
+def _sum_amounts(amounts: Iterable[Decimal]) -> Decimal:
+    """Sum validated finite amounts exactly without the ambient Decimal context."""
+    total = places = 0
+    for amount in amounts:
+        sign, digits, exponent = amount.as_tuple()
+        scale = -exponent
+        if scale > places:
+            total *= 10 ** (scale - places)
+            places = scale
+        coefficient = 0
+        for digit in digits:
+            coefficient = coefficient * 10 + digit
+        total += (-coefficient if sign else coefficient) * 10 ** (places - scale)
+    sign, digits, _ = Decimal(total).as_tuple()
+    return Decimal((sign, digits, -places))
+
+
 def _spent(session: Session, policy: BudgetPolicy, *, exclude_id: str | None = None) -> Decimal:
     """Sum only rows bound to this exact scoped policy and currency."""
     statement = select(CostLedger).where(
@@ -208,10 +226,7 @@ def _spent(session: Session, policy: BudgetPolicy, *, exclude_id: str | None = N
         statement = statement.where(CostLedger.store_budget_id == policy.id)
     if exclude_id is not None:
         statement = statement.where(CostLedger.id != exclude_id)
-    total = Decimal(0)
-    for row in session.scalars(statement).all():
-        total += _row_occupancy(row)
-    return total
+    return _sum_amounts(_row_occupancy(row) for row in session.scalars(statement).all())
 
 
 def _reconciliation_blocked(session: Session, policy: BudgetPolicy) -> bool:
@@ -392,8 +407,8 @@ def reserve_cost(session: Session, actor: AuthenticatedSubject, run: AgentRun,
         reserved = _ceiling_amount(estimate)
         if _exceeds(reserved, _per_call_limit(employee)) or _exceeds(reserved, _per_call_limit(store)):
             raise CostLedgerError("cost_budget_exceeded")
-        if (_exceeds(_spent(session, employee) + reserved, _limit(employee))
-                or _exceeds(_spent(session, store) + reserved, _limit(store))):
+        if (_exceeds(_sum_amounts((_spent(session, employee), reserved)), _limit(employee))
+                or _exceeds(_sum_amounts((_spent(session, store), reserved)), _limit(store))):
             raise CostLedgerError("cost_budget_exceeded")
 
         # Conditional version bumps are the cross-transaction admission gate:
@@ -401,8 +416,8 @@ def reserve_cost(session: Session, actor: AuthenticatedSubject, run: AgentRun,
         # or fails closed with cost_ledger_conflict.
         _bump_policy(session, employee, at)
         _bump_policy(session, store, at)
-        if (_exceeds(_spent(session, employee) + reserved, _limit(employee))
-                or _exceeds(_spent(session, store) + reserved, _limit(store))):
+        if (_exceeds(_sum_amounts((_spent(session, employee), reserved)), _limit(employee))
+                or _exceeds(_sum_amounts((_spent(session, store), reserved)), _limit(store))):
             raise CostLedgerError("cost_budget_exceeded")
 
         ledger = CostLedger(
@@ -552,9 +567,18 @@ def _lock_budgets(session: Session, ledger: CostLedger, at: datetime,
         except CostLedgerError:
             over = True
             continue
-        if _exceeds(_spent(session, policy, exclude_id=ledger.id) + estimated, limit):
+        if _exceeds(_sum_amounts((_spent(session, policy, exclude_id=ledger.id), estimated)), limit):
             over = True
     return over
+
+
+def _matches_settled_usage(ledger: CostLedger | None, amount: str, usage: dict | None) -> bool:
+    if (ledger is None or ledger.status not in ("settled", "reconciliation_required")
+            or ledger.estimated_amount != amount or usage is None):
+        return False
+    saved = ledger.usage_snapshot
+    # Equality alone would equate JSON booleans/floats with integer token counts.
+    return saved == usage and all(type(count) is int for _, count in saved["quantities"])
 
 
 def settle_cost(session: Session, actor: AuthenticatedSubject, run: AgentRun,
@@ -602,9 +626,10 @@ def settle_cost(session: Session, actor: AuthenticatedSubject, run: AgentRun,
     # positive rate settles at 0.000001, never 0.000000, so budget is not released.
     estimated = _ceiling_amount(estimate)
     formatted = _formatted(estimated)
+    snapshot = _usage_snapshot(usage)
 
     if ledger.status in ("settled", "reconciliation_required"):
-        if ledger.estimated_amount == formatted:
+        if _matches_settled_usage(ledger, formatted, snapshot):
             return ledger
         raise CostLedgerError("cost_ledger_conflict")
     if ledger.status != "reserved":
@@ -624,7 +649,7 @@ def settle_cost(session: Session, actor: AuthenticatedSubject, run: AgentRun,
                 CostLedger.status == "reserved",
             )
             .values(status=status, estimated_amount=formatted,
-                    usage_snapshot=_usage_snapshot(usage), error_code=error_code,
+                    usage_snapshot=snapshot, error_code=error_code,
                     updated_at=at, settled_at=at)
             .execution_options(synchronize_session=False)
         )
@@ -633,14 +658,14 @@ def settle_cost(session: Session, actor: AuthenticatedSubject, run: AgentRun,
                 session.rollback()
                 current = _find_ledger(session, ledger.organization_id, ledger.store_id,
                                        ledger.run_id, ledger.step_id, ledger.call_key)
-                if current is not None and current.estimated_amount == formatted:
+                if _matches_settled_usage(current, formatted, snapshot):
                     return current
             # Managed mode: the CAS lost inside the caller's transaction. Fail
             # closed instead of rolling back and re-reading a fake success.
             raise CostLedgerError("cost_ledger_conflict")
         ledger.status = status
         ledger.estimated_amount = formatted
-        ledger.usage_snapshot = _usage_snapshot(usage)
+        ledger.usage_snapshot = snapshot
         ledger.error_code = error_code
         ledger.updated_at = at
         ledger.settled_at = at
@@ -876,14 +901,14 @@ def _permission_allowed(session: Session, actor: AuthenticatedSubject, permissio
 def _scoped_time(value: datetime | str | None, name: str) -> datetime | None:
     if value is None:
         return None
-    if isinstance(value, str):
-        try:
+    try:
+        if isinstance(value, str):
             value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            raise CostLedgerError("cost_time_range_invalid", 400) from None
-    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
-        raise CostLedgerError("cost_time_range_invalid", 400)
-    return value.astimezone(timezone.utc)
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+            raise CostLedgerError("cost_time_range_invalid", 400)
+        return value.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        raise CostLedgerError("cost_time_range_invalid", 400) from None
 
 
 def _scoped_identifier(value: str | None) -> str | None:

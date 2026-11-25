@@ -42,6 +42,7 @@ from backend.app.modules.erp_commands.erp_003_wire import (
     REQUEST_INVALID,
     REQUEST_TOO_LARGE,
     RESPONSE_INVALID,
+    SIGNED_RESPONSE_COMMON_FIELDS,
     LoopbackSandboxConfig,
     SandboxAdapterError,
     SandboxCapabilities,
@@ -170,10 +171,7 @@ class SyntheticERPHTTPAdapter:
 
     def _verify_common(
         self, dto, data, phase: str, maybe_sent: bool, code: str) -> None:
-        required = (
-            "contract_id", "adapter_id", "protocol_version", "mode",
-            "organization_id", "store_id")
-        if any(key not in data for key in required):
+        if any(key not in data for key in SIGNED_RESPONSE_COMMON_FIELDS):
             raise SandboxAdapterError(code, phase, maybe_sent)
         if dto.contract_id != CONTRACT_ID or dto.adapter_id != ADAPTER_ID:
             raise SandboxAdapterError(code, phase, maybe_sent)

@@ -1,0 +1,45 @@
+.ar-product-image-result .assistant-image-dialog img {
+  display: block;
+  inline-size: 100%;
+  block-size: auto;
+  max-block-size: min(72vh, 60rem);
+  max-block-size: min(72dvh, 60rem);
+  object-fit: contain;
+}
+
+.ar-product-image-result .assistant-image-dialog[open] {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Keep Close and Retry in reach while tall content scrolls independently. */
+.ar-product-image-controls {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: start;
+  gap: .375rem;
+  margin-block-end: .4rem;
+}
+
+.ar-product-image-controls > button {
+  box-sizing: border-box;
+  min-block-size: max(44px, 2.25rem);
+  min-inline-size: 44px;
+  max-inline-size: 100%;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.ar-product-image-controls > button[aria-disabled="true"] {
+  opacity: .65;
+  cursor: default;
+}
+
+.ar-product-image-viewport {
+  min-block-size: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}

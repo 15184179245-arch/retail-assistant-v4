@@ -1,6 +1,5 @@
-import { navigate } from "../app/router";
-import { openWorkbenchTab, setLeftSection } from "../workspace/store";
-import { getPermittedWorkObjects, OBJECT_LIBRARY_CATEGORIES, toRouteWorkbenchTab } from "./workObjects";
+import { setLeftSection } from "../workspace/store";
+import { getPermittedWorkObjects, OBJECT_LIBRARY_CATEGORIES, openWorkObjectRouteTab } from "./workObjects";
 import styles from "../styles/workbench.module.css";
 
 export interface ObjectLibraryViewProps {
@@ -58,9 +57,7 @@ export function ObjectLibraryView({ capabilities }: ObjectLibraryViewProps) {
                     type="button"
                     className={styles.primaryBtn}
                     onClick={() => {
-                      setLeftSection("today");
-                      navigate(mod.path);
-                      openWorkbenchTab(toRouteWorkbenchTab(mod));
+                      openWorkObjectRouteTab(mod.path);
                     }}
                   >
                     打开工作对象

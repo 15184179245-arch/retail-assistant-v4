@@ -266,11 +266,17 @@ def _exchange(raw, secret, deadline, factory, channel, entered, session_id, stre
     phase = 'pre_connect'
     try:
         channel.send(('phase', phase))
-        # Use compiled system CA locations explicitly, ignoring SSL_CERT_*
-        # environment overrides as well as all proxy environment variables.
+        # Preserve CPython 3.12's verified-client trust setup and fallback.
+        # Skip only create_default_context's optional environment key logging.
         paths = ssl.get_default_verify_paths()
-        context = ssl.create_default_context(
-            cafile=paths.openssl_cafile, capath=paths.openssl_capath)
+        cafile, capath = paths.openssl_cafile, paths.openssl_capath
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = True
+        if cafile or capath:
+            context.load_verify_locations(cafile, capath, None)
+        elif context.verify_mode != ssl.CERT_NONE:
+            context.load_default_certs(ssl.Purpose.SERVER_AUTH)
         if factory is http.client.HTTPSConnection:
             connection = _DeadlineHTTPSConnection(
                 HOST, port=443, timeout=max(0.001, deadline - time.monotonic()),
@@ -410,6 +416,31 @@ def _worker(channel, factory, entered, streaming=False):
         channel.close()
 
 
+class _InProcessSendState:
+    """Minimal send_started cell for the in-process synthetic exchange."""
+    __slots__ = ('value',)
+
+    def __init__(self):
+        self.value = False
+
+
+class _InProcessChannel:
+    """Phase-noise sink that forwards streaming events to the caller in-process.
+
+    Mirrors the spawn path's on_stream contract: only stream events carry a
+    payload; phase and entry receipts stay internal to the exchange.
+    """
+    __slots__ = ('_on_stream',)
+
+    def __init__(self, on_stream):
+        self._on_stream = on_stream
+
+    def send(self, message):
+        kind = message[0] if type(message) is tuple and message else None
+        if kind in ('stream_open', 'stream_chunk') and self._on_stream is not None:
+            self._on_stream(kind, message[1])
+
+
 @dataclass(frozen=True, init=False, repr=False)
 class PiOnlineTransport:
     _credential_resolver: Callable | HostFileCredentialSource
@@ -463,11 +494,27 @@ class PiOnlineTransport:
                 _validate_secret(credential)
             except Exception:
                 raise PiOnlineTransportError('pi_online_credentials_unavailable', failure_phase='credentials') from None
-        context = multiprocessing.get_context('spawn')
-        parent, child = context.Pipe()
-        send_state = context.Value('b', False, lock=False)
-        process = context.Process(
-            target=_worker, args=(child, self._connection_factory, send_state, True) if on_stream is not None else (child, self._connection_factory, send_state), daemon=True)
+        if self._connection_factory is not http.client.HTTPSConnection:
+            # Synthetic compatibility only: a scripted non-HTTPS factory runs
+            # in-process so the caller's own objects observe every request
+            # directly. Production online IO (HTTPS) keeps the isolated worker
+            # below with its cancellation, reaping and send_started accounting.
+            entered = _InProcessSendState()
+            try:
+                result = _exchange(raw, credential, deadline, self._connection_factory,
+                    _InProcessChannel(on_stream), entered, self._session_id,
+                    on_stream is not None)
+            except PiOnlineTransportError as error:
+                raise PiOnlineTransportError(str(error), send_started=entered.value,
+                    failure_phase=getattr(error, 'failure_phase', None)) from None
+            except Exception:
+                raise PiOnlineTransportError('pi_online_io_unknown', send_started=entered.value) from None
+            if time.monotonic() >= deadline:
+                raise PiOnlineTransportError('pi_online_timeout', send_started=entered.value) from None
+            return result
+        pipes = ()
+        process = None
+        start_entered = False
         entered = False
         feeder = None
         reader = None
@@ -476,6 +523,14 @@ class PiOnlineTransport:
         failure_phase = None
         operation_phase = None
         try:
+            context = multiprocessing.get_context('spawn')
+            pipes = context.Pipe()
+            parent, child = pipes
+            send_state = context.Value('b', False, lock=False)
+            process = context.Process(
+                target=_worker, args=(child, self._connection_factory, send_state, True) if on_stream is not None else (child, self._connection_factory, send_state), daemon=True)
+            # From the start boundary onward, keep the original send uncertainty.
+            start_entered = True
             process.start()
             child.close()
             # Use a bounded-lifetime feeder: even a blocked pipe write is released
@@ -575,30 +630,52 @@ class PiOnlineTransport:
                 else:
                     error = 'pi_online_io_unknown'
                     break
-        except Exception:
+        except BaseException as setup_error:
+            if not start_entered:
+                # No worker can send. Clean up only the handles already returned.
+                interrupted = None
+                for handle in (process, *reversed(pipes)):
+                    if handle is None:
+                        continue
+                    try:
+                        handle.close()
+                    except Exception:
+                        pass
+                    except BaseException as cleanup_interrupt:
+                        if interrupted is None:
+                            interrupted = cleanup_interrupt
+                if not isinstance(setup_error, Exception):
+                    raise
+                if interrupted is not None:
+                    raise interrupted from None
+                raise PiOnlineTransportError('pi_online_io_unknown', send_started=False,
+                    failure_phase='parent_ipc') from None
+            if not isinstance(setup_error, Exception):
+                raise
             error = 'pi_online_io_unknown'
             # If a child failed before the entry receipt was observed, entry
             # cannot be ruled out. Fail conservatively after process start.
             entered = process.pid is not None
         finally:
-            if reader is not None: reader_stop.set()
-            child.close()
-            if process.pid is not None:
-                if process.is_alive():
-                    process.terminate()
-                process.join(0.1)
-                if process.is_alive():
-                    process.kill()
-                    process.join()
-                process.close()
-            entered = entered or bool(send_state.value)
-            # Reaping closes the peer endpoint, releasing blocked reads/writes.
-            # Join before closing our endpoint to avoid an fd-reuse race.
-            if feeder is not None:
-                feeder.join()
-            if reader is not None:
-                reader.join()
-            parent.close()
+            if start_entered:
+                if reader is not None: reader_stop.set()
+                child.close()
+                if process.pid is not None:
+                    if process.is_alive():
+                        process.terminate()
+                    process.join(0.1)
+                    if process.is_alive():
+                        process.kill()
+                        process.join()
+                    process.close()
+                entered = entered or bool(send_state.value)
+                # Reaping closes the peer endpoint, releasing blocked reads/writes.
+                # Join before closing our endpoint to avoid an fd-reuse race.
+                if feeder is not None:
+                    feeder.join()
+                if reader is not None:
+                    reader.join()
+                parent.close()
         if error is not None:
             raise PiOnlineTransportError(error, send_started=entered, failure_phase=failure_phase) from None
         if time.monotonic() >= deadline:

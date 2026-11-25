@@ -10,7 +10,10 @@ CONTEXT_KEY = 'assistant_work_authority'
 DEFAULT_CAPABILITIES = frozenset({'agents.run', 'tasks.manage', 'tasks.read_self',
     'catalog.read', 'knowledge.read', 'memory.read', 'memory.write',
     'guanjia.inventory.read', 'guanjia.pricing.read', 'guanjia.company.read'})
-CAPABILITIES=DEFAULT_CAPABILITIES|frozenset({'guanjia.sales.read','guanjia.catalog.read'})
+from backend.app.modules.workspace.service import _KIND_PERMISSION_MAP
+_WORKSPACE_PERMISSIONS = frozenset(permission for actions in _KIND_PERMISSION_MAP.values()
+    for operation in ('read', 'write') for permission in actions[operation])
+CAPABILITIES=DEFAULT_CAPABILITIES|frozenset({'guanjia.sales.read','guanjia.catalog.read'})|_WORKSPACE_PERMISSIONS
 
 
 @dataclass(frozen=True)
@@ -61,7 +64,10 @@ def check(session, principal, *, permission='agents.run', now=None, lock=False):
     else:
         # Read-only capability projections may run inside final-pin callbacks.
         # The enlisted lock-path recheck supplies the actual DB commit clock.
-        snapshot = _validate(session, **args, now=now or datetime.now(timezone.utc))
+        # Never relock here: the authority lock was taken at the original
+        # execution entry (lock_work_authority), and a FOR UPDATE inside the
+        # commit guard's read-only validation is command_check_write_forbidden.
+        snapshot = _validate(session, **args, now=now or datetime.now(timezone.utc), lock=False)
     row = session.get(authority_model(principal.kind), snapshot.work_id, populate_existing=True)
     if row is None or principal != _from_row(row): _deny()
     # Commit must preserve both grant validity and this exact principal, not
@@ -133,6 +139,8 @@ def from_execution(session, execution, run):
     if row is None:
         if CONTEXT_KEY in context: _deny()
         return None
+    from backend.app.modules.assistant.workspace_binding import validate_origin
+    validate_origin(session, row)
     principal = _from_row(row)
     if (type(marker) is not dict or marker != frozen(principal)
             or type(marker.get('version')) is not int

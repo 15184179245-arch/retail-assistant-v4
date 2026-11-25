@@ -11,11 +11,11 @@ data class SyntheticProduct(
 
 object SyntheticCatalog {
     val products = listOf(
-        SyntheticProduct("demo-001", "SYN-C001", "6900000000017", "合成示例：十字螺丝刀", 1250),
-        SyntheticProduct("demo-002", "SYN-C002", "6900000000024", "合成示例：活动扳手", 3680),
-        SyntheticProduct("demo-003", "SYN-C003", "6900000000031", "合成示例：绝缘胶带", 560),
-        SyntheticProduct("demo-004", "SYN-C004", "6900000000048", "合成示例：卷尺", 2190),
-        SyntheticProduct("demo-005", "SYN-C005", "6900000000055", "合成示例：尖嘴钳", 2870),
+        SyntheticProduct("demo-001", "SYN-C001", "2000000001005", "合成示例：十字螺丝刀", 1250),
+        SyntheticProduct("demo-002", "SYN-C002", "2000000001012", "合成示例：活动扳手", 3680),
+        SyntheticProduct("demo-003", "SYN-C003", "2000000001029", "合成示例：绝缘胶带", 560),
+        SyntheticProduct("demo-004", "SYN-C004", "2000000001036", "合成示例：卷尺", 2190),
+        SyntheticProduct("demo-005", "SYN-C005", "2000000001043", "合成示例：尖嘴钳", 2870),
     )
 
     fun search(query: String): List<SyntheticProduct> {

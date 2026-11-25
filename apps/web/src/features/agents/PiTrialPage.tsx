@@ -1,3 +1,4 @@
+import type {TrialCitation} from './piTrialApi';
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type { Session } from "../../lib/auth/session";
 import { getScopeVersion, subscribe } from "../../lib/auth/session";
@@ -8,6 +9,10 @@ function Times({ value }: { value: Pick<Observation<unknown>, "startedAt" | "col
   return <p>请求时间：{value.startedAt}；采集时间：{value.collectedAt}</p>;
 }
 
+export function TrialCitationContent({citation:c}:{citation:TrialCitation}) {
+  if(c.kind==='product_image_result'||c.kind==='history_image_result')return <>{c.label}{c.observedAt&&<p>来源时间：{c.observedAt}</p>}</>;
+  return <>{c.label} / {c.kind} / {c.objectId} / {c.version} / {c.versionRef}{c.sourceRef&&<p>来源：{c.sourceRef}</p>}{c.observedAt&&<p>来源时间：{c.observedAt}</p>}</>;
+}
 export function PiTrialPage({ session, baseUrl = "" }: { session: Session; baseUrl?: string }) {
   const scope = useSyncExternalStore(subscribe, getScopeVersion, getScopeVersion);
   const controller = useMemo(() => new PiTrialController(session, {
@@ -56,8 +61,7 @@ export function PiTrialPage({ session, baseUrl = "" }: { session: Session; baseU
         <h4>服务端来源</h4>
         {view.run.data.citations?.length === 0 && <p>服务端未提供知识或商品引用；不补造来源。</p>}
         <ul>{view.run.data.citations?.map((c, index) => <li key={index}>
-          {c.label} / {c.kind} / {c.objectId} / {c.version} / {c.versionRef}
-          {c.sourceRef && <p>来源：{c.sourceRef}</p>}{c.observedAt && <p>来源时间：{c.observedAt}</p>}
+          <TrialCitationContent citation={c}/>
         </li>)}</ul>
       </> : <p>答案尚未记录或答案／来源不可用；旧内容已隐藏。</p>}
     </article>}

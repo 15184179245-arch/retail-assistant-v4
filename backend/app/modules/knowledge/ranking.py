@@ -3,9 +3,7 @@
 The formal path never re-reads a body: A gets the exact database token score
 and compact citation metadata from ``projection.load_window``; the fresh B
 worker only applies the original product/category scope regex, the stable
-``(-score, submitted_at)`` order and the 1..20 citation cap.  The legacy
-full-text scorer is kept below as a *test oracle* for value-for-value parity;
-it is not called by the P1-C chain.
+``(-score, submitted_at)`` order and the 1..20 citation cap.
 """
 from __future__ import annotations
 
@@ -30,10 +28,6 @@ HEADER_FIELDS = (
     'source_generation', 'window_limit', 'window_expires_at',
     'resolver_version', 'normalizer_version', 'projection_schema_version', 'query',
 )
-
-
-def tokens(text: str) -> set[str]:
-    return {token for token in re.split(r'\s+', (text or '').lower()) if token}
 
 
 def _timestamp(value):
@@ -81,55 +75,6 @@ def rank_candidates(candidates, *, query: str, limit: int = 5) -> dict:
             'approved_by': item.get('approved_by'),
             'approved_at': item.get('approved_at'),
             'expires_at': item.get('expires_at'),
-            'scope_type': item['scope_type'],
-            'scope_ref': item.get('scope_ref'),
-        })
-    return {'query': text, 'citations': citations, 'insufficient': not citations,
-            'reason': None if citations else 'insufficient_evidence', 'answer': None}
-
-
-def legacy_score_candidates(candidates, *, query: str, limit: int = 5) -> dict:
-    """Test-only oracle: the original full-text ``score_materialized`` shape.
-
-    ``candidates`` here must still carry ``body``; P1-C production never calls
-    this function and never carries a body across the read boundary.
-    """
-    text = (query or '').strip()
-    if not text:
-        return {'query': query or '', 'citations': [], 'insufficient': True,
-                'reason': 'empty_query', 'answer': None}
-    query_tokens = tokens(text)
-    scored = []
-    for item in candidates:
-        if item['scope_type'] in ('product', 'category'):
-            reference = (item.get('scope_ref') or '').strip()
-            if not reference:
-                continue
-            pattern = r'(?<![A-Za-z0-9_-])' + re.escape(reference) + r'(?![A-Za-z0-9_-])'
-            if re.search(pattern, text, flags=re.IGNORECASE) is None:
-                continue
-        haystack = ' '.join(filter(None, (item.get('title'), item.get('body'),
-                                          item.get('source_ref'), item.get('scope_ref'))))
-        lowered = haystack.lower()
-        overlap = sum(1 for token in query_tokens if token in lowered)
-        if overlap:
-            scored.append((overlap, _timestamp(item.get('submitted_at')), item))
-    scored.sort(key=lambda row: (-row[0], row[1]))
-    citations = []
-    for _, _, item in scored[:max(1, min(limit, 20))]:
-        approved_at = item.get('approved_at')
-        expires_at = item.get('expires_at')
-        citations.append({
-            'entry_id': item['entry_id'],
-            'revision_id': item['revision_id'],
-            'version': item['revision_version'],
-            'title': item['title'],
-            'excerpt': (item.get('body') or '')[:400],
-            'source_type': item['source_type'],
-            'source_ref': item.get('source_ref'),
-            'approved_by': item.get('approved_by'),
-            'approved_at': _timestamp(approved_at).isoformat() if approved_at else None,
-            'expires_at': _timestamp(expires_at).isoformat() if expires_at else None,
             'scope_type': item['scope_type'],
             'scope_ref': item.get('scope_ref'),
         })

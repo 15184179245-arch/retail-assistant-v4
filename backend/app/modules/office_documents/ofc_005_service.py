@@ -48,7 +48,8 @@ _NUM = re.compile(r"(?:0|[1-9][0-9]{0,8})(?:\.[0-9]{1,3})?\Z")
 _MONEY = re.compile(r"(?:0|[1-9][0-9]{0,8})(?:\.[0-9]{1,2})?\Z")
 _SAFE_KEY = re.compile(r"[A-Za-z0-9_.:-]{1,120}\Z")
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
-_XML_BAD = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff]")
+# XML 1.0 Char ranges, not a ban on all Unicode noncharacters.
+_XML_BAD = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 _TWO = Decimal("0.01")
 
 
@@ -339,7 +340,10 @@ def _rows(row):
 
 def _xml_cell(value,index,row_index):
     # Every user-controlled field is written as inlineStr, never Excel formula.
-    text_value=xml_escape(str(value), {'"':"&quot;", "'":"&apos;"})
+    text_value=str(value)
+    if _XML_BAD.search(text_value):
+        _fail("office_document_xlsx_character_invalid", 422)
+    text_value=xml_escape(text_value, {'"':"&quot;", "'":"&apos;"})
     col=chr(65+index)
     return f'<c r="{col}{row_index}" t="inlineStr"><is><t xml:space="preserve">{text_value}</t></is></c>'
 

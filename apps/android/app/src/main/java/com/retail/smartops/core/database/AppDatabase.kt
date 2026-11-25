@@ -65,10 +65,12 @@ interface CatalogCacheDao {
     @Query("DELETE FROM catalog_cache_items WHERE snapshotVersion != :version")
     fun removeOtherVersions(version: String)
 
+    // Rank literal barcode/code matches before truncating broad name/code candidates.
     @Query("""SELECT * FROM catalog_cache_items
         WHERE snapshotVersion = :version AND instr(searchText, :query) > 0
-        ORDER BY name, productId LIMIT :limit""")
-    fun search(version: String, query: String, limit: Int): List<CatalogItemEntity>
+        ORDER BY CASE WHEN code COLLATE NOCASE = :entered OR barcode COLLATE BINARY = :entered
+            THEN 0 ELSE 1 END, name, productId LIMIT :limit""")
+    fun search(version: String, query: String, limit: Int, entered: String = query): List<CatalogItemEntity>
 }
 
 @Entity(
@@ -187,6 +189,59 @@ interface SalesDraftDao {
         )
         putDraft(saved)
         return saved
+    }
+
+    @Transaction
+    fun readOwnedDraftSnapshot(
+        draftId: String, scopeDigest: String, organizationId: String, storeId: String, employeeId: String,
+    ): Pair<LocalSalesDraftEntity, List<SalesSyncIntentEntity>>? {
+        val draft = getDraft(draftId)?.takeIf {
+            it.scopeDigest == scopeDigest && it.organizationId == organizationId &&
+                it.storeId == storeId && it.employeeId == employeeId
+        } ?: return null
+        val intents = listDraftIntents(draftId)
+        require(intents.all {
+            it.scopeDigest == scopeDigest && it.organizationId == organizationId &&
+                it.storeId == storeId && it.employeeId == employeeId
+        }) { "draft_scope_mismatch" }
+        return draft to intents
+    }
+
+    /** Own the snapshot and first never-sent key in one Room transaction. */
+    @Transaction
+    fun persistDraftAndInitialIntent(
+        candidate: LocalSalesDraftEntity, initialIntent: SalesSyncIntentEntity,
+    ): LocalSalesDraftEntity {
+        val existing = getDraft(candidate.draftId)
+        if (existing == null) {
+            check(initialIntent.draftId == candidate.draftId &&
+                initialIntent.scopeDigest == candidate.scopeDigest &&
+                initialIntent.organizationId == candidate.organizationId &&
+                initialIntent.storeId == candidate.storeId && initialIntent.employeeId == candidate.employeeId
+            ) { "draft_scope_mismatch" }
+            createDraftAndIntent(candidate, initialIntent)
+            return candidate
+        }
+        check(existing.syncState != "corrupt" && existing.status != "paid") { "draft_read_only" }
+        check(listDraftIntents(candidate.draftId).none { it.action == "prepare_handoff_v4" }) { "draft_read_only" }
+        return saveOwnedDraft(candidate.copy(rawBackup = existing.rawBackup, lastError = existing.lastError))
+    }
+
+    @Transaction
+    fun saveRepairsOfOwnedDraft(
+        expected: LocalSalesDraftEntity, repair: LocalSalesDraftEntity,
+    ): Boolean {
+        val current = getDraft(expected.draftId) ?: return false
+        if (current != expected || current.serverDraftId != null || current.status == "paid" ||
+            repair.draftId != current.draftId || repair.scopeDigest != current.scopeDigest ||
+            repair.organizationId != current.organizationId || repair.storeId != current.storeId ||
+            repair.employeeId != current.employeeId ||
+            listDraftIntents(current.draftId).any {
+                it.action != "create_draft_v4" || it.state != "pending" || it.attempts != 0
+            }
+        ) return false
+        putDraft(repair)
+        return true
     }
 
     @Query("""SELECT * FROM sales_sync_intents

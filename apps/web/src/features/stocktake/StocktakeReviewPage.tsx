@@ -1,7 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api/client";
 import { authorizedRequest, getScopeVersion } from "../../lib/auth/session";
+import { hasCapability, useCapabilities } from "../../lib/auth/capabilities";
+import { businessPermission } from "../../lib/auth/businessPermissions";
 import type { Session } from "../../lib/auth/session";
+import { readStocktakeObservationPage, type ObservationSource } from "./observations";
+
+export type { ObservationSource } from "./observations";
 
 type Coverage = "partial_area" | "partial_shelf" | "unknown";
 export type ReviewDecision = "accepted_partial" | "needs_recount";
@@ -15,24 +20,6 @@ export interface StocktakeSessionRow {
   version: number;
   opened_by: string;
   created_at: string;
-}
-
-export interface ObservationSource {
-  id: string;
-  event_seq: number;
-  session_id: string;
-  kind: "observed" | "correction";
-  supersedes_id: string | null;
-  product_id: string | null;
-  unknown_product_label: string | null;
-  location_id: string | null;
-  unknown_location_label: string | null;
-  quantity: string;
-  unit: string;
-  media_id: string | null;
-  observed_by: string;
-  observed_at: string;
-  recorded_at: string;
 }
 
 export interface StocktakeReviewLine {
@@ -217,19 +204,10 @@ async function loadAllObservations(id: string): Promise<ObservationSource[]> {
   let after = 0;
   // Bound pagination; too many sources must fail closed, not silently truncate.
   for (let page = 0; page < 100; page++) {
-    const batch = await authorizedRequest<ObservationSource[]>(
-      "/api/v1/stocktake/sessions/" + encodeURIComponent(id) +
-      "/observations?after_seq=" + after + "&limit=100");
-    if (!Array.isArray(batch) || batch.length > 100) {
-      throw new Error("invalid_stocktake_page");
-    }
+    const batch = await readStocktakeObservationPage(id, after, 100);
     if (batch.length === 0) return result;
-    for (const item of batch) {
-      if (!Number.isInteger(item.event_seq) || item.event_seq <= after ||
-          item.session_id !== id) throw new Error("invalid_stocktake_cursor");
-      after = item.event_seq;
-      result.push(item);
-    }
+    after = batch[batch.length - 1].event_seq;
+    result.push(...batch);
     if (batch.length < 100) return result;
   }
   throw new Error("stocktake_observation_pagination_incomplete");
@@ -243,6 +221,8 @@ export function StocktakeReviewPage({
   initialPreview?: ReviewPreview;
   initialSources?: ObservationSource[];
 }) {
+  const [reviewRejected, setReviewRejected] = useState(false);
+  const canReview = useCapabilities().hasCapability(businessPermission.stocktake.write) && !reviewRejected;
   const [sessions, setSessions] = useState<StocktakeSessionRow[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [preview, setPreview] = useState<ReviewPreview | null>(initialPreview ?? null);
@@ -348,7 +328,7 @@ export function StocktakeReviewPage({
       ? [...new Set([...previous, id])] : previous.filter(x => x !== id));
   }
   async function submit() {
-    if (!preview || !sourceComplete || submitting || loading || accessDenied ||
+    if (reviewRejected || !hasCapability(businessPermission.stocktake.write) || !preview || !sourceComplete || submitting || loading || accessDenied ||
         !selectedId || !blind) return;
     let body: ReturnType<typeof buildStocktakeDecision>;
     try {
@@ -375,7 +355,13 @@ export function StocktakeReviewPage({
       await open(selectedId);
     } catch (e) {
       if (scope !== getScopeVersion()) return;
-      if (deny(e)) return;
+      if (e instanceof ApiError && e.status === 401 && deny(e)) return;
+      if (e instanceof ApiError && e.status === 403) {
+        setReviewRejected(true);
+        await open(selectedId);
+        if (scope === getScopeVersion()) setError("提交复核未获授权；保留可重新核实的只读证据。");
+        return;
+      }
       if (e instanceof ApiError && e.status === 409) {
         const id = selectedId;
         clearDetail();
@@ -396,6 +382,7 @@ export function StocktakeReviewPage({
     <h2 id="stocktake-title">局部盘点、换算与人工裁决</h2>
     <p className="welcome-copy">仅查看当前门店现场观察，不等于账面库存。任何复核只生成审计收据，绝不调整库存或写入管家婆。</p>
     <p role="status">覆盖范围：局部 / 未知；正式账面库存、真实差异及全店准确率均不可计算。</p>
+    {!canReview && <p>当前身份只能读盘点证据，不能提交复核。</p>}
     {error ? <p className="login-error" role="alert">{error}</p> : null}
     {accessDenied ? <p role="alert">当前账号无盘点读取或复核权限；敏感数据已隐藏。</p> : <>
       <button type="button" onClick={() => void refreshSessions()} disabled={loading || submitting}>刷新本店盘点会话</button>
@@ -428,7 +415,7 @@ export function StocktakeReviewPage({
             return <li key={line.observation_id}>
               <label><input type="checkbox" checked={selectedIds.includes(line.observation_id)}
                 onChange={e => changeSelected(line.observation_id, e.target.checked)}
-                disabled={!sourceComplete || loading || submitting} />
+                disabled={!canReview || !sourceComplete || loading || submitting} />
                 观察 {line.observation_id} · 序号 {line.event_seq}</label>
               <p>商品：{line.product_id ?? "待识别：" + (line.unknown_product_label ?? "未知")} ·
                 库位：{line.location_id ?? "待识别：" + (line.unknown_location_label ?? "未知")}</p>
@@ -473,7 +460,7 @@ export function StocktakeReviewPage({
             账面写入：否
           </li>)}</ul>}
         <h3>仅人工复核，不执行库存变更</h3>
-        <fieldset disabled={!safety?.canRecount || !blind || loading || submitting}>
+        <fieldset disabled={!canReview || !safety?.canRecount || !blind || loading || submitting}>
           <legend>复核的是所见会话版本 {preview.session_version}</legend>
           <label>裁决类别 <select value={decision} onChange={e => changeDecision(e.target.value as ReviewDecision)}>
             <option value="needs_recount">需重新盘点 / 补证</option>
@@ -491,7 +478,7 @@ export function StocktakeReviewPage({
           }}>勾选本次全部有效观察</button>
         </fieldset>
         <button className="login-button" type="button"
-          disabled={!safety?.canRecount || (decision === "accepted_partial" &&
+          disabled={!canReview || !safety?.canRecount || (decision === "accepted_partial" &&
             !safety?.acceptedPartialAllowed) || loading || submitting || !blind ||
             selectedIds.length === 0 || reason.trim().length < 3}
           onClick={() => void submit()}>

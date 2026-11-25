@@ -296,6 +296,7 @@ def observe(session, requester, agent, *, payload: ObservationInput, host: Obser
         _observation_authority(session, requester, agent, host, payload.operation)
         row = None
         source_version = None
+        captured_at = None
         if not _confirmed_mapping(session, requester, host, payload):
             status = 'mapping_unconfirmed'
         elif (host.source_contract != 'synthetic-v1'
@@ -310,8 +311,10 @@ def observe(session, requester, agent, *, payload: ObservationInput, host: Obser
             read_endpoint(payload.operation, params)
             try:
                 raw = host.transport.query(payload.operation, params)
-                status, row, source_version = _interpret_observation(
-                    raw, payload, host, datetime.now(timezone.utc))
+                response_at = datetime.now(timezone.utc)
+                status, row, source_version = _interpret_observation(raw, payload, host, response_at)
+                # Report the source capture time used for freshness, not the later recheck time.
+                captured_at = response_at
             except RateLimited:
                 status = 'rate_limited'
             except TimeoutError:
@@ -329,7 +332,9 @@ def observe(session, requester, agent, *, payload: ObservationInput, host: Obser
         _observation_authority(session, requester, agent, host, payload.operation)
         if status not in ('mapping_unconfirmed', 'hold_real_read') and not _confirmed_mapping(session, requester, host, payload):
             status, row, source_version = 'mapping_unconfirmed', None, None
-        result = _observation_result(payload, host, start, datetime.now(timezone.utc), status, row, source_version)
+            captured_at = None
+        result = _observation_result(payload, host, start, captured_at or datetime.now(timezone.utc),
+                                     status, row, source_version)
         _observation_audit(session, requester, agent, payload, host, status, result)
         # Audit append may block on the DB; recheck after that last I/O before
         # disclosure. A denied call may have an observed-source audit, never an

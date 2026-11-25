@@ -4,7 +4,8 @@ from hashlib import sha256
 from fastapi import HTTPException
 from backend.app.application import commit_guard
 from backend.app.modules.assistant.models import AssistantTurnDispatch
-from backend.app.modules.assistant.core_adapter import digest, packed
+from backend.app.modules.assistant.core_adapter import digest
+from backend.app.modules.assistant.input_capacity import compose_turn_input
 from backend.app.modules.assistant.authority import issue_work_authority
 from backend.app.workers.outbox import OutboxEvent, enqueue
 
@@ -49,9 +50,7 @@ def binding(db,turn,intent):
         raise HTTPException(409,'assistant_turn_dispatch_binding_conflict')
     # All included text remains user-supplied data, not a system policy or a
     # reconstructed human credential. Never silently truncate the new request.
-    text='继续处理同一事项。以下是用户原始要求和按顺序追加的要求；以最后一次补充为本轮请求。\n'+packed({
-        'root_work_id':turn.root_work_id,'original_request':view['text'],
-        'followups':[event['text'] for event in turn.history if event['kind']=='followup']}).decode()
+    text=compose_turn_input(turn.root_work_id, view['text'], turn.history)
     return dict(task_state=view['task_state'],title=view['title'],text=text)
 
 

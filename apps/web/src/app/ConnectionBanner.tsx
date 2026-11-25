@@ -5,6 +5,7 @@ import { navigate } from "./router";
 
 export interface ConnectionBannerProps {
   session?: Session | null;
+  audience?: "assistant" | "general";
   onRetryConnection?: () => void;
   onRelogin?: () => void;
 }
@@ -37,6 +38,7 @@ function getSessionExpiryState(expiresAt?: string): {
 
 export function ConnectionBanner({
   session,
+  audience = "general",
   onRetryConnection,
   onRelogin,
 }: ConnectionBannerProps) {
@@ -94,7 +96,7 @@ export function ConnectionBanner({
     message = sessionExpiryWarning;
     action = { label: "重新登录", onClick: handleRelogin };
     role = "alert";
-  } else if (status === "offline") {
+  } else if (status === "offline" && audience !== "assistant") {
     bannerType = "danger";
     badgeLabel = "离线";
     message = "网络连接已断开，系统已切换至离线模式。现场扫码查货与人工开单保持可用，数据将在网络恢复后同步。";
@@ -102,13 +104,17 @@ export function ConnectionBanner({
   } else if (status === "backend_unreachable") {
     bannerType = "warning";
     badgeLabel = "服务未连接";
-    message = "服务端连接中断，正在尝试重新连接... 现场扫码与手工开单保持可用，写操作暂未同步。";
+    message = audience === "assistant"
+      ? "暂时无法连接助理服务。可继续编辑草稿；已经发送的消息请先核对原记录，不要重发。"
+      : "服务端连接中断，正在尝试重新连接... 现场扫码与手工开单保持可用，写操作暂未同步。";
     action = { label: "重试连接", onClick: handleRetry };
     role = "alert";
   } else if (status === "model_offline") {
     bannerType = "info";
     badgeLabel = "AI 离线";
-    message = "AI 辅助模型当前不可用，Agent 助手建议功能已暂停；现场手工开单、扫码与收货业务正常可用。";
+    message = audience === "assistant"
+      ? "模型暂不可用。已保存事项仍可查看；本页是否接收新消息以当前发送入口为准。"
+      : "AI 辅助模型当前不可用，Agent 助手建议功能已暂停；现场手工开单、扫码与收货业务正常可用。";
     role = "status";
   }
 

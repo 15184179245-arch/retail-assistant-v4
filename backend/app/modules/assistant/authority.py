@@ -85,6 +85,11 @@ def _seal(row):
         if row.source_inbox_id is not None or row.source_inbox_sha256 is not None:
             binding.update(version=3, source_inbox_id=row.source_inbox_id,
                            source_inbox_sha256=row.source_inbox_sha256)
+    pin = getattr(row, 'workspace_binding_sha256', None)
+    if pin is not None:
+        if type(pin) is not str or len(pin) != 64 or any(c not in '0123456789abcdef' for c in pin):
+            _deny('assistant_work_authority_binding_conflict')
+        binding['workspace_binding_sha256'] = pin
     return digest(binding)
 
 
@@ -129,10 +134,12 @@ def _bindings(session, row):
         view = binding(session, work, dispatch)
     else:
         view = _view(session, Scope(row.organization_id, row.store_id, row.owner_id), work, include_execution=False)
+    from backend.app.modules.assistant.workspace_binding import validate_origin
+    validate_origin(session, row)
     return dispatch, view
 
 
-def _validate(session, work_id, run_id, binding_sha256, permission, now, kind='work'):
+def _validate(session, work_id, run_id, binding_sha256, permission, now, kind='work', *, lock=True):
     """Read-only check under existing locks, also safe for commit_guard."""
     with session.no_autoflush:
         refresh_authority(session)
@@ -141,6 +148,9 @@ def _validate(session, work_id, run_id, binding_sha256, permission, now, kind='w
                 or row.revoked_at is not None or not _utc(row.issued_at) <= now < _utc(row.expires_at)):
             _deny()
         dispatch, view = _bindings(session, row)
+        if row.workspace_binding_sha256 is not None:
+            from backend.app.modules.assistant.workspace_binding import validate_origin, current_thread
+            current_thread(session, validate_origin(session, row), lock=lock)
         if kind == 'turn' and row.source_inbox_id is not None:
             from backend.app.modules.assistant.inbox import check_authority
             check_authority(session, row.source_inbox_id, row.source_inbox_sha256,
@@ -188,6 +198,9 @@ def issue_work_authority(session, actor, work, dispatch, policy, *, kind='work')
                 actor.organization_id, actor.store_id, actor.subject_id, actor.account_id)
             or (dispatch.session_id, dispatch.account_version) != (actor.session_id, actor.account_version)):
         _deny('assistant_work_authority_issuance_denied')
+    from backend.app.modules.assistant.workspace_binding import root_context, augment_policy, context_sha256
+    context = root_context(session, work, kind=kind)
+    policy = augment_policy(session, actor, policy, context)
     epoch = lock_command_authority(session, actor)
     now = commit_guard._db_clock(session)
     if _utc(policy.expires_at) <= now: _deny()
@@ -206,13 +219,14 @@ def issue_work_authority(session, actor, work, dispatch, policy, *, kind='work')
         account_id=actor.account_id, origin_session_id=actor.session_id, account_version=actor.account_version,
         work_epoch=work_epoch, request_id=work.request_id, request_digest=work.request_digest, snapshot_sha256=work.snapshot_sha256,
         permissions=sorted(policy.permissions), issued_at=now, expires_at=_utc(policy.expires_at))
+    row.workspace_binding_sha256 = context_sha256(context)
     row.binding_sha256 = _seal(row)
     session.add(row)
     expected = _snapshot(row)
     def final(db, instant):
         for permission in expected.permissions:
             check_command_authority(db, actor, permission=permission, epoch=epoch, now=instant)
-        _validate(db, expected.work_id, expected.run_id, expected.binding_sha256, 'agents.run', instant, kind=kind)
+        _validate(db, expected.work_id, expected.run_id, expected.binding_sha256, 'agents.run', instant, kind=kind, lock=False)
     commit_guard.enlist(session, action='assistant.work_authority_issued', check=final)
     record_event(session, actor_id=actor.subject_id, organization_id=actor.organization_id,
         store_id=actor.store_id, action='assistant.work_authority_issued', target_type='assistant_turn' if kind == 'turn' else 'task',
@@ -247,7 +261,7 @@ def lock_work_authority(session, *, work_id, run_id, binding_sha256, permission,
         if row is None or (row.organization_id, row.store_id, row.account_id) != scope: _deny()
         result = _validate(session, work_id, run_id, binding_sha256, permission, commit_guard._db_clock(session), kind=kind)
         def final(db, instant):
-            _validate(db, work_id, run_id, binding_sha256, permission, instant, kind=kind)
+            _validate(db, work_id, run_id, binding_sha256, permission, instant, kind=kind, lock=False)
         commit_guard.enlist(session, action='assistant.work_authority_used', check=final)
         return result
 

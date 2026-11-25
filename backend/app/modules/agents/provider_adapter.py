@@ -514,6 +514,7 @@ class ChatCompletionsProvider:
         if not isinstance(content, str) or not content.strip():
             raise ProviderError("provider_invalid_response", input_tokens=input_tokens, output_tokens=output_tokens) from None
         try:
+            content.encode("utf-8")
             return ProviderResponse(suggestion=content, input_tokens=input_tokens, output_tokens=output_tokens)
         except (TypeError, ValueError):
             raise ProviderError("provider_invalid_response", input_tokens=input_tokens, output_tokens=output_tokens) from None

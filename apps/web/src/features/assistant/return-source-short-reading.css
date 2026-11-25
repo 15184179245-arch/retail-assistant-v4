@@ -1,0 +1,8 @@
+/* At narrow, short viewports wrapped return headings can cover the entire scrollport.
+ * Let them scroll out of the way; scope=col and native keyboard scrolling stay intact.
+ */
+@media (max-width: 600px) and (max-height: 360px) {
+  .ar-return-source-short-reading thead th {
+    position: static;
+  }
+}

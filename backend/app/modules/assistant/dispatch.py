@@ -4,6 +4,7 @@ New explicitly granted work uses its exact WorkPrincipal; legacy work retains
 the original employee session checks. Neither path creates a background login. A
 durably launching intent is NEVER automatically submitted or spawned again.
 """
+from backend.app.modules.assistant.input_capacity import check_input_capacity
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from threading import Event
@@ -40,6 +41,8 @@ class AssistantWorkerConfig:
     inbox_policy: WorkAuthorityPolicy | None = None
     discovery: bool = False
     source: bool = False
+    tool_profile: str = ''
+    tool_selection: tuple = ()
 
 
 def _config(config):
@@ -58,6 +61,26 @@ def _config(config):
             or config.online_policy is not None and config.source != config.online_policy.source_enabled
             or type(config.discovery) is not bool or config.discovery and not config.memory
             or config.online_policy is not None and config.discovery != config.online_policy.discovery_enabled):
+        raise ValueError('assistant_worker_configuration_invalid')
+
+    # The workbench profile is the only tool_profile override: a configured
+    # key/version 2D selection as the run's upper bound, never a default-all.
+    if (type(config.tool_profile) is not str
+            or config.tool_profile not in ('', 'pi-workbench-v1')
+            or config.online_policy is not None and config.online_policy.workbench_enabled
+                is not (config.tool_profile == 'pi-workbench-v1')
+            or type(config.tool_selection) is not tuple
+            or any(type(pair) is not tuple or len(pair) != 2
+                   or type(pair[0]) is not str or type(pair[1]) is not str
+                   for pair in config.tool_selection)):
+        raise ValueError('assistant_worker_configuration_invalid')
+    if config.tool_profile == 'pi-workbench-v1':
+        if (not (config.memory and config.discovery and config.source)
+                or not config.tool_selection
+                or sorted(config.tool_selection) != list(config.tool_selection)
+                or len(set(config.tool_selection)) != len(config.tool_selection)):
+            raise ValueError('assistant_worker_configuration_invalid')
+    elif config.tool_selection:
         raise ValueError('assistant_worker_configuration_invalid')
 
     if config.inbox_policy is not None:
@@ -350,10 +373,23 @@ def tick(config):
                 return 'waiting'
             if db.get(AgentRun, dispatch.run_id) is not None:
                 raise HTTPException(409, 'assistant_run_already_exists')
+            check_input_capacity(view['text'])
             payload = runtime_http.PiRequest(text=view['text'].strip(), run_id=dispatch.run_id)
         pi = (config.online_policy.for_work(config.pi, actor, payload)
               if config.online_policy is not None else config.pi)
-        prepared, private = runtime_http.prepare_pi_submission(pi, actor, payload, memory=config.memory, **({'discovery':True} if config.discovery else {}), **({'source':True} if config.source else {}))
+        # Prepare validates the release/route only; the selection is
+        # execution-scoped and is passed to execute below.
+        workbench = config.tool_profile == 'pi-workbench-v1'
+        workbench_kwargs = ({'workbench': True} if workbench else {})
+        selection_kwargs = ({'tool_selection': [
+            {'tool_key': pair[0], 'version': pair[1]} for pair in config.tool_selection]}
+            if workbench else {})
+        prepared, private = runtime_http.prepare_pi_submission(pi, actor, payload, memory=config.memory, **({'discovery':True} if config.discovery else {}), **({'source':True} if config.source else {}), **workbench_kwargs)
+    except HTTPException as error:
+        code = ('ASSISTANT_INPUT_CAPACITY_EXCEEDED'
+                if error.status_code == 422 and error.detail == 'assistant_input_capacity_exceeded'
+                else 'PI_PRELAUNCH_DENIED')
+        return _deny(config, work_id, code,kind=kind)
     except Exception:
         return _deny(config, work_id, 'PI_PRELAUNCH_DENIED',kind=kind)
     # The launching intent commits BEFORE any Pi Run/claim/process/provider.
@@ -385,7 +421,7 @@ def tick(config):
         # never be reverted, even if a commit reply was lost.
         return _deny(config, work_id, 'PI_PRELAUNCH_DENIED',kind=kind)
     try:
-        runtime_http.execute_pi_submission(pi, actor, payload, prepared, private, memory=config.memory, **({'discovery':True} if config.discovery else {}), **({'source':True} if config.source else {}))
+        runtime_http.execute_pi_submission(pi, actor, payload, prepared, private, memory=config.memory, **({'discovery':True} if config.discovery else {}), **({'source':True} if config.source else {}), **workbench_kwargs, **selection_kwargs)
     except Exception:
         # The authoritative Run may already exist or have sent a model call.
         # Reconciliation below cannot re-execute it, even after response loss.

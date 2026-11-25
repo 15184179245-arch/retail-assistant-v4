@@ -14,6 +14,7 @@ from backend.app.modules.audit.service import record_event
 from backend.app.workers.outbox import OutboxEvent, enqueue
 from backend.app.modules.assistant.core_adapter import CORE_COMMIT, CoreError, DshCoreAdapter, digest
 from backend.app.modules.assistant.models import AssistantWork, AssistantDispatch
+from backend.app.modules.assistant import workspace_binding as workspace
 
 EVENT_TYPE = 'assistant.pi.requested.v1'
 
@@ -51,8 +52,11 @@ def _check_request(text, request_id):
 
 
 def _effect_payload(work):
-    return dict(work_id=work.task_id, owner_id=work.owner_id, core_commit=work.core_commit,
+    result = dict(work_id=work.task_id, owner_id=work.owner_id, core_commit=work.core_commit,
         ticket_id=work.ticket_id, assignment_id=work.assignment_id, snapshot_sha256=work.snapshot_sha256)
+    if work.workspace_context is not None:
+        result['workspace_binding_sha256'] = workspace.context_sha256(work.workspace_context)
+    return result
 
 
 def _view(session, actor, work, *, include_execution=True):
@@ -67,22 +71,29 @@ def _view(session, actor, work, *, include_execution=True):
             or type(work.snapshot) is not dict
             or digest(work.snapshot) != work.snapshot_sha256
             or work.snapshot.get('scope') != expected_scope
-            or work.request_digest != digest({'text': task.description})
+            or work.request_digest != workspace.work_request_digest(task.description, workspace.context_request(workspace.root_context(session, work)))
             or event.event_type != EVENT_TYPE or event.payload != _effect_payload(work)):
         raise HTTPException(409, 'assistant_work_binding_conflict')
     result = dict(work_id=work.task_id, request_id=work.request_id, title=task.title,
         text=task.description, task_state=task.state,
         execution_status='queued' if event.status in ('pending', 'retry') else 'dispatch_unverified',
-        version=work.version, created_at=work.created_at.isoformat())
+        version=work.version, created_at=work.created_at.isoformat(),
+        workspace_context=workspace.context_view(work.workspace_context))
     if include_execution:
         from backend.app.modules.assistant.dispatch import execution_view
         result.update(execution_view(session, actor, work))
     return result
 
 
-def submit_work(session, actor, *, text, request_id, core, authority_policy=None):
-    """Caller owns commit. An explicit request is accepted, not proposed again."""
+def submit_work(session, actor, *, text, request_id, core, authority_policy=None,
+                workspace_context=None, prepare_new=None):
+    """Caller owns commit; only new receipts need fresh Host admission."""
     _check_request(text, request_id)
+    from pydantic import ValidationError
+    try:
+        workspace_context = workspace.normalize_workspace_context(workspace_context)
+    except ValidationError:
+        raise HTTPException(422, 'assistant_workspace_context_invalid') from None
     if type(core) is not DshCoreAdapter:
         raise HTTPException(503, 'assistant_intake_unavailable')
     epoch = lock_command_authority(session, actor)
@@ -95,7 +106,7 @@ def submit_work(session, actor, *, text, request_id, core, authority_policy=None
     existing = session.scalar(select(AssistantWork).where(*_scope(actor),
         AssistantWork.request_id == request_id).with_for_update())
     if existing is not None:
-        if existing.request_digest != digest({'text': text}):
+        if existing.request_digest != workspace.work_request_digest(text, workspace_context):
             raise HTTPException(409, 'assistant_request_conflict')
         return {**_view(session, actor, existing), 'replayed': True}
     from backend.app.modules.assistant.models import AssistantInbox, AssistantTurn
@@ -104,9 +115,14 @@ def submit_work(session, actor, *, text, request_id, core, authority_policy=None
                 model.store_id == actor.store_id, model.owner_id == actor.subject_id,
                 model.request_id == request_id)):
             raise HTTPException(409, 'assistant_request_conflict')
+    if prepare_new is not None:
+        authority_policy = prepare_new()
+    if workspace_context is not None and authority_policy is None:
+        raise HTTPException(503, 'assistant_workspace_unavailable')
     key = f'assistant:{actor.subject_id}:{request_id}'
     task = tasks.create_managed_task(session, actor, title=text.strip()[:200], description=text,
         reason='用户明确交代助理工作', idempotency_key=key)
+    resolved_context = workspace.resolve_context(session, actor, workspace_context, task.id)
     at = commit_guard._db_clock(session)
     scope = dict(organization_id=actor.organization_id, store_id=actor.store_id,
                  owner_id=actor.subject_id, task_id=task.id)
@@ -116,7 +132,7 @@ def submit_work(session, actor, *, text, request_id, core, authority_policy=None
         raise HTTPException(503, 'assistant_intake_unavailable') from None
     work = AssistantWork(task_id=task.id, organization_id=actor.organization_id, store_id=actor.store_id,
         owner_id=actor.subject_id, origin_account_id=actor.account_id, request_id=request_id,
-        request_digest=digest({'text': text}), core_commit=CORE_COMMIT,
+        request_digest=workspace.work_request_digest(text, workspace_context), workspace_context=resolved_context, core_commit=CORE_COMMIT,
         ticket_id=result['ticket_id'], assignment_id=result['assignment_id'], snapshot=result['snapshot'],
         snapshot_sha256=digest(result['snapshot']), version=1, created_at=at)
     effect = result['effects'][0]

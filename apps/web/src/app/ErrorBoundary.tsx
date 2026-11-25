@@ -35,12 +35,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   }
 
   public reset = (): void => {
-    const updater = (this as unknown as { updater?: { isMounted?: (c: unknown) => boolean } }).updater;
-    if (updater && typeof updater.isMounted === "function" && updater.isMounted(this)) {
-      this.setState({ hasError: false, error: null });
-    } else {
-      this.state = { hasError: false, error: null };
-    }
+    this.setState({ hasError: false, error: null });
     this.props.onReset?.();
   };
 

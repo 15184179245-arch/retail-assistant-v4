@@ -175,10 +175,12 @@ def _invalidate_original(connection, raw, error):
         connection.invalidate()
     except BaseException as failure:
         error.add_note("pi_knowledge_forward_invalidate_failed:" + type(failure).__name__)
-        try:
-            raw.close()
-        except BaseException as closing:
-            error.add_note("pi_knowledge_forward_physical_close_unknown:" + type(closing).__name__)
+    # Pool invalidation may suppress a driver's close exception. Retain the
+    # ORIGINAL raw object and explicitly close it even after invalidate returns.
+    try:
+        raw.close()
+    except BaseException as closing:
+        error.add_note("pi_knowledge_forward_physical_close_unknown:" + type(closing).__name__)
 
 
 def _cleanup_failed_transaction(connection, raw, error):
@@ -190,19 +192,36 @@ def _cleanup_failed_transaction(connection, raw, error):
         _invalidate_original(connection, raw, error)
 
 
-def preflight_sqlite_connection(connection, revision_parents):
+@contextmanager
+def retained_step_errors(connection):
+    """Share the existing owner/primary-error cleanup, not0079's started flag."""
+    state = connection.info.get(_STATE_KEY)
+    if type(state) is not dict:
+        _reject("unowned_connection")
+    state["retained_step_started"] = True
+    try:
+        yield
+    except BaseException as error:
+        state["step_error"] = error
+        raise
+
+
+def preflight_sqlite_connection(connection, revision_parents, retained_history=None):
     """Raw reads only: do not take a writer lock or cause SQLA autobegin."""
     raw = raw_connection(connection)
     if connection.in_transaction() or connection.in_nested_transaction() or raw.in_transaction:
         _reject("external_transaction")
     versions = _read_versions(raw)
     if not _allowed_versions(versions, revision_parents):
-        _reject("version_unknown")
+        if retained_history is None or not retained_history.allows_heads(versions):
+            _reject("version_unknown")
+    if retained_history is not None:
+        retained_history.preflight(raw, versions)
     return raw
 
 
 @contextmanager
-def checked_migration_connection(engine, revision_parents):
+def checked_migration_connection(engine, revision_parents, retained_history=None):
     """Own this env's connection and preserve primary errors during cleanup.
 
     Retain the original raw object and state dict; consulting connection.info
@@ -215,16 +234,19 @@ def checked_migration_connection(engine, revision_parents):
         if engine.dialect.name == "sqlite":
             raw = raw_connection(connection)
             connection.info[_STATE_KEY] = state
-            preflight_sqlite_connection(connection, revision_parents)
+            if retained_history is not None:
+                from backend.migrations.retained_sales_history import CONNECTION_KEY
+                connection.info[CONNECTION_KEY] = retained_history
+            preflight_sqlite_connection(connection, revision_parents, retained_history)
         yield connection
-        if state["forward_started"] and raw.in_transaction:
+        if (state["forward_started"] or state.get("retained_step_started")) and raw.in_transaction:
             _reject("transaction_left_open")
     except BaseException as error:
         remembered = state.get("step_error")
         primary = remembered if isinstance(remembered, BaseException) else error
         if primary is not error:
             primary.add_note("pi_knowledge_forward_proxy_unwind_failed:" + type(error).__name__)
-        if state["forward_started"] and raw is not None:
+        if (state["forward_started"] or state.get("retained_step_started")) and raw is not None:
             _cleanup_failed_transaction(connection, raw, primary)
         if primary is not error:
             raise primary from error
@@ -275,8 +297,12 @@ def begin_forward_step(connection, migration_context):
     if type(state) is not dict or state.get("forward_started") or raw.in_transaction:
         _reject("external_transaction")
     versions = _read_versions(raw)
+    from backend.migrations.retained_sales_history import CONNECTION_KEY
+    history = connection.info.get(CONNECTION_KEY)
     if versions != frozenset({PREDECESSOR}):
-        _reject("predecessor_required")
+        if history is None or not history.forward_heads(versions):
+            _reject("predecessor_required")
+        history.require_shape(raw)
     raw.execute("PRAGMA foreign_keys=ON").close()
     if _one(raw, "PRAGMA foreign_keys")[0] != 1:
         _reject("fk_disabled")
@@ -288,6 +314,9 @@ def begin_forward_step(connection, migration_context):
         _reject("physical_transaction_missing")
     if _read_versions(raw) != versions:
         _reject("version_changed_under_lock")
+    if versions != frozenset({PREDECESSOR}):
+        history.require_shape(raw)
+    state["predecessor_versions"] = versions
     state["predecessor"] = PREDECESSOR
 
 
@@ -298,7 +327,7 @@ def require_boundary(connection):
             or not state.get("forward_started") or not raw.in_transaction
             or _one(raw, "PRAGMA foreign_keys")[0] != 1):
         _reject("physical_fk_transaction_required")
-    if _read_versions(raw) != frozenset({PREDECESSOR}):
+    if _read_versions(raw) != state.get("predecessor_versions", frozenset({PREDECESSOR})):
         _reject("predecessor_required")
     return raw
 

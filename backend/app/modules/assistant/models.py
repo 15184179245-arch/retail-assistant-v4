@@ -20,6 +20,7 @@ class AssistantWork(Base):
     assignment_id: Mapped[str] = mapped_column(String(32), nullable=False)
     snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
     snapshot_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    workspace_context: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     outbox_event_id: Mapped[str] = mapped_column(String(36), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
@@ -82,6 +83,9 @@ class AssistantWorkAuthority(Base):
     issued_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     binding_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    workspace_binding_sha256: Mapped[str | None] = mapped_column(String(64),
+        CheckConstraint("workspace_binding_sha256 IS NULL OR length(workspace_binding_sha256) = 64",
+                        name="ck_work_authority_workspace_pin"), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     __table_args__ = (
         ForeignKeyConstraint(['work_id'], ['assistant_work.task_id'], name='fk_work_authority_work', ondelete='RESTRICT'),
@@ -215,6 +219,9 @@ class AssistantTurnAuthority(Base):
     issued_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     binding_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    workspace_binding_sha256: Mapped[str | None] = mapped_column(String(64),
+        CheckConstraint("workspace_binding_sha256 IS NULL OR length(workspace_binding_sha256) = 64",
+                        name="ck_turn_authority_workspace_pin"), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     source_inbox_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     source_inbox_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)

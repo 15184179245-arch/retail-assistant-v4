@@ -1,17 +1,21 @@
 package com.retail.smartops.core.auth
 
 import android.content.Context
-import android.content.SharedPreferences
-import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyProperties
-import android.util.Base64
 import com.retail.smartops.core.network.ApiResult
 import com.retail.smartops.core.network.LoginApi
+import com.retail.smartops.core.network.hasValidLoginScope
+import com.retail.smartops.core.network.hasValidScope
+import com.retail.smartops.core.network.invalidEnvelope
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import java.security.KeyStore
-import javax.crypto.Cipher
-import javax.crypto.KeyGenerator
-import javax.crypto.SecretKey
-import javax.crypto.spec.GCMParameterSpec
+import java.util.UUID
 
 data class Session(
     val accessToken: String,
@@ -35,75 +39,29 @@ class InMemorySessionStorage : SessionStorage {
     override fun clear() { stored = null }
 }
 
-/** AES/GCM at rest in app-private prefs; the key never leaves Android Keystore. */
-class SecureSessionStorage(context: Context) : SessionStorage {
-    private val preferences: SharedPreferences =
+/**
+ * The real app never writes or restores bearer tokens. Revocation can fail both
+ * locally and remotely; a restarted process must prove identity with a new login.
+ * The active Session lives in the retained repository, not in this policy object.
+ */
+internal object ProcessOnlySessionStorage : SessionStorage {
+    override fun save(session: Session) = Unit
+    override fun load(): Session? = null
+    override fun clear() = Unit
+}
+
+/** Best-effort retirement of a prior APK's locally encrypted bearer, never a draft database. */
+internal fun retireLegacySessionArtifacts(context: Context) {
+    runCatching {
+        context.getSharedPreferences("real_session_restore", Context.MODE_PRIVATE)
+            .edit().remove("signed_in_payload_digest").commit()
+    }
+    runCatching {
+        KeyStore.getInstance("AndroidKeyStore").apply { load(null); deleteEntry("retail.real.session") }
+    }
+    runCatching {
         context.getSharedPreferences("real_session", Context.MODE_PRIVATE)
-
-    override fun save(session: Session) {
-        val plain = listOf(
-            session.accessToken, session.subjectId, session.organizationId,
-            session.storeId, session.expiresAtEpochMillis.toString(), session.username,
-        ).joinToString(SEPARATOR)
-        require(plain.split(SEPARATOR).size == 6) { "session fields must not contain the separator" }
-        val cipher = Cipher.getInstance(TRANSFORMATION).apply {
-            init(Cipher.ENCRYPT_MODE, key())
-        }
-        val encrypted = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
-        val payload = Base64.encodeToString(cipher.iv, Base64.NO_WRAP) + "." +
-            Base64.encodeToString(encrypted, Base64.NO_WRAP)
-        check(preferences.edit().putString(KEY, payload).commit()) { "cannot persist session" }
-    }
-
-    override fun load(): Session? = try {
-        val payload = preferences.getString(KEY, null) ?: return null
-        val parts = payload.split(".", limit = 2)
-        require(parts.size == 2) { "invalid session payload" }
-        val cipher = Cipher.getInstance(TRANSFORMATION).apply {
-            init(Cipher.DECRYPT_MODE, key(),
-                GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP)))
-        }
-        val fields = String(cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)),
-            Charsets.UTF_8).split(SEPARATOR)
-        require(fields.size == 6) { "invalid session fields" }
-        Session(
-            accessToken = fields[0], subjectId = fields[1], organizationId = fields[2],
-            storeId = fields[3], expiresAtEpochMillis = fields[4].toLong(), username = fields[5],
-        )
-    } catch (error: Exception) {
-        preferences.edit().remove(KEY).commit()
-        null
-    }
-
-    override fun clear() {
-        // Invalidate the decryption key first. A later prefs failure cannot revive the token.
-        val keyRemoved = runCatching {
-            KeyStore.getInstance(KEYSTORE).apply { load(null); deleteEntry(ALIAS) }
-        }.isSuccess
-        val payloadRemoved = runCatching { preferences.edit().remove(KEY).commit() }.getOrDefault(false)
-        check(keyRemoved || payloadRemoved) { "cannot invalidate local session" }
-    }
-
-    private fun key(): SecretKey {
-        val keyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }
-        (keyStore.getKey(ALIAS, null) as? SecretKey)?.let { return it }
-        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE).apply {
-            init(
-                KeyGenParameterSpec.Builder(ALIAS,
-                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
-                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                    .build(),
-            )
-        }.generateKey()
-    }
-
-    private companion object {
-        const val KEYSTORE = "AndroidKeyStore"
-        const val ALIAS = "retail.real.session"
-        const val TRANSFORMATION = "AES/GCM/NoPadding"
-        const val KEY = "encrypted_session"
-        const val SEPARATOR = "\u001F"
+            .edit().remove("encrypted_session").commit()
     }
 }
 
@@ -120,6 +78,13 @@ class RequestScope internal constructor(
     internal fun cancel() { cancelled = true }
 }
 
+data class SessionStatus(
+    val session: Session?,
+    val generation: Int,
+    val capabilities: CapabilityState,
+    val localClearFailed: Boolean,
+)
+
 /**
  * Owns the real employee session. A user switch first invalidates every request
  * scope and clears visible data, so a late response from the previous employee
@@ -131,15 +96,24 @@ class SessionRepository(
     private val clock: () -> Long = System::currentTimeMillis,
     private val onScopeChanged: () -> Unit = {},
 ) {
+    // Not a credential. Keeps saved Navigation state distinct across process restarts
+    // even if the same employee logs back in at the same generation number.
+    internal val navigationSessionKey: UUID = UUID.randomUUID()
     @Volatile private var generation = 0
     @Volatile var localClearFailed = false
         private set
     private var session: Session? = loadValidSession()
+    private var tokenForLogoutRetry: String? = null
     private val scopes = linkedSetOf<RequestScope>()
     private val scopeListeners = linkedSetOf<() -> Unit>()
     private var capabilityState: CapabilityState =
         if (session != null) CapabilityState(Capabilities.DEFAULT_CAPABILITIES, "v1")
         else CapabilityState(emptySet(), "v0")
+
+    private val _status = MutableStateFlow(status())
+    val status: StateFlow<SessionStatus> = _status.asStateFlow()
+
+    private fun status() = SessionStatus(session, generation, capabilityState, localClearFailed)
 
     @Synchronized
     fun getCapabilities(): Set<String> = capabilityState.capabilities
@@ -152,17 +126,13 @@ class SessionRepository(
 
     @Synchronized
     fun setCapabilities(capabilities: Set<String>, version: String = "v1") {
-        capabilityState = CapabilityState(capabilities, version)
-        runCatching { onScopeChanged() }
-        scopeListeners.toList().forEach { runCatching { it() } }
+        capabilityState = if (currentSession() == null) CapabilityState()
+            else CapabilityState(capabilities.toSet(), version)
+        notifyScopeChanged()
     }
 
     @Synchronized
-    fun clearCapabilities() {
-        capabilityState = CapabilityState(emptySet(), "v0")
-        runCatching { onScopeChanged() }
-        scopeListeners.toList().forEach { runCatching { it() } }
-    }
+    fun clearCapabilities() = setCapabilities(emptySet(), "v0")
 
     @Synchronized
     fun onScopeInvalidated(listener: () -> Unit): () -> Unit {
@@ -194,9 +164,11 @@ class SessionRepository(
 
 
     @Synchronized
-    fun currentSession(): Session? {
+    fun currentSession(): Session? = sessionAt(clock())
+
+    private fun sessionAt(now: Long): Session? {
         val value = session ?: return null
-        if (value.expiresAtEpochMillis <= clock()) {
+        if (value.expiresAtEpochMillis <= now) {
             clearIdentity()
             return null
         }
@@ -209,50 +181,107 @@ class SessionRepository(
     fun beginRequest(): RequestScope =
         RequestScope(this, generation).also { scopes.add(it) }
 
+    /** Also used by UI timer; qualifiers prevent an old timer from expiring a newer session. */
+    @Synchronized
+    fun remainingSessionMillis(expectedGeneration: Int): Long {
+        if (expectedGeneration != generation) return 0
+        val now = clock()
+        return sessionAt(now)?.let { it.expiresAtEpochMillis - now } ?: 0
+    }
+
     fun login(username: String, password: String): ApiResult<Session> {
         val scope = synchronized(this) {
+            // Every attempt supersedes any previous in-flight login and scope.
             clearIdentity()
+            if (localClearFailed) return localCleanupFailure()
             beginRequest()
         }
-        val result = api.login(username, password)
-        return synchronized(this) {
+        val result = try {
+            api.login(username, password)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            ApiResult.Cancelled
+        } catch (_: Exception) {
+            ApiResult.Failure(0, "LOGIN_UNAVAILABLE", "暂时无法登录，请稍后重试。", null)
+        }
+        var discardToken: String? = null
+        val outcome = synchronized(this) {
             scopes.remove(scope)
-            if (!scope.isActive()) return@synchronized ApiResult.Cancelled
+            if (!scope.isActive()) {
+                discardToken = (result as? ApiResult.Success)?.data?.takeIf { it.hasValidScope() }?.accessToken
+                return@synchronized ApiResult.Cancelled
+            }
+            scope.cancel()
             when (result) {
                 is ApiResult.Success -> {
                     val data = result.data
+                    if (!data.hasValidScope()) return@synchronized invalidEnvelope()
                     val next = Session(data.accessToken, data.subjectId, data.organizationId,
                         data.storeId, data.expiresAtEpochMillis, username)
-                    storage.save(next)
+                    if (next.expiresAtEpochMillis <= clock()) {
+                        discardToken = next.accessToken
+                        return@synchronized ApiResult.Failure(
+                            0, "LOGIN_EXPIRED", "本次登录会话已过期，请重试。", null,
+                        )
+                    }
+                    try {
+                        storage.save(next)
+                    } catch (_: Exception) {
+                        discardToken = next.accessToken
+                        // A storage implementation may have partially written before failing.
+                        clearIdentity()
+                        return@synchronized if (localClearFailed) localCleanupFailure() else
+                            ApiResult.Failure(0, "SESSION_SAVE_FAILED", "本机无法保存会话，请重试。", null)
+                    }
                     session = next
                     capabilityState = CapabilityState(Capabilities.DEFAULT_CAPABILITIES, "v1")
+                    _status.value = status()
                     ApiResult.Success(next)
                 }
                 is ApiResult.Failure -> result
                 ApiResult.Cancelled -> ApiResult.Cancelled
             }
         }
+        // Never hold the session monitor during remote compensation. Do not revoke a current token.
+        discardToken?.takeIf { token -> currentSession()?.accessToken != token }?.let(::revokeToken)
+        return outcome
     }
 
-    /** Clear local identity/storage/draft on the caller's (main) thread. */
+    /** Invalidate all local presentation and persisted restore permission before remote work. */
     @Synchronized
     fun logoutLocal(): String? {
-        val token = session?.accessToken
+        val token = session?.accessToken ?: tokenForLogoutRetry
         clearIdentity()
+        tokenForLogoutRetry = token.takeIf { localClearFailed }
         return token
     }
 
-    /** Best-effort remote revocation; failure never restores the local identity. */
+    @Synchronized
+    internal fun beginLogout(expectedGeneration: Int): LogoutTicket? {
+        if (generation != expectedGeneration) return null
+        val token = logoutLocal()
+        return LogoutTicket(generation, token)
+    }
+
     fun revokeToken(token: String?): ApiResult<Unit> {
         if (token == null) return ApiResult.Success(Unit)
         return try {
             api.logout(token)
-        } catch (error: Exception) {
-            ApiResult.Failure(0, "NETWORK_ERROR", "已退出本机登录。", null)
+        } catch (_: Exception) {
+            ApiResult.Failure(0, "LOGOUT_UNREACHABLE", "暂未确认服务端已撤销该会话。", null)
         }
     }
 
-    fun logout(): ApiResult<Unit> = revokeToken(logoutLocal())
+    fun logout(): ApiResult<Unit> {
+        val token = logoutLocal()
+        val cleanupFailed = localClearFailed
+        val remote = revokeToken(token)
+        return if (cleanupFailed) localCleanupFailure() else remote
+    }
+
+    private fun localCleanupFailure() = ApiResult.Failure(
+        0, "SESSION_CLEANUP_FAILED", "未能确认已清除本机登录。", "请重试退出，或等待设备存储恢复。",
+    )
 
     /** A 401 only clears the session when it belongs to the current identity scope. */
     @Synchronized
@@ -269,25 +298,55 @@ class SessionRepository(
         scopes.forEach { it.cancel() }
         scopes.clear()
         session = null
-        capabilityState = CapabilityState(emptySet(), "v0")
-        try {
-            storage.clear()
-            localClearFailed = false
-        } catch (_: Exception) {
-            // The secure store invalidates its encryption key if prefs removal fails.
-            // Keep the local identity revoked and allow callers to revoke the server token.
-            localClearFailed = true
-        }
+        capabilityState = CapabilityState()
+        localClearFailed = runCatching { storage.clear() }.isFailure
+        if (!localClearFailed) tokenForLogoutRetry = null
+        notifyScopeChanged()
+    }
+
+    private fun notifyScopeChanged() {
+        _status.value = status()
         runCatching { onScopeChanged() }
         scopeListeners.toList().forEach { runCatching { it() } }
     }
 
     private fun loadValidSession(): Session? {
-        val stored = storage.load() ?: return null
-        if (stored.expiresAtEpochMillis <= clock()) {
+        val stored = runCatching { storage.load() }.getOrNull() ?: return null
+        if (stored.expiresAtEpochMillis <= clock() ||
+            !hasValidLoginScope(stored.accessToken, stored.subjectId, stored.organizationId, stored.storeId)) {
             try { storage.clear() } catch (_: Exception) { localClearFailed = true }
             return null
         }
         return stored
+    }
+}
+
+internal class LogoutTicket(val generation: Int, val token: String?)
+data class LogoutOutcome(val generation: Int, val remoteUnconfirmed: Boolean)
+
+/**
+ * Scope is owned by the retained activity session coordinator, not by the
+ * login/signed-in composition. Only the in-flight job captures the old token.
+ * UI sees a generation-tagged outcome and ignores it after a fresh login.
+ */
+class SessionLogoutCoordinator(
+    private val repository: SessionRepository,
+    private val ownerScope: CoroutineScope,
+    private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
+) {
+    private val _outcome = MutableStateFlow<LogoutOutcome?>(null)
+    val outcome: StateFlow<LogoutOutcome?> = _outcome.asStateFlow()
+
+    fun request(expectedGeneration: Int) {
+        val request = repository.beginLogout(expectedGeneration) ?: return
+        if (request.token == null) return
+        ownerScope.launch(dispatcher) {
+            val incomplete = repository.revokeToken(request.token) !is ApiResult.Success
+            // Different requests may finish out of order. Never evict a newer outcome.
+            _outcome.update { previous ->
+                if (previous != null && previous.generation > request.generation) previous
+                else LogoutOutcome(request.generation, incomplete)
+            }
+        }
     }
 }

@@ -7,7 +7,7 @@ from hashlib import sha256
 from uuid import uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import exists, select
 
 from backend.app.modules.audit.service import record_event
 from backend.app.modules.auth.service import has_usable_account
@@ -359,6 +359,29 @@ def _apply_ack(db, actor, ident, wire, ack):
     return _finish(db, actor, row, request, 'reconcile', replayed=not created)
 
 
+def _merge_readback_lines(wire, current_line_results, receipt):
+    """Combine exact per-line observations without counting one external row twice."""
+    from backend.app.modules.erp_purchasing.erp_005_wire import _validate_external_line_refs
+    old = {line['line_id']: line for line in current_line_results}
+    if len(old) != len(wire.lines) or set(old) != {line.line_id for line in wire.lines}:
+        source.fail('binding_changed')
+    results = []
+    for number, line in enumerate(wire.lines):
+        observed = receipt.lines[number] if receipt else None
+        candidate = dict(line_id=line.line_id, status=observed.status if observed else 'unknown',
+            external_line_ref=observed.external_line_ref if observed else None, error_code=observed.error_code if observed else None)
+        if old[line.line_id]['status'] in ('accepted', 'rejected'):
+            if candidate['status'] != 'unknown' and candidate != old[line.line_id]:
+                source.fail('receipt_conflict')
+            candidate = old[line.line_id]
+        results.append(candidate)
+    try:
+        _validate_external_line_refs(line['external_line_ref'] for line in results)
+    except ValueError:
+        source.fail('receipt_conflict')
+    return results
+
+
 def _apply_readback(db, actor, ident, wire, receipt):
     from backend.app.modules.erp_purchasing.erp_005_wire import ReceiptReadbackReceipt, ReceiptWireLine
     now = _guard(db, actor, 'reconcile')
@@ -377,21 +400,16 @@ def _apply_readback(db, actor, ident, wire, receipt):
         evidence = receipt.model_dump(exclude={'nonce', 'signature'})
     else:
         evidence = dict(attempt_id=attempt.id, input_digest=attempt.input_digest, result='not_found_unknown')
-    old = {line['line_id']: line for line in attempt.line_results}
-    if len(old) != len(wire.lines) or set(old) != {line.line_id for line in wire.lines}:
-        source.fail('binding_changed')
-    results = []
-    for number, line in enumerate(wire.lines):
-        observed = receipt.lines[number] if receipt else None
-        candidate = dict(line_id=line.line_id, status=observed.status if observed else 'unknown',
-            external_line_ref=observed.external_line_ref if observed else None, error_code=observed.error_code if observed else None)
-        if old[line.line_id]['status'] in ('accepted', 'rejected'):
-            if candidate['status'] != 'unknown' and candidate != old[line.line_id]:
-                source.fail('receipt_conflict')
-            candidate = old[line.line_id]
-        results.append(candidate)
+    results = _merge_readback_lines(wire, attempt.line_results, receipt)
     if attempt.state == 'sandbox_verified' and receipt is not None:
         if receipt.document_state == 'rejected' or (receipt.external_ref is not None and receipt.external_ref != attempt.external_ref):
+            source.fail('receipt_conflict')
+    # The existing reconcile authority guard holds the store lock through
+    # commit. Test only the new accepted binding, and keep the unique backstop.
+    if receipt is not None and receipt.document_state == 'accepted' and attempt.external_ref is None:
+        claimed = select(exists().where(*source.scope(ERPReceiptAttempt, actor),
+            ERPReceiptAttempt.external_ref == receipt.external_ref, ERPReceiptAttempt.id != attempt.id))
+        if db.scalar(claimed):
             source.fail('receipt_conflict')
     _, created = _observation(db, actor, row, attempt, 'readback', 'readback:' + canonical_digest(evidence), evidence, now)
     if created:

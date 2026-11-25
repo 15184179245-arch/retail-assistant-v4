@@ -12,11 +12,14 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import func, select, text, update
 
+from backend.app.core.security import AuthenticatedSubject
 from backend.app.modules.audit.models import AuditEvent
 from backend.app.modules.audit.service import record_event
 from backend.app.modules.auth.models import EmployeeAccount, LoginSession
 from backend.app.modules.auth.service import has_usable_account
-from backend.app.modules.identity.command_guard import lock_employee_authority, lock_scope_security_fence
+from backend.app.modules.identity.command_guard import (
+    lock_command_authority, lock_employee_authority, lock_scope_security_fence,
+)
 from backend.app.modules.identity.models import Store, Subject
 from backend.app.modules.identity.repository import grants_for, load_scope
 from backend.app.modules.identity.service import authorize_scope, permission_allowed
@@ -96,11 +99,17 @@ def guard_person(db, actor, capability):
     # Reject a machine or locator before calling the employee-specific guard.
     if not getattr(actor, "account_id", None) or not getattr(actor, "session_id", None):
         fail("human_required")
-    lock_employee_authority(db, actor)
+    if type(actor) is not AuthenticatedSubject:
+        raise HTTPException(403, "human_session_required")
+    epoch = None
+    if capability == "read":
+        lock_employee_authority(db, actor)
+    else:
+        epoch = lock_command_authority(db, actor)
     now = clock(db)
     allow_person(db, actor, "read", now)
     allow_person(db, actor, capability, now)
-    return now
+    return epoch
 
 
 def person_permission(db, principal, subject_id, permission, now):

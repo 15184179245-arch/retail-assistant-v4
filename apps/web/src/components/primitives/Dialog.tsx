@@ -9,6 +9,7 @@ import styles from './primitives.module.css';
 
 export interface DialogProps {
   open: boolean;
+  role?: 'dialog' | 'alertdialog';
   onClose: () => void;
   title: string;
   description?: string;
@@ -25,6 +26,7 @@ export interface DialogProps {
 
 export function Dialog({
   open,
+  role = 'dialog',
   onClose,
   title,
   description,
@@ -123,7 +125,7 @@ export function Dialog({
       <div
         ref={dialogRef}
         id={baseId}
-        role="dialog"
+        role={role}
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={descId}

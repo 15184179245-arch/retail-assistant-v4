@@ -295,7 +295,11 @@ class WorkspaceApiClient(
             },
             headers = headers,
         ) { data ->
-            parseArtifact(data) ?: throw IllegalArgumentException("Invalid Artifact")
+            if (idempotencyKey.isNullOrBlank()) {
+                parseFreshL1Mutation(data, expected, artifactId, baseVersion, "patch", actorType = actorType)
+            } else {
+                parseArtifact(data) ?: throw IllegalArgumentException("Invalid Artifact")
+            }
         }
     }
 
@@ -318,7 +322,11 @@ class WorkspaceApiClient(
             },
             headers = headers,
         ) { data ->
-            parseArtifact(data) ?: throw IllegalArgumentException("Invalid Artifact")
+            if (idempotencyKey.isNullOrBlank()) {
+                parseFreshL1Mutation(data, expected, artifactId, baseVersion, "undo", targetOpId = targetOpId)
+            } else {
+                parseArtifact(data) ?: throw IllegalArgumentException("Invalid Artifact")
+            }
         }
     }
 
@@ -347,7 +355,7 @@ class WorkspaceApiClient(
         path = "/api/v1/workspace/artifacts/${encodeSegment(artifactId)}/unlock",
         body = mapOf("field" to field, "fields" to listOf(field), "base_version" to baseVersion),
     ) { data ->
-        parseArtifact(data) ?: throw IllegalArgumentException("Invalid Artifact")
+        parseFreshL1Mutation(data, expected, artifactId, baseVersion, "unlock")
     }
 
     fun acceptSuggestion(
@@ -365,7 +373,7 @@ class WorkspaceApiClient(
             "base_version" to baseVersion,
         ),
     ) { data ->
-        parseArtifact(data) ?: throw IllegalArgumentException("Invalid Artifact")
+        parseFreshL1Mutation(data, expected, artifactId, baseVersion, "accept_suggestion", targetOpId = opId)
     }
 
     fun ignoreSuggestion(
@@ -383,7 +391,7 @@ class WorkspaceApiClient(
             "base_version" to baseVersion,
         ),
     ) { data ->
-        parseArtifact(data) ?: throw IllegalArgumentException("Invalid Artifact")
+        parseFreshL1Mutation(data, expected, artifactId, baseVersion, "ignore_suggestion", targetOpId = opId)
     }
 
     fun resolveBlocks(
@@ -805,6 +813,53 @@ class WorkspaceApiClient(
             version = (raw["version"] as? Number)?.toInt(),
             sourceRoute = raw["source_route"] as? String,
         )
+    }
+
+    /** The unkeyed L1 writes have one fresh Host CAS operation, not a read or a replay. */
+    private fun parseFreshL1Mutation(
+        data: Map<String, Any?>,
+        expected: Session,
+        artifactId: String,
+        baseVersion: Int,
+        opType: String,
+        actorType: String = "human",
+        targetOpId: String? = null,
+    ): WorkspaceArtifact {
+        fun wholeNumber(value: Any?): Long? = when (value) {
+            is Int -> value.toLong()
+            is Long -> value
+            else -> null
+        }
+        fun Map<*, *>.texts(vararg fields: String) = fields.all { this[it] is String }
+        fun Map<*, *>.textList(field: String) = (this[field] as? List<*>)?.all { it is String } == true
+
+        val artifact = requireNotNull(data["artifact"] as? Map<*, *>) { "Missing mutation artifact" }
+        val op = requireNotNull(data["op"] as? Map<*, *>) { "Missing mutation operation" }
+        val version = wholeNumber(artifact["version"])
+        require(artifactId.isNotBlank() && artifact["id"] == artifactId &&
+            artifact["organization_id"] == expected.organizationId && artifact["store_id"] == expected.storeId &&
+            artifact["owner_subject_id"] == expected.subjectId &&
+            artifact.texts("thread_id", "kind", "title", "status", "created_at", "updated_at") &&
+            baseVersion > 0 && version != null && version == baseVersion.toLong() + 1 && version <= Int.MAX_VALUE &&
+            artifact["payload"] is Map<*, *> && artifact.textList("locked_fields") &&
+            (artifact["source_refs"] as? List<*>)?.all { it is Map<*, *> } == true &&
+            (artifact["pending_suggestions"] as? List<*>)?.all { item ->
+                val suggestion = item as? Map<*, *>
+                suggestion != null && suggestion.texts("field", "op_id", "actor_subject_id", "created_at") &&
+                    suggestion.containsKey("suggested_value") &&
+                    (suggestion["reason"] == null || suggestion["reason"] is String)
+            } == true
+        ) { "Incomplete or mismatched mutation artifact" }
+
+        require((op["id"] as? String)?.isNotBlank() == true && op["artifact_id"] == artifactId &&
+            op["op_type"] == opType && op["actor_type"] == actorType && op["actor_subject_id"] == expected.subjectId &&
+            wholeNumber(op["version_before"]) == baseVersion.toLong() && wholeNumber(op["version_after"]) == version &&
+            op["patch"] is Map<*, *> && op.textList("applied_fields") && op.textList("skipped_fields") &&
+            op["created_at"] is String && (targetOpId == null || op["undo_of_op_id"] == targetOpId) &&
+            (!data.containsKey("idempotent_replay") || data["idempotent_replay"] == false)
+        ) { "Incomplete or mismatched fresh mutation operation" }
+
+        return requireNotNull(parseArtifact(data)) { "Invalid mutation artifact" }
     }
 
     @Suppress("UNCHECKED_CAST")

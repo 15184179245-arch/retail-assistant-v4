@@ -1,18 +1,17 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
-import type { ValidatedUiBlock } from "../blocks";
+import { ConnectionBanner } from "../app/ConnectionBanner";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Dialog } from "../components/primitives";
 import { StatusBadge } from "../components/StatusBadge";
 import { useConnectionStatus } from "../lib/api/health";
-import { generateIdempotencyKey } from "../lib/api/idempotency";
 import {
   createArtifact,
 } from "../lib/api/workspace";
 import { canAccessRoute } from "../app/navigation";
 import { navigate } from "../app/router";
 import { ForbiddenPage, renderRouteComponent } from "../app/routes";
-import { captureSessionScope, type Session } from "../lib/auth/session";
-import { getCapabilityVersion } from "../lib/auth/capabilities";
-import type { WorkspaceArtifactDto } from "../lib/api/generated";
+import { captureSessionScope, logoutSession, type Session } from "../lib/auth/session";
+import { getCapabilityVersion, hasCapability } from "../lib/auth/capabilities";
+import { businessPermission } from "../lib/auth/businessPermissions";
 import {
   appendArtifactOp,
   attachObjectToComposer,
@@ -22,6 +21,7 @@ import {
   dismissDirtyLeavePrompt,
   dismissToast,
   getActiveThread,
+  getWorkspaceState,
   hasAnyDirtyTab,
   hydrateWorkspaceFromUrl,
   openWorkbenchTab,
@@ -35,13 +35,14 @@ import {
   toggleThreadSidebar,
   TODAY_TAB,
   upsertArtifact,
+  useVerifiedArtifactSummaries,
   useWorkspaceState,
+  workspaceTabLabel,
 } from "../workspace/store";
 import { ArtifactCoeditWorkspace } from "./ArtifactCoeditWorkspace";
 import { CommandPalette } from "./CommandPalette";
 import { ObjectLibraryView } from "./ObjectLibraryView";
-import { setShellMode } from "./shellMode";
-import { ThreadSidebar } from "./ThreadSidebar";
+import { AssistantPage } from "../features/assistant/AssistantPage";
 import { TodayView } from "./TodayView";
 import { getWorkObjectByPath, toRouteWorkbenchTab } from "./workObjects";
 import styles from "../styles/workbench.module.css";
@@ -51,6 +52,8 @@ export interface AiFirstShellProps {
   capabilities: string[];
   currentPath: string;
   children?: ReactNode;
+  notice?: ReactNode;
+  workspaceOnly?: boolean;
 }
 
 export function AiFirstShell({
@@ -58,14 +61,15 @@ export function AiFirstShell({
   capabilities,
   currentPath,
   children,
+  notice,
+  workspaceOnly = false,
 }: AiFirstShellProps) {
   const ws = useWorkspaceState();
+  const artifactSummaries = useVerifiedArtifactSummaries(ws);
   const connection = useConnectionStatus();
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [confirmState, setConfirmState] = useState<{
-    artifact: WorkspaceArtifactDto;
-    idempotencyKey: string;
-  } | null>(null);
+  const [submitBoundaryOpen, setSubmitBoundaryOpen] = useState(false);
+  const keepDraftButton = useRef<HTMLButtonElement>(null);
 
   const modelOffline =
     connection.status === "model_offline" ||
@@ -97,6 +101,7 @@ export function AiFirstShell({
   }, [capabilities]);
 
   useEffect(() => {
+    if (currentPath === "/assistant") { toggleThreadSidebar(false); setMobilePane("thread"); return; }
     if (currentPath === "/") {
       const currentTab = ws.openTabs.find((t) => t.id === ws.activeTabId);
       if (currentTab?.kind === "route") {
@@ -117,6 +122,7 @@ export function AiFirstShell({
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
+        if (getWorkspaceState().dirtyLeavePrompt) return;
         setPaletteOpen((prev) => !prev);
       }
     };
@@ -136,6 +142,7 @@ export function AiFirstShell({
 
   const handleCreateQuoteDraft = useCallback(
     async (prefill?: { sku?: string; name?: string; unitPrice?: string }) => {
+      if (!hasCapability(businessPermission.sales.write)) return;
       const isCurrent = captureSessionScope();
       const activeThread = getActiveThread();
       const title = prefill?.name
@@ -177,36 +184,13 @@ export function AiFirstShell({
     [session.organizationId, session.storeId, session.subjectId],
   );
 
-  const openL2ConfirmForArtifact = useCallback((artifact: WorkspaceArtifactDto) => {
-    setConfirmState({
-      artifact,
-      idempotencyKey: generateIdempotencyKey(),
-    });
-  }, []);
-
-  const handleTriggerActionCard = useCallback(
-    (block: ValidatedUiBlock) => {
-      const targetId =
-        typeof block.props.target_artifact_id === "string"
-          ? block.props.target_artifact_id
-          : typeof block.props.artifact_id === "string"
-            ? block.props.artifact_id
-            : block.refs.find((r) => r.kind === "artifact")?.id;
-      const artifact = targetId ? ws.artifactsById[targetId] : undefined;
-      if (artifact) {
-        openL2ConfirmForArtifact(artifact);
-      } else {
-        pushToast("请先固定或打开对应的 L1 工作成果后再确认提交。", "warning");
-      }
-    },
-    [openL2ConfirmForArtifact, ws.artifactsById],
-  );
-
   const activeTab = ws.openTabs.find((t) => t.id === ws.activeTabId) ?? TODAY_TAB;
   const activeThread = getActiveThread();
-  const isRouteDirectMismatch = currentPath !== "/" && activeTab.id === TODAY_TAB.id;
+  const isRouteDirectMismatch = currentPath !== "/" && currentPath !== "/assistant" && currentPath !== "/workspace" && activeTab.id === TODAY_TAB.id;
 
   const renderWorkbenchContent = () => {
+    // Redirects and unknown/forbidden routes must not be swallowed by restored tabs.
+    if (currentPath !== "/" && currentPath !== "/assistant" && currentPath !== "/workspace" && !getWorkObjectByPath(currentPath)) return children;
     if (ws.leftSection === "objects") {
       return <ObjectLibraryView capabilities={capabilities} />;
     }
@@ -258,20 +242,12 @@ export function AiFirstShell({
     if (ws.leftSection === "settings") {
       return (
         <section className={styles.tabMainCard} data-shell-settings="true">
-          <h3 className={styles.panelTitle}>工作台设置与壳层回滚开关</h3>
+          <h3 className={styles.panelTitle}>身份与工作区</h3>
           <p style={{ fontSize: "13px", color: "var(--muted)" }}>
             当前身份：{session.username}（{session.organizationId} / {session.storeId}）· 权限数：
             {capabilities.length}
           </p>
           <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "12px" }}>
-            <button
-              type="button"
-              className={styles.secondaryBtn}
-              onClick={() => setShellMode("legacy")}
-              data-switch-legacy-shell="true"
-            >
-              切换回经典单页壳层 (?shell=legacy)
-            </button>
             <button
               type="button"
               className={styles.secondaryBtn}
@@ -294,7 +270,7 @@ export function AiFirstShell({
           artifactId={activeTab.artifactId}
           tabId={activeTab.id}
           session={session}
-          onRequestL2Submit={openL2ConfirmForArtifact}
+          onOpenSubmitBoundary={() => setSubmitBoundaryOpen(true)}
         />
       );
     }
@@ -313,7 +289,7 @@ export function AiFirstShell({
                 </span>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-                {(currentPath === "/sales" || currentPath === "/purchasing") ? (
+                {currentPath === "/sales" && capabilities.includes(businessPermission.sales.write) ? (
                   <button
                     type="button"
                     className={styles.primaryBtn}
@@ -366,54 +342,23 @@ export function AiFirstShell({
       <TodayView
         session={session}
         capabilities={capabilities}
-        homeContent={currentPath === "/" ? children : null}
         onCreateQuoteDraft={() => void handleCreateQuoteDraft()}
       />
     );
   };
 
   return (
-    <div className={styles.shellRoot} data-ai-first-shell="true">
-      {/* Top command / collapse utility strip */}
-      <div className={styles.shellBar}>
-        <div className={styles.shellBarGroup}>
-          <button
-            type="button"
-            className={styles.commandTrigger}
-            onClick={() => setPaletteOpen(true)}
-            data-command-palette-trigger="true"
-          >
-            <span>搜索或快捷命令…</span>
-            <span className={styles.shortcutBadge}>Ctrl+K</span>
-          </button>
-          <button
-            type="button"
-            className={styles.modeButton}
-            onClick={() => toggleThreadSidebar()}
-            data-toggle-thread-btn="true"
-          >
-            {ws.threadCollapsed ? "展开对话线程" : "收起对话线程"}
-          </button>
-        </div>
-
-        <div className={styles.shellBarGroup}>
-          <StatusBadge
-            kind={modelOffline ? "waiting" : "fact"}
-            source={modelOffline ? "模型离线" : `AI 工作台 · 零售智能经营`}
-          />
-          <button
-            type="button"
-            className={styles.modeButton}
-            onClick={() => setShellMode("legacy")}
-            data-header-legacy-toggle="true"
-          >
-            经典视图
-          </button>
-        </div>
-      </div>
-
+    <div className={`${styles.shellRoot} ${workspaceOnly ? "od-manual-workspace" : ""}`} data-ai-first-shell="true">
+      {!workspaceOnly && <header className={styles.shellBar}>
+        <div className={styles.shellBrand}><span className="od-brand-mark" aria-hidden="true">三</span><div><strong>零售智能经营</strong><small>工作区 · {activeThread.title}</small></div><StatusBadge kind="development" source="开发环境" /></div>
+        <button type="button" className={styles.commandTrigger} onClick={() => setPaletteOpen(true)} data-command-palette-trigger="true"><span>⌕ 搜索商品、单据或快捷命令</span><kbd>Ctrl K</kbd></button>
+        <div className={styles.shellIdentity}><span className={styles.serviceState}>{connection.status === "online" ? "● 服务可用" : "◌ 连接待核"}</span><span>{session.username}<small>{session.storeId}</small></span><button type="button" onClick={() => { void logoutSession().then(() => navigate("/login")); }}>退出登录</button></div>
+      </header>}
+      {workspaceOnly && <p className="od-manual-note">人工草稿工作区 · 与助理事项独立。保存草稿不等于提交或写入ERP。</p>}
+      {notice}
+      <ConnectionBanner session={session} />
       {/* Narrow viewport (<1024px) two-pane tab switch */}
-      <div className={styles.mobileModeSwitch} role="tablist" aria-label="移动端双栏切换">
+      {!workspaceOnly && <div className={styles.mobileModeSwitch} role="tablist" aria-label="移动端双栏切换">
         <button
           type="button"
           role="tab"
@@ -424,7 +369,7 @@ export function AiFirstShell({
           onClick={() => setMobilePane("thread")}
           data-mobile-tab="thread"
         >
-          对话 ({activeThread.messages.length})
+          我的助理
         </button>
         <button
           type="button"
@@ -438,7 +383,7 @@ export function AiFirstShell({
         >
           工作台 ({ws.openTabs.length})
         </button>
-      </div>
+      </div>}
 
       {/* 3-Column AI-First Shell Layout */}
       <div
@@ -447,14 +392,14 @@ export function AiFirstShell({
         }`}
       >
         {/* Left Navigation Rail */}
-        <nav className={styles.railNav} aria-label="工作台侧边主导航">
+        {!workspaceOnly && <nav className={styles.railNav} aria-label="工作台侧边主导航">
           <h2 className={styles.railHeading}>工作区</h2>
           {(
             [
-              { id: "today", label: "Today 今日" },
-              { id: "objects", label: "对象库 (5类)" },
-              { id: "threads", label: `线程 (${ws.threads.length})` },
-              { id: "settings", label: "设置 / 模式" },
+              { id: "today", label: "◈ 今日" },
+              { id: "objects", label: "▦ 对象库" },
+              { id: "threads", label: "☷ 工作区" },
+              { id: "settings", label: "⚙ 设置" },
             ] as const
           ).map((nav) => (
             <button
@@ -474,15 +419,14 @@ export function AiFirstShell({
               <span>{nav.label}</span>
             </button>
           ))}
-        </nav>
+          <button type="button" className={styles.railButton} onClick={() => { const collapsed = !ws.threadCollapsed; toggleThreadSidebar(collapsed); setMobilePane(collapsed ? "workbench" : "thread"); }} data-toggle-thread-btn="true">{ws.threadCollapsed ? "◧ 展开对话" : "◧ 收起对话"}</button>
+        </nav>}
 
         {/* Collapsible Dialogue Thread Sidebar */}
-        {!ws.threadCollapsed ? (
-          <div className={ws.mobilePane !== "thread" ? styles.hiddenOnMobilePane : ""}>
-            <ThreadSidebar
-              modelOffline={modelOffline}
-              onTriggerL2ActionCard={handleTriggerActionCard}
-            />
+        {!workspaceOnly && !ws.threadCollapsed ? (
+          <div className={`${styles.conversationColumn} ${ws.mobilePane !== "thread" ? styles.hiddenOnMobilePane : ""}`}>
+            {(capabilities.includes("agent.run") || capabilities.includes("agents.run")) && capabilities.includes("tasks.read_self")
+              ? <AssistantPage session={session} embedded /> : <div className={styles.conversationUnavailable}><strong>我的助理</strong><p>当前身份尚无事项读取权限。右侧已授权的人工工作台仍可使用。</p></div>}
           </div>
         ) : null}
 
@@ -496,6 +440,7 @@ export function AiFirstShell({
         >
           <div className={styles.tabBar} role="tablist" aria-label="工作台多标签页">
             {ws.openTabs.map((tab) => {
+              const label = workspaceTabLabel(tab, artifactSummaries);
               const isActive =
                 isRouteDirectMismatch ? tab.path === currentPath : tab.id === activeTab.id;
               return (
@@ -510,23 +455,21 @@ export function AiFirstShell({
                     aria-selected={isActive}
                     className={styles.tabSelectBtn}
                     onClick={() => {
-                      setLeftSection("today");
-                      const ok = selectWorkbenchTab(tab.id);
-                      if (ok && tab.id === TODAY_TAB.id && currentPath !== "/") {
-                        navigate("/");
-                      } else if (ok && tab.kind === "route" && tab.path && tab.path !== currentPath) {
-                        navigate(tab.path);
-                      }
+                      selectWorkbenchTab(tab.id, { onActivated: () => {
+                        setLeftSection("today");
+                        if (tab.id === TODAY_TAB.id) navigate("/");
+                        else if (tab.kind === "route" && tab.path) navigate(tab.path);
+                      } });
                     }}
                   >
                     {tab.dirty ? <span className={styles.dirtyDot} aria-label="未保存修改" /> : null}{" "}
-                    {tab.title}
+                    {label}
                   </button>
                   {tab.closable ? (
                     <button
                       type="button"
                       className={styles.tabCloseBtn}
-                      aria-label={`关闭标签 ${tab.title}`}
+                      aria-label={`关闭标签 ${label}`}
                       onClick={() => {
                         const closed = closeWorkbenchTab(tab.id);
                         if (closed && tab.path === currentPath) {
@@ -555,50 +498,47 @@ export function AiFirstShell({
         onCreateQuoteDraft={(prefill) => void handleCreateQuoteDraft(prefill)}
       />
 
-      {/* No business adapter: retain an explanatory boundary, not a fake confirmation. */}
-      {confirmState ? (
-        <Dialog open={true} onClose={() => setConfirmState(null)}
+      {/* Static guidance only: never retain an artifact or approval state here. */}
+      {submitBoundaryOpen ? (
+        <Dialog open={true} onClose={() => setSubmitBoundaryOpen(false)}
           title="正式业务提交尚未接入"
           description="当前工作区只支持查看和人工编辑草稿。工作区保存凭据不等于管家婆、库存、采购或销售正式单据回执。"
-          footer={<button type="button" className={styles.secondaryBtn} onClick={() => setConfirmState(null)}>返回核对</button>}>
-          <p>当前对象：{confirmState.artifact.title} · v{confirmState.artifact.version}</p>
+          footer={<button type="button" className={styles.secondaryBtn} onClick={() => setSubmitBoundaryOpen(false)}>返回核对</button>}>
           <p role="status" data-workspace-submit-unavailable="true">本入口不会发送提交请求，不会改变正式单据或库存。请使用已接入的原业务页面办理。</p>
         </Dialog>
       ) : null}
 
-      {/* Dirty Tab Leave Confirmation Modal */}
       {ws.dirtyLeavePrompt ? (
-        <div className={styles.paletteBackdrop} role="presentation">
-          <div
-            className={styles.dirtyDialog}
-            role="alertdialog"
-            aria-modal="true"
-            aria-label="未保存修改确认"
-            data-dirty-leave-dialog="true"
-          >
-            <h3 className={styles.panelTitle}>存在未保存的草稿编辑</h3>
-            <p style={{ margin: 0, fontSize: "14px", color: "var(--ink-secondary)" }}>
-              您有未提交的本地编辑。确定{ws.dirtyLeavePrompt.targetDescription}吗？
-            </p>
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
-              <button
-                type="button"
-                className={styles.secondaryBtn}
-                onClick={dismissDirtyLeavePrompt}
-              >
-                留在此标签
-              </button>
-              <button
-                type="button"
-                className={styles.primaryBtn}
-                onClick={confirmDirtyLeavePrompt}
-                data-confirm-dirty-leave="true"
-              >
-                放弃未保存修改并切换
-              </button>
-            </div>
+        <Dialog
+          open={true}
+          role="alertdialog"
+          id="workspace-dirty-leave"
+          size="sm"
+          onClose={dismissDirtyLeavePrompt}
+          closeOnBackdrop={false}
+          initialFocusRef={keepDraftButton}
+          title="存在未保存的草稿编辑"
+          description={`您有未提交的本地编辑。确定${ws.dirtyLeavePrompt.targetDescription}吗？`}
+        >
+          <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: "8px" }}>
+            <button
+              ref={keepDraftButton}
+              type="button"
+              className={styles.secondaryBtn}
+              onClick={dismissDirtyLeavePrompt}
+            >
+              留在此标签
+            </button>
+            <button
+              type="button"
+              className={styles.primaryBtn}
+              onClick={confirmDirtyLeavePrompt}
+              data-confirm-dirty-leave="true"
+            >
+              放弃未保存修改并切换
+            </button>
           </div>
-        </div>
+        </Dialog>
       ) : null}
 
       {/* Cross-device active editor / status toasts */}

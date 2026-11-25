@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from hashlib import sha256
 import json
 import os
@@ -81,18 +81,9 @@ def _fail(code: str) -> None:
     raise AgentExecutorError(code)
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 def _digest(value: object) -> str:
     return sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
                              separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
-
-
-def _canonical(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True,
-                      separators=(",", ":"), allow_nan=False)
 
 
 def _enabled() -> bool:
@@ -137,10 +128,6 @@ def _claim(*, session_factory, machine_token: str, lease_seconds: int,
             lease_seconds=lease_seconds, expected_runtime=expected_runtime, run_id=run_id)
         session.commit()
     return claim
-
-
-def _scoped_messages(session: Session, run_id: str, org: str, store: str) -> list[AgentStep]:
-    return list_steps(session, org, store, run_id)
 
 
 def _origin_text(session: Session, execution, run) -> str:

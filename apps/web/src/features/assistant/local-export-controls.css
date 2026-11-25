@@ -1,0 +1,14 @@
+.assistant-export-actions > button.ar-read {
+  box-sizing: border-box;
+  max-inline-size: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* Keep both local actions touchable after rotating beyond the portrait breakpoint. */
+@media (any-pointer: coarse), (max-width: 760px) {
+  .assistant-export-actions > button.ar-read {
+    min-block-size: 44px;
+    min-inline-size: 44px;
+  }
+}

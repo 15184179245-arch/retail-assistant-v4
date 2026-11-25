@@ -199,6 +199,8 @@ def perform_loopback_request(
             raise SandboxAdapterError(TIMEOUT, phase, sent)
         sock.settimeout(remaining)
         response = connection.getresponse()
+        if time.monotonic() >= deadline:
+            raise SandboxAdapterError(TIMEOUT, phase, sent)
         status = response.status
 
         if 300 <= status < 400:
@@ -230,9 +232,14 @@ def perform_loopback_request(
             chunks.extend(chunk)
             if len(chunks) > MAX_RESPONSE_BYTES:
                 raise SandboxAdapterError(RESPONSE_TOO_LARGE, phase, sent)
+            # A complete response may release the socket as it returns its last bytes.
+            if response.isclosed():
+                break
+        finished_at = time.monotonic()
+        if finished_at >= deadline:
+            raise SandboxAdapterError(TIMEOUT, phase, sent)
         if expected_length is not None and len(chunks) != expected_length:
-            code = (TIMEOUT if time.monotonic() >= deadline - 0.05
-                    else RESPONSE_INVALID)
+            code = TIMEOUT if finished_at >= deadline - 0.05 else RESPONSE_INVALID
             raise SandboxAdapterError(code, phase, sent)
         return status, bytes(chunks)
     except SandboxAdapterError:

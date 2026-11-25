@@ -3,7 +3,9 @@
  * Generated from contracts/openapi.json
  * Original projection: 342 schemas / 175 paths.
  * Incrementally aligned to 389 schemas / 203 paths, source SHA-256:
- * 050ff31487db38e8ebf4d2e2ceb33b105459af5fdafbc9b413b5e9fc243bf8e5
+ * 46b4ef2d2b474ecad98d6924f82b446f0e0c450b23b3f7f4385ac8db0e438d5b
+ * ERP dispatch/reconcile declare 503; unwired Office review writes declare 409.
+ * DTO/path shapes unchanged.
  * Updated 4 existing schema shapes; added 47 schemas and 28 path summaries.
  * Compile-time shape projection only, not JSON Schema runtime validation.
  */
@@ -103,7 +105,7 @@ export interface AllocationLineProposal {
 }
 
 export interface AnswerCitation {
-  kind: "knowledge" | "catalog" | "memory" | "guanjia_observation" | "guanjia_category" | "research";
+  kind: "knowledge" | "catalog" | "memory" | "guanjia_observation" | "guanjia_category" | "research" | "product_image_result" | "history_image_result";
   label: string;
   object_id: string;
   observed_at: (string | null);

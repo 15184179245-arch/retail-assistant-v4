@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
 from backend.app.core.security import AuthenticatedSubject
+from backend.app.modules.agents.process_transport import exchange_committed
 from backend.app.modules.agents import repository, tool_registry, answer_receipts
 from backend.app.modules.agents import capability_discovery as discovery
 from backend.app.modules.agents import source_environment
@@ -321,46 +322,18 @@ def run(raw):
         return dict(version=1,code='unavailable',result=None)
 
 
-def _cleanup_nested(process):
-    # A consume child never starts another operation. It shares the outer
-    # worker group so outer cancellation kills both, but its own timeout must
-    # kill only this PID, never its parent or the whole application group.
-    try:
-        process.kill()
-    except ProcessLookupError:
-        pass
-    process.wait(timeout=5)
-    for stream in (process.stdin,process.stdout):
-        if stream is not None:stream.close()
+def _exchange_timeout(request):
+    probe = (request.get('mode') == 'execute'
+             and request.get('payload', {}).get('decision', {}).get('tool_key') == 'research.probe')
+    return 50.0 if probe else _TIMEOUT
 
 
 def exchange(request, *, deadline=None):
-    process=None
-    nested=_IN_WORKER
-    try:
-        if nested and request.get('mode') not in ('consume','consume_batch'):raise ValueError()
-        raw=receipts._json(request).encode()
-        if _decode(raw) != request: raise ValueError()
-        is_probe=request.get('mode')=='execute' and request.get('payload',{}).get('decision',{}).get('tool_key')=='research.probe'
-        ceiling=time.monotonic()+(50.0 if is_probe else _TIMEOUT)
-        deadline=ceiling if deadline is None else min(deadline,ceiling)
-        if time.monotonic()>=deadline:raise ValueError()
-        process=subprocess.Popen(_COMMAND,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
-            start_new_session=not nested,close_fds=True,cwd=_ROOT,env={'PATH':os.defpath,'LANG':'C.UTF-8'})
-        output,status=_exchange(process,raw,deadline)
-        value=protected._decode(output)
-        if (status != 0 or type(value) is not dict or set(value) != {'version','code','request_sha256','result'}
-                or type(value['version']) is not int or value['version'] != 1 or value['code'] != 'committed'
-                or value['request_sha256'] != _digest(request)): raise ValueError()
-        return value['result']
-    except BaseException:
-        return None
-    finally:
-        if process is not None:
-            try:
-                (_cleanup_nested if nested else _cleanup)(process)
-            except BaseException:
-                return None
+    return exchange_committed(request, command=_COMMAND, cwd=_ROOT, nested=_IN_WORKER,
+        nested_modes=('consume', 'consume_batch'), encode=receipts._json, decode_request=_decode,
+        decode_reply=protected._decode, digest=_digest, timeout=_exchange_timeout,
+        deadline=deadline, check_deadline=True, spawn=subprocess.Popen,
+        communicate=_exchange, cleanup_outer=_cleanup)
 
 
 def execute(selected,claim,step_id,run_version,step_version,decision,name):

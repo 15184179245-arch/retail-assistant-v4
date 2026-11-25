@@ -225,7 +225,8 @@ class PiRunBridge:
     @classmethod
     def submit_for_http(cls, *, session_factory, requester, machine_token,
                         text, key, requested_run_id, runtime_record, offline_transport=None, campaign=None,
-                        category_source=None, category_products_contract=None, research_source=None, sales_source=None):
+                        category_source=None, category_products_contract=None, research_source=None, sales_source=None,
+                        tool_selection=None):
         record = repository.validate_pi_runtime_record(runtime_record)
         if campaign is not None:
             from backend.app.modules.agents.pi_online_campaign import PiOnlineCampaign
@@ -252,7 +253,8 @@ class PiRunBridge:
                 category_source=category_source.pin() if category_source is not None else None,
                 category_products_contract=category_products_contract,
                 research_source=research_source.pin() if research_source is not None else None,
-                sales_source=sales_source.pin_dict() if sales_source is not None else None)
+                sales_source=sales_source.pin_dict() if sales_source is not None else None,
+                tool_selection=tool_selection)
         if receipt.get("replayed") is not False:
             return receipt, None
         claim = executor._claim(session_factory=session_factory, machine_token=machine_token,
@@ -396,7 +398,8 @@ class PiRunBridge:
     def _renew_discovery_lease(self, session):
         # Caller has already locked and revalidated current execution authority.
         # Renewal remains in its normal attempt transaction; never revive a lease.
-        if self.runtime_record['wire_protocol'].startswith(('v4.pi-discovery/', 'v4.pi-source/')):
+        if repository.pi_record_tool_profile(self.runtime_record) in (
+                tool_registry.PI_DISCOVERY_PROFILE, tool_registry.PI_SOURCE_PROFILE, tool_registry.PI_WORKBENCH_PROFILE):
             repository.heartbeat_worker_execution(session, self.claim, lease_seconds=90,
                 expected_runtime=repository.SDK_RUNTIME)
 
@@ -509,8 +512,10 @@ class PiRunBridge:
     def _decision(self, session, ctx, message):
         from backend.app.modules.agents import runtime_protocol as wire
         content = message["content"]
-        text_limit = 131072 if self.runtime_record["wire_protocol"].startswith(("v4.pi-discovery/", "v4.pi-source/")) else 8000
-        memory_profile = repository.pi_record_tool_profile(self.runtime_record) in ('pi-memory-v1', 'pi-discovery-v1', 'pi-source-v1')
+        profile = repository.pi_record_tool_profile(self.runtime_record)
+        text_limit = 131072 if profile in (tool_registry.PI_DISCOVERY_PROFILE,
+            tool_registry.PI_SOURCE_PROFILE, tool_registry.PI_WORKBENCH_PROFILE) else 8000
+        memory_profile = profile != tool_registry.PI_READONLY_PROFILE
         if not memory_profile and len(content) != 1:
             reject("single_native_content_required")
         if message["stopReason"] == "toolUse":
@@ -624,8 +629,7 @@ class PiRunBridge:
                         self._tools(session, ctx)
                         if online and pending.get('invalid_arguments'):
                             from . import capability_discovery
-                            memory_profile = repository.pi_record_tool_profile(self.runtime_record) in (
-                                'pi-memory-v1', 'pi-discovery-v1', 'pi-source-v1')
+                            memory_profile = repository.pi_record_tool_profile(self.runtime_record) != tool_registry.PI_READONLY_PROFILE
                             batch = [item for item in message['content'] if item['type'] == 'toolCall']
                             if not 1 <= len(batch) <= (4 if memory_profile else 1):
                                 reject('native_content_bound')
@@ -730,17 +734,21 @@ class PiRunBridge:
             campaign.check_facts(repository.pi_campaign_facts(session, self.claim))
 
     @staticmethod
-    def _online_usage(response):
+    def _online_accounting(response):
         """Known accounting is independent of decisive-content acceptance."""
         from backend.app.modules.agents import runtime_protocol as wire
-        from backend.app.modules.agents.pi_online_response import observe_response_usage
+        from backend.app.modules.agents.pi_online_response import _bound_response_usage
         wire._pi_provider_response(response)
         if response['status'] != 200:
             reject('pi_provider_status')
         try:
-            return observe_response_usage(response['body'])['usage']
+            return _bound_response_usage(response['body'])
         except Exception:
             reject('pi_provider_usage_unknown')
+
+    @staticmethod
+    def _online_usage(response):
+        return dict(PiRunBridge._online_accounting(response).usage)
 
     def provider_call(self, *, run, epoch, attempt_id, step_id, permit,
                       input_digest, request_digest, request, on_stream=None):
@@ -763,7 +771,13 @@ class PiRunBridge:
                     self._offline_transport.require_run(ctx.run.organization_id, ctx.run.store_id, ctx.run.id)
                 self._online_request(session,ctx,pending,args)
                 response_binding = response_names = None
-                if getattr(self,'_research_source',None) is not None or getattr(self,'_sales_source',None) is not None:
+                # Research/sales source runs authenticate tool calls against the
+                # frozen binding. Workbench runs use the same identity-checked
+                # admitted-schemas machinery (its artifact inputs are not, and
+                # must not be, part of the ordinary static catalog dict).
+                if (getattr(self,'_research_source',None) is not None
+                        or getattr(self,'_sales_source',None) is not None
+                        or repository.pi_record_tool_profile(self.runtime_record) == tool_registry.PI_WORKBENCH_PROFILE):
                     from . import capability_discovery
                     response_binding = deepcopy(ctx.execution.frozen_context['pi_readonly_binding'])
                     response_names = sorted(capability_discovery.active_names(session,ctx))
@@ -813,10 +827,15 @@ class PiRunBridge:
             normalized = None
             truncated = False
             try:
+                # Workbench rides the source-level admission lattice (WorkbenchPeer
+                # is online+memory+discovery+source all true). Artifact tool calls
+                # are authenticated against the frozen binding via the
+                # admitted-schemas path, never against the static catalog dict.
+                _profile = repository.pi_record_tool_profile(self.runtime_record)
                 normalized = normalize_response(response['body'], model='deepseek-v4.1-flash',
-                    memory=repository.pi_record_tool_profile(self.runtime_record) in (tool_registry.PI_MEMORY_PROFILE, tool_registry.PI_DISCOVERY_PROFILE, tool_registry.PI_SOURCE_PROFILE),
-                    discovery=repository.pi_record_tool_profile(self.runtime_record) in (tool_registry.PI_DISCOVERY_PROFILE, tool_registry.PI_SOURCE_PROFILE),
-                    source=repository.pi_record_tool_profile(self.runtime_record) == tool_registry.PI_SOURCE_PROFILE,
+                    memory=_profile in (tool_registry.PI_MEMORY_PROFILE, tool_registry.PI_DISCOVERY_PROFILE, tool_registry.PI_SOURCE_PROFILE, tool_registry.PI_WORKBENCH_PROFILE),
+                    discovery=_profile in (tool_registry.PI_DISCOVERY_PROFILE, tool_registry.PI_SOURCE_PROFILE, tool_registry.PI_WORKBENCH_PROFILE),
+                    source=_profile in (tool_registry.PI_SOURCE_PROFILE, tool_registry.PI_WORKBENCH_PROFILE),
                     categories=getattr(self,'_category_source',None) is not None,
                     category_products_contract=getattr(self,'_category_products_contract',None),
                     verified_binding=response_binding, active_names=response_names, recover_invalid_arguments=True)
@@ -825,7 +844,7 @@ class PiRunBridge:
             except (ValueError, TypeError, KeyError):
                 pass
             try:
-                usage = self._online_usage(response)
+                observation = self._online_accounting(response)
             except Exception:
                 self._store_provider_result(pending,actor,response=response,normalized=normalized)
                 # Keep the known HTTP rejection visible after the unknown
@@ -835,7 +854,7 @@ class PiRunBridge:
                        else 'pi_provider_usage_unknown')
             # Billing observations remain durable even if content cannot be
             # authenticated. A failed parser never grants a next action.
-            self._store_provider_result(pending,actor,response=response,usage=usage,normalized=normalized)
+            self._store_provider_result(pending,actor,response=response,observation=observation,normalized=normalized)
             if on_stream is not None:on_stream('receipt_committed', {'at_ms':time.time()*1000})
             if probe:
                 # A diagnostic is never a business answer or a tool permission.
@@ -849,6 +868,7 @@ class PiRunBridge:
                 reject('pi_online_content_binding')
             pending['response_digest'] = normalized['raw_sha256']
             pending['invalid_arguments'] = normalized.get('invalid_arguments')
+            usage = dict(observation.usage)
             if (usage['input']+usage['cacheRead']+usage['cacheWrite'] > pending['budget']['input']
                     or usage['output'] > pending['budget']['output']):
                 reject('pi_provider_usage_exceeded')
@@ -859,20 +879,13 @@ class PiRunBridge:
 
     def _require_probe_dispatch_window(self):
         campaign = getattr(self, '_campaign', None)
-        if campaign is not None and campaign.mode in ('real-probe', 'real-readonly-trial', 'real-memory-trial', 'real-assistant-trial'):
-            from datetime import timedelta
-            from backend.app.modules.agents import pi_online_campaign as campaigns
-            from backend.app.modules.agents.pi_online_transport import TIMEOUT_SECONDS
-            campaign.validate()
-            # The worker bounds key/CA/DNS/send/receive by TIMEOUT_SECONDS.
-            # Leave 15 s scheduling/cleanup margin inside the UTC campaign;
-            # this is not an OS hard-real-time or wall-clock-jump guarantee.
-            if campaign.expires_at - campaigns.utc_now() < timedelta(seconds=TIMEOUT_SECONDS + 15):
-                campaigns.reject()
+        if campaign is not None:
+            campaign.require_dispatch_window()
 
-    def _store_provider_result(self,pending,actor,*,response=None,usage=None,error=None,normalized=None):
+    def _store_provider_result(self,pending,actor,*,response=None,observation=None,error=None,normalized=None):
         from backend.app.workers.agent_guard import guard_recovery
         from backend.app.modules.agents import runtime_protocol as wire
+        usage = None if observation is None else dict(observation.usage)
         with self._transaction('accounting') as session:
             # Accounting is not a new execution permission. A revoked employee
             # cannot erase a known bill; machine/scope/fence stay revalidated.
@@ -892,12 +905,15 @@ class PiRunBridge:
             if error is not None and getattr(error,'send_started',None) is False:
                 row.send_started = False
             row.updated_at = ctx.now
+            response_digest = None
             if response is not None:
                 # Store only safe whitelisted metadata, never body/error text.
                 try:
                     wire._pi_provider_response(response)
-                    row.response_digest = sha256(response['body'].encode()).hexdigest()
+                    digest = sha256(response['body'].encode()).hexdigest()
+                    row.response_digest = digest
                     row.provider_request_id = response['request_id']
+                    response_digest = digest
                 except Exception:
                     pass
             if normalized is not None:
@@ -905,15 +921,14 @@ class PiRunBridge:
                     reject('pi_online_content_binding')
                 row.message_digest = normalized['message_sha256']
                 row.usage_presence = normalized['usage_presence']
-            if usage is not None:
-                from backend.app.modules.agents.pi_online_response import observe_response_usage
-                observed = observe_response_usage(response['body'])
-                if observed['usage'] != usage:
+            if observation is not None:
+                # The accounting fence still verifies the exact lexical body
+                # independently. Never reuse evidence from another response.
+                if response_digest != observation.response_digest or response['status'] != 200:
                     reject('pi_provider_usage_unknown')
-                # Store raw presence truthfully even when only the independent
-                # accounting parser succeeded; no content decision is implied.
-                row.usage_presence = observed['usage_presence']
-                row.usage_basis = observed['usage_basis']
+                row.usage_presence = dict(observation.usage_presence)
+                basis = observation.usage_basis
+                row.usage_basis = None if basis is None else dict(basis)
             if usage is None:
                 row.state = 'not_sent' if row.send_started is False else 'unknown'
                 row.error_code = 'pi_provider_result_unknown'
@@ -989,7 +1004,15 @@ class PiRunBridge:
                 if metadata:
                     discovery.selection_result(session, ctx, arguments, selection)
                 repository.require_pi_tool_receipt(session, self.claim, pi_name=name, decision=decision, state="accepted")
-                definition = tool_registry.resolve_tool(decision["tool_key"], version, store_id=self.claim.store_id)
+                if (repository.pi_record_tool_profile(self.runtime_record) == tool_registry.PI_WORKBENCH_PROFILE
+                        and type(decision["tool_key"]) is str and type(version) is str
+                        and (decision["tool_key"], version) in tool_registry.WORKSPACE_TOOLS):
+                    # Workspace artifact pair inside the verified workbench
+                    # binding's frozen selection: resolve the fixed registry
+                    # definition; resolve_tool keeps rejecting these keys.
+                    definition = tool_registry.workspace_definition(decision["tool_key"], version)
+                else:
+                    definition = tool_registry.resolve_tool(decision["tool_key"], version, store_id=self.claim.store_id)
                 executor._remaining_budget(ctx.run, repository.list_steps(session, ctx.run.organization_id,
                     ctx.run.store_id, ctx.run.id), phase="tool")
                 step, run_version = executor._open_tool_step(session, ctx, self.claim, ctx.run,
@@ -1008,7 +1031,7 @@ class PiRunBridge:
             projection_profile = None
             if definition.key == 'knowledge.search' and version == '1':
                 projection_profile = repository.pi_record_tool_profile(self.runtime_record)
-                if projection_profile in tool_registry.PI_PROFILES:
+                if projection_profile in tool_registry.PI_ALL_PROFILES:
                     from backend.app.modules.knowledge import p1c as knowledge_p1c
                     projection_input = definition.input_model.model_validate(arguments)
                     control = getattr(self, '_execution_control', None)
@@ -1025,16 +1048,33 @@ class PiRunBridge:
                         projection_actor = pctx.person
                         run_remaining = (pctx.run.deadline_at - projection_now).total_seconds()
                     projection_deadline = intent_started + min(3.0, max(0.0, run_remaining))
-                    projection_prepared = knowledge_p1c.prepare_search(
-                        self.factory, projection_actor, query=projection_input.query,
-                        now=projection_now, deadline=projection_deadline,
-                        cancel_event=projection_stop)
-                    projection_worker = knowledge_p1c.score_prepared(
-                        projection_prepared, deadline=projection_deadline,
-                        cancel_event=projection_stop, limit=projection_input.limit)
+                    snapshot_error = None
+                    try:
+                        projection_prepared = knowledge_p1c.prepare_search(
+                            self.factory, projection_actor, query=projection_input.query,
+                            now=projection_now, deadline=projection_deadline,
+                            cancel_event=projection_stop)
+                        projection_worker = knowledge_p1c.score_prepared(
+                            projection_prepared, deadline=projection_deadline,
+                            cancel_event=projection_stop, limit=projection_input.limit)
+                    except BaseException as error:
+                        snapshot_error = error
+                        raise
+                    finally:
+                        # B is the only file-path consumer. C uses the frozen
+                        # in-memory rows and rechecks the current DB projection.
+                        if projection_prepared is not None:
+                            try:
+                                knowledge_p1c.cleanup(projection_prepared)
+                            except OSError:
+                                code = 'pi_knowledge_snapshot_cleanup_unconfirmed'
+                                if snapshot_error is None:
+                                    raise BridgeError(code) from None
+                                snapshot_error.add_note(code)
             from backend.app.modules.integrations.guanjia import observation_receipts
-            source_process = (repository.pi_record_tool_profile(self.runtime_record) == tool_registry.PI_SOURCE_PROFILE
-                              and (definition.key, version) in tool_registry.GUANJIA_SOURCE_TOOLS)
+            source_process = ((definition.key, version) in tool_registry.GUANJIA_SOURCE_TOOLS
+                and repository.pi_record_tool_profile(self.runtime_record) in (
+                    tool_registry.PI_SOURCE_PROFILE, tool_registry.PI_WORKBENCH_PROFILE))
             if (definition.key, version) in tool_registry.GUANJIA_SALES_TOOLS:
                 from backend.app.modules.integrations.guanjia import sales_ranking_process
                 selected_sales = getattr(self, '_sales_source', None)

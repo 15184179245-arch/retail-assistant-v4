@@ -57,7 +57,11 @@
       "organization_id",
       "store_id",
       "nonce",
-      "signature"
+      "signature",
+      "contract_id",
+      "adapter_id",
+      "protocol_version",
+      "mode"
     ],
     "title": "SandboxCapabilities",
     "type": "object"
@@ -68,6 +72,7 @@
     "additionalProperties": false,
     "properties": {
       "acknowledged": {
+        "const": true,
         "title": "Acknowledged",
         "type": "boolean"
       },
@@ -139,7 +144,11 @@
       "input_digest",
       "acknowledged",
       "nonce",
-      "signature"
+      "signature",
+      "contract_id",
+      "adapter_id",
+      "protocol_version",
+      "mode"
     ],
     "title": "SandboxDispatchAck",
     "type": "object"
@@ -573,7 +582,11 @@
       "input_digest",
       "lines",
       "nonce",
-      "signature"
+      "signature",
+      "contract_id",
+      "adapter_id",
+      "protocol_version",
+      "mode"
     ],
     "title": "SandboxReadbackReceipt",
     "type": "object"

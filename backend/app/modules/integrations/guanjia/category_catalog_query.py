@@ -4,7 +4,7 @@ No network, authorization issuance, implicit flush, or publication. A malformed
 current source row invalidates the whole result, including an otherwise empty page.
 """
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import re
 import json
 from hashlib import sha256
@@ -89,6 +89,35 @@ def _upstream_status(raw):
     if type(value) is not bool:
         return 'unknown', 'invalid_type'
     return ('enabled' if value else 'disabled'), None
+
+
+_LEGACY_PLUS_EIGHT = timezone(timedelta(hours=8))
+
+
+def _observation_digest_matches(payload, source_version, stored_time, expected):
+    # UTCDateTime has already normalized the source instant. Keep the old
+    # UTC/null encoding as the fast path, then check one historical spelling.
+    if stored_time is not None and (type(stored_time) is not datetime
+            or stored_time.utcoffset() != timedelta(0)):
+        return False
+    observation = {'payload': payload, 'source_version': source_version,
+        'source_updated_at': stored_time.isoformat() if stored_time is not None else None}
+
+    def matches():
+        return sha256(json.dumps(observation, ensure_ascii=False, sort_keys=True,
+            separators=(',', ':'), allow_nan=False).encode('utf-8')).hexdigest() == expected
+
+    if matches():
+        return True
+    if stored_time is None:
+        return False
+    # This candidate is evidence only if it matches the original SHA exactly.
+    # Neither directory nor store metadata attests the original source offset.
+    try:
+        observation['source_updated_at'] = stored_time.astimezone(_LEGACY_PLUS_EIGHT).isoformat()
+    except OverflowError:
+        return False
+    return matches()
 
 
 def _scope(directory, identity):
@@ -209,16 +238,12 @@ def _query_category_catalog(session, directory, *, organization_id, store_id,
                     or row['payload'].get('external_code') != row['external_code']
                     or row['payload']['raw'].get('code') != row['external_code']):
                 _deny()
-            observation = {'payload': row['payload'],
-                'source_version': row['snapshot_source_version'],
-                'source_updated_at': row['source_updated_at'].isoformat()
-                    if row['source_updated_at'] else None}
             try:
-                actual_digest = sha256(json.dumps(observation, ensure_ascii=False,
-                    sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')).hexdigest()
+                verified = _observation_digest_matches(row['payload'], row['snapshot_source_version'],
+                    row['source_updated_at'], row['payload_sha256'])
             except (TypeError, ValueError, RecursionError):
-                _deny()
-            if actual_digest != row['payload_sha256']:
+                verified = False
+            if not verified:
                 _deny()
             if category_id in descendants:
                 fields = (row['product_id'], row['external_code'], category_id,

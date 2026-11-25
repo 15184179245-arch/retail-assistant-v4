@@ -45,10 +45,10 @@ WINDOW_LIMIT = 10_000
 class KnowledgeSourceGeneration(Base):
     """Singleton authority row for the currently published projection.
 
-    ``generation`` starts at 1 and is only advanced by the ``0077`` triggers and
-    by a successful publish.  ``generation = build.source_generation + 1`` is
-    the publish invariant; a direct ``UPDATE``/``REPLACE`` that resets it,
-    overflows it, or deletes the row is rejected inside the database.
+    ``generation`` starts at 1 and the ``0077`` source-change triggers advance
+    it.  Publishing requires ``generation == build.source_generation`` and
+    moves the build pointer without advancing the generation.  Database guards
+    reject resets, overflow, reseeding, and deletion of the authority row.
     """
 
     __tablename__ = "knowledge_source_generation"

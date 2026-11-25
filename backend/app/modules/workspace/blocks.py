@@ -16,7 +16,6 @@ from sqlalchemy.orm import Session
 
 from backend.app.core.security import AuthenticatedSubject
 from backend.app.modules.catalog.models import CatalogProduct, CatalogSnapshot
-from backend.app.modules.identity.service import resolve_effective_capabilities
 from backend.app.modules.locations.models import Location, PlacementAssertion
 from backend.app.modules.pricing.models import PricingQuote
 from backend.app.modules.purchasing.models import PurchaseEvidence, PurchaseIntent
@@ -330,6 +329,15 @@ def _version_matches(expected_version: str | int | None, *actual_candidates: obj
     return False
 
 
+
+def _quote_current(quote: PricingQuote) -> bool:
+    expires_at = quote.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at > datetime.now(timezone.utc) and quote.status in ("quoted", "active")
+
+
+
 def _resolve_single_ref(
     session: Session,
     actor: AuthenticatedSubject,
@@ -407,6 +415,8 @@ def _resolve_single_ref(
             .order_by(PricingQuote.created_at.desc())
         ).scalars().first()
         if quote is not None:
+            if not _quote_current(quote):
+                mark_stale(quote.rule_version)
             sources.add("pricing")
             timestamps.append(quote.created_at)
             if "sales.read" in cap_set or "pricing.quote" in cap_set:
@@ -436,11 +446,7 @@ def _resolve_single_ref(
             return {"kind": kind, "id": ref_id, "found": False, "verification_label": "待核实"}, stripped, stale_refs, sources, timestamps
         sources.add("pricing")
         timestamps.append(quote.created_at)
-        now = datetime.now(timezone.utc)
-        expires_at = quote.expires_at
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if not _version_matches(expected_ver, quote.rule_version, quote.object_version) or expires_at <= now or quote.status not in ("quoted", "active"):
+        if not _version_matches(expected_ver, quote.rule_version, quote.object_version) or not _quote_current(quote):
             mark_stale(quote.rule_version)
         item = {"kind": kind, "id": quote.id, "found": True, "product_id": quote.product_id, "rule_version": quote.rule_version}
         if "sales.read" in cap_set or "pricing.quote" in cap_set:
@@ -668,10 +674,7 @@ def _resolve_single_ref(
         if any(p in cap_set for p in kind_read_caps):
             payload_copy = copy.deepcopy(art.payload or {})
             if "pricing.cost.read" not in cap_set:
-                for cost_key in ("cost_price", "cost_amount"):
-                    if cost_key in payload_copy:
-                        payload_copy.pop(cost_key, None)
-                        stripped.append(cost_key)
+                payload_copy = workspace_service._project_artifact_payload(payload_copy, cap_set, stripped)
             item["payload"] = payload_copy
         else:
             stripped.append("payload")
@@ -706,8 +709,7 @@ def resolve_block(
             fallback_text=f"{fallback_title}该智能卡片已降级展示（原因：{exc.message}）",
         )
 
-    caps, _ = resolve_effective_capabilities(session, actor)
-    cap_set = set(caps)
+    cap_set = workspace_service._output_capabilities(session, actor)
 
     resolved_items: list[dict[str, Any]] = []
     all_stripped: list[str] = []

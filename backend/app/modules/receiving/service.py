@@ -6,14 +6,14 @@ Commands and audit share the caller's outer DB transaction.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from hashlib import sha256
 import json
 import re
 from uuid import uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import select, update
+from sqlalchemy import and_, select, update
 from sqlalchemy.orm import Session
 from backend.app.modules.identity.command_guard import lock_employee_authority
 
@@ -25,13 +25,14 @@ from backend.app.modules.identity.service import authorize_scope
 from backend.app.modules.auth.models import EmployeeAccount
 from backend.app.modules.knowledge.commands import execute_command
 from backend.app.modules.purchasing.models import PurchaseIntent, PurchaseIntentLine
+from backend.app.modules.purchasing.schemas import canonical_quantity
 from backend.app.modules.receiving.models import (
     ReceivingBatch, ReceivingCommand, ReceivingDecision, ReceivingDiscrepancy, ReceivingLine,
 )
 
 _READ, _WRITE, _REVIEW = "receiving.read", "receiving.write", "receiving.review"
 _SHA = re.compile(r"[a-f0-9]{64}\Z")
-_DEC = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,3})?\Z")
+_DEC = re.compile(r"(0|[1-9][0-9]*)(?:\.([0-9]+))?\Z")
 _UNITS = frozenset(("piece", "box", "kg", "meter"))
 _DECISIONS = frozenset((
     "accept_observation", "request_recount", "return_supplier_review",
@@ -68,13 +69,33 @@ def _name(value: object, field: str, cap: int = 200) -> str:
     return value
 
 
-def _number(value: object, field: str) -> Decimal:
-    if not isinstance(value, str) or len(value) > 40 or _DEC.fullmatch(value) is None:
+def _number(value: object, field: str, *, quantity=False) -> Decimal:
+    match = _DEC.fullmatch(value) if isinstance(value, str) and len(value) <= 40 else None
+    if match is None:
         _fail("receiving_" + field + "_invalid")
+    fractional = match[2] or ""
+    if len(fractional.rstrip("0") if quantity else fractional) > 3:
+        _fail("receiving_" + field + "_invalid")
+    # Preserve the scale of stored evidence; ERP-005 digests its exact text.
     number = Decimal(value)
     if not number.is_finite() or number < 0 or number > Decimal("1000000000"):
         _fail("receiving_" + field + "_invalid")
     return number
+
+
+def _stored_intent_quantity(value: object) -> Decimal:
+    # The old purchase writer used fixed-point Decimal rendering without a
+    # lexical length bound; SQLite could store all its redundant trailing zeros.
+    # Validate the full historical lexeme, but construct a small Decimal.
+    match = _DEC.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        _fail("receiving_intent_quantity_invalid")
+    whole, fraction = match.groups()
+    significant = (fraction or "").rstrip("0")
+    if len(whole) > 10 or len(significant) > 3:
+        _fail("receiving_intent_quantity_invalid")
+    bounded = whole + ("." + significant if significant else "")
+    return _number(bounded, "intent_quantity")
 
 
 def _payload(payload: dict) -> dict:
@@ -146,6 +167,7 @@ def _out(db: Session, actor: AuthenticatedSubject, row: ReceivingBatch) -> dict:
              "product_id": x.product_id, "product_version": x.product_version,
              "unknown_product_label": x.unknown_product_label,
              "observed_quantity": x.observed_quantity, "unit": x.unit,
+             # This is the original declaration, not a reviewed fulfillment.
              "final_for_intent_line": x.final_for_intent_line,
              "evidence_sha256": x.evidence_sha256, "observed_by": x.observed_by}
             for x in lines
@@ -201,6 +223,36 @@ def _intent_line(db: Session, actor: AuthenticatedSubject, intent_id: str,
     if row is None:
         _fail("receiving_intent_line_not_found")
     return row
+
+
+def _bound_prior_observations(db: Session, original: PurchaseIntentLine,
+                              current_id: str):
+    """Read only observations of the exact independently bound intent product."""
+    scope = (ReceivingLine.organization_id == original.organization_id,
+             ReceivingLine.store_id == original.store_id)
+    disputed = select(ReceivingDiscrepancy.id).where(
+        ReceivingDiscrepancy.organization_id == ReceivingLine.organization_id,
+        ReceivingDiscrepancy.store_id == ReceivingLine.store_id,
+        ReceivingDiscrepancy.batch_id == ReceivingLine.batch_id,
+        ReceivingDiscrepancy.line_id == ReceivingLine.id,
+        ReceivingDiscrepancy.kind.in_(("wrong_item", "identity_unknown")),
+    ).exists().label("binding_disputed")
+    return list(db.execute(select(
+        ReceivingLine.unit, ReceivingLine.observed_quantity,
+        ReceivingLine.final_for_intent_line, ReceivingBatch.status, disputed,
+    ).join(ReceivingBatch, and_(
+        ReceivingBatch.id == ReceivingLine.batch_id,
+        ReceivingBatch.organization_id == ReceivingLine.organization_id,
+        ReceivingBatch.store_id == ReceivingLine.store_id,
+    )).where(
+        *scope,
+        ReceivingBatch.intent_id == original.intent_id,
+        ReceivingLine.intent_line_id == original.id,
+        ReceivingLine.id != current_id,
+        ReceivingLine.product_id == original.product_id,
+        ReceivingLine.product_version == original.product_version,
+        ReceivingLine.unknown_product_label.is_(None),
+    )))
 
 
 def _verified_product(db: Session, actor: AuthenticatedSubject, product_id: str):
@@ -271,7 +323,7 @@ def record_batch(db: Session, actor: AuthenticatedSubject, payload: dict, *,
             if key in seen:
                 _fail("receiving_line_duplicate")
             seen.add(key)
-            qty = _number(entry["observed_quantity"], "quantity")
+            observed = canonical_quantity(_number(entry["observed_quantity"], "quantity", quantity=True))
             if entry["unit"] not in _UNITS:
                 _fail("receiving_unit_unknown")
             proof = _sha(entry["evidence_sha256"], "line_evidence_sha256")
@@ -306,7 +358,7 @@ def record_batch(db: Session, actor: AuthenticatedSubject, payload: dict, *,
                 store_id=actor.store_id, batch_id=batch.id, line_key=key,
                 intent_line_id=line_id, product_id=product_id,
                 product_version=product_version, unknown_product_label=label,
-                observed_quantity=entry["observed_quantity"], unit=entry["unit"],
+                observed_quantity=observed, unit=entry["unit"],
                 final_for_intent_line=entry["final_for_intent_line"], evidence_sha256=proof,
                 quoted_price=entry["quoted_price"], delivered_price=entry["delivered_price"],
                 price_evidence_sha256=entry["price_evidence_sha256"],
@@ -329,44 +381,49 @@ def record_batch(db: Session, actor: AuthenticatedSubject, payload: dict, *,
                 original = _intent_line(db, actor, intent_id, line_id)
                 if original.confirmed_by is None or original.quantity is None:
                     _fail("receiving_intent_line_unconfirmed")
-                if product_id != original.product_id:
-                    types["wrong_item"] = {"expected_product_id": original.product_id,
-                                           "observed_product_id": product_id}
-                prior = list(db.scalars(select(ReceivingLine).join(
-                    ReceivingBatch, ReceivingBatch.id == ReceivingLine.batch_id
-                ).where(
-                    ReceivingLine.organization_id == actor.organization_id,
-                    ReceivingLine.store_id == actor.store_id,
-                    ReceivingBatch.intent_id == intent_id,
-                    ReceivingLine.intent_line_id == line_id,
-                    ReceivingLine.id != line.id,
-                )))
-                if any(p.final_for_intent_line for p in prior):
+                bound = (product_id is not None and (product_id, product_version)
+                         == (original.product_id, original.product_version))
+                if not bound:
+                    types["wrong_item"] = {
+                        "expected_product_id": original.product_id,
+                        "observed_product_id": product_id,
+                        "expected_product_version": original.product_version,
+                        "observed_product_version": product_version,
+                    }
+                prior = _bound_prior_observations(db, original, line.id)
+                # A final declaration on wrong/unknown evidence cannot close the
+                # line. Acceptance of an observation is not an identity repair.
+                # Hold a credible declaration against duplicates while it awaits
+                # independent review; only then is it a closed local line.
+                finals = [p for p in prior if p.final_for_intent_line and not p.binding_disputed]
+                if any(p.status == "reviewed" for p in finals):
                     _fail("receiving_intent_line_already_final")
-                # PurchaseIntentLine has NO native unit. All comparisons are
-                # human-attested same-unit candidate discrepancies, never a
-                # verified packaging conversion or ERP quantity.
-                compatible = product_id == original.product_id and all(
-                    p.product_id == product_id and p.unit == entry["unit"] for p in prior
-                )
+                if finals:
+                    _fail("receiving_intent_line_final_pending_review")
+                # No native unit exists on PurchaseIntentLine. Even bound rows
+                # with discrepant units must not be silently dropped or converted.
+                compatible = bound and all(p.unit == entry["unit"] for p in prior)
                 if compatible:
-                    cumulative = qty + sum(
-                        (_number(p.observed_quantity, "quantity") for p in prior), Decimal(0)
-                    )
-                    expected = _number(original.quantity, "intent_quantity")
+                    with localcontext() as context:
+                        context.prec = 80  # Same exact, bounded-decimal arithmetic as ERP-005.
+                        cumulative = Decimal(observed) + sum(
+                            (_number(p.observed_quantity, "quantity", quantity=True) for p in prior), Decimal(0)
+                        )
+                    expected_text = original.quantity
+                    expected = _stored_intent_quantity(expected_text)
                     if cumulative > expected:
                         types["overage"] = {
-                            "expected_quantity": format(expected, "f"),
+                            "expected_quantity": expected_text,
                             "cumulative_observed_quantity": format(cumulative, "f"),
                             "unit_verification": "employee_attested_unknown_conversion",
                         }
                     elif entry["final_for_intent_line"] and cumulative < expected:
                         types["shortage"] = {
-                            "expected_quantity": format(expected, "f"),
+                            "expected_quantity": expected_text,
                             "cumulative_observed_quantity": format(cumulative, "f"),
                             "unit_verification": "employee_attested_unknown_conversion",
                         }
-                else:
+                elif bound:
                     types["wrong_item"] = {
                         "reason": "product_or_unit_mismatch_across_batches",
                         "intent_line_id": line_id,

@@ -45,76 +45,70 @@ from backend.app.workers.outbox import OutboxEvent
 from backend.app.modules.sales.service import SalesError
 
 
-async def agent_error_handler(_request: Request, exc: AgentRuntimeError) -> JSONResponse:
-    body = ApiEnvelope(success=False, data=None, code=exc.code.upper(), error=exc.code,
-                       user_message="Agent 请求无法完成。", hint=None)
-    return JSONResponse(status_code=exc.status_code, content=body.model_dump(),
-                        headers={"Cache-Control": "no-store"})
+def _domain_error_response(status: int, error: str, message: str, hint: str | None) -> JSONResponse:
+    body = ApiEnvelope(success=False, data=None, code=error.upper(), error=error,
+                       user_message=message, hint=hint)
+    return JSONResponse(status_code=status, content=body.model_dump(), headers={"Cache-Control": "no-store"})
 
+
+async def agent_error_handler(_request: Request, exc: AgentRuntimeError) -> JSONResponse:
+    message, hint = {
+        "pi_provider_capacity_exceeded": (
+            "输入及上下文超出本次处理上限。", "请拆分要求后重试；内容未被自动截断。"),
+    }.get(exc.code, ("Agent 请求无法完成。", None))
+    return _domain_error_response(exc.status_code, exc.code, message, hint)
 
 
 async def workflow_error_handler(_request: Request, exc: WorkflowError) -> JSONResponse:
     status = workflow_error_status(exc.code)
     messages = {403: "当前身份不能执行此流程动作。", 404: "当前门店没有可读取的流程或任务。",
                 422: "流程请求参数不符合要求。", 503: "此材料所需的解析能力暂不可用。"}
-    body = ApiEnvelope(success=False, data=None, code=exc.code.upper(), error=exc.code,
-        user_message=messages.get(status, "流程内容、状态或来源校验已变化，请刷新并核对。"),
-        hint="请核对原始记录；结果未知时不要重复执行。")
-    return JSONResponse(status_code=status, content=body.model_dump(), headers={"Cache-Control": "no-store"})
-
+    return _domain_error_response(status, exc.code,
+        messages.get(status, "流程内容、状态或来源校验已变化，请刷新并核对。"), "请核对原始记录；结果未知时不要重复执行。")
 
 
 async def erp_sales_error_handler(_request: Request, exc: ERPSalesError) -> JSONResponse:
     status = 404 if exc.code == "erp_sales_not_found" else 403 if exc.code in (
         "erp_sales_human_required", "erp_sales_participant_unavailable") else 422 if exc.code in ("erp_sales_input_invalid", "erp_sales_cursor_invalid") else 409
-    body = ApiEnvelope(success=False, data=None, code=exc.code.upper(), error=exc.code,
-        user_message="销售命令、来源或授权状态不符合要求，请刷新核对。", hint="已绑定或结果未知的销售不得换通路重发。")
-    return JSONResponse(status_code=status, content=body.model_dump(), headers={"Cache-Control": "no-store"})
-
+    return _domain_error_response(status, exc.code,
+        "销售命令、来源或授权状态不符合要求，请刷新核对。", "已绑定或结果未知的销售不得换通路重发。")
 
 
 async def erp_receipt_error_handler(_request: Request, exc: ERPReceiptError) -> JSONResponse:
     status = 404 if exc.code == "erp_receipt_not_found" else 403 if exc.code in (
         "erp_receipt_human_required", "erp_receipt_participant_unavailable") else 422 if exc.code in (
         "erp_receipt_input_invalid", "erp_receipt_cursor_invalid") else 409
-    body = ApiEnvelope(success=False, data=None, code=exc.code.upper(), error=exc.code,
-        user_message="入库命令、来源或授权状态已变化，请刷新核对。", hint="已绑定或结果未知的批次不得换通路重发。")
-    return JSONResponse(status_code=status, content=body.model_dump(), headers={"Cache-Control": "no-store"})
-
+    return _domain_error_response(status, exc.code,
+        "入库命令、来源或授权状态已变化，请刷新核对。", "已绑定或结果未知的批次不得换通路重发。")
 
 
 async def erp_catalog_error_handler(_request: Request, exc: ERPCatalogError) -> JSONResponse:
     status = 404 if exc.code == "erp_catalog_not_found" else 403 if exc.code in (
         "erp_catalog_human_required", "erp_catalog_participant_unavailable") else 422 if exc.code in (
         "erp_catalog_input_invalid", "erp_catalog_cursor_invalid") else 409
-    body = ApiEnvelope(success=False, data=None, code=exc.code.upper(), error=exc.code,
-        user_message="商品维护命令、来源或授权状态已变化，请刷新核对。", hint="结果未知时请回查原命令，不得重复派发。")
-    return JSONResponse(status_code=status, content=body.model_dump(), headers={"Cache-Control": "no-store"})
-
+    return _domain_error_response(status, exc.code,
+        "商品维护命令、来源或授权状态已变化，请刷新核对。", "结果未知时请回查原命令，不得重复派发。")
 
 
 async def office_schedule_error_handler(_request: Request, exc: ScheduleError) -> JSONResponse:
     status = schedule_error_status(exc.code)
-    body = ApiEnvelope(success=False, data=None, code=exc.code.upper(), error=exc.code,
-        user_message="排程、授权或所见版本已变化，请刷新后核对。", hint="排程只生成待人审建议，未知结果请先回查原操作。")
-    return JSONResponse(status_code=status, content=body.model_dump(), headers={"Cache-Control": "no-store"})
-
+    return _domain_error_response(status, exc.code,
+        "排程、授权或所见版本已变化，请刷新后核对。", "排程只生成待人审建议，未知结果请先回查原操作。")
 
 
 async def office_exception_error_handler(_request: Request, exc: OfficeExceptionError) -> JSONResponse:
     status = exception_error_status(exc.code)
     messages = {403: "当前身份或来源读取权限不能执行此异常操作。", 404: "当前门店没有可读取的异常或来源。",
                 422: "异常请求参数不符合要求。", 400: "操作标识不符合要求。"}
-    body = ApiEnvelope(success=False, data=None, code=exc.code.upper(), error=exc.code,
-        user_message=messages.get(status, "异常状态、所见来源或核验依据已变化，请刷新后重新核对。"),
-        hint="异常关闭仅记录核对结果；原业务结果未知时不要重复执行。")
-    return JSONResponse(status_code=status, content=body.model_dump(), headers={"Cache-Control": "no-store"})
-
+    return _domain_error_response(status, exc.code,
+        messages.get(status, "异常状态、所见来源或核验依据已变化，请刷新后重新核对。"), "异常关闭仅记录核对结果；原业务结果未知时不要重复执行。")
 
 
 async def http_error_handler(_request: Request, exc: HTTPException) -> JSONResponse:
     detail = exc.detail if isinstance(exc.detail, str) else "http_error"
     code_map = {
+        "office_extraction_sheet_limit": ("OFFICE_EXTRACTION_SHEET_LIMIT", "工作表超过 30 张，未生成解析结果。", "请拆分为每份不超过 30 张工作表后重试。"),
+        "office_review_source_not_integrated": ("OFFICE_REVIEW_SOURCE_NOT_INTEGRATED", "审核来源尚未接入，此处仅保留历史查询。", "请使用对应业务的原有审批入口。"),
         "assistant_input_capacity_exceeded": ("ASSISTANT_INPUT_CAPACITY_EXCEEDED", "这条消息超出当前传输容量。", "请分段发送；原文未截断，也未提交执行。"),
         "knowledge_revision_closed": ("KNOWLEDGE_REVISION_CLOSED", "知识已撤回或失效，不能直接修订。", "如需重新提交，请创建新的待审条目。"),
         "knowledge_version_conflict": ("KNOWLEDGE_VERSION_CONFLICT", "知识版本已变化。", "请刷新并审阅最新版本后再操作。"),

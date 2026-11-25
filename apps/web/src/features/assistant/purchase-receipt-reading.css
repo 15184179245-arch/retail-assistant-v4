@@ -1,0 +1,9 @@
+/* One native keyboard entry, not a tab stop for every stored line. */
+.ar-purchase-receipt-keyboard-list {
+  scroll-margin-block-start: .6rem;
+}
+
+.ar-purchase-receipt-keyboard-list:focus-visible {
+  outline: 2px solid #196852;
+  outline-offset: -2px;
+}

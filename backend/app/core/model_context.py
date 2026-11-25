@@ -108,6 +108,7 @@ def fit_prompt(render: Callable[[dict | None], str], context: dict | None,
     Current input, tools and instructions are mandatory. Never truncate their
     text, or modify stored/frozen context. Overlong mandatory input fails before
     a cost reservation or provider dispatch.
+    The renderer must be deterministic for the same context.
     """
     def fits(value: str) -> bool:
         return estimate_tokens(value) + PROTOCOL_RESERVE <= max_input_tokens
@@ -117,15 +118,19 @@ def fit_prompt(render: Callable[[dict | None], str], context: dict | None,
         return prompt
     messages = list((context or {}).get("messages") or [])
     empty = {**(context or {}), "messages": [], "truncated": True}
-    if not fits(render(empty)):
+    prompt = render(empty)
+    if not fits(prompt):
         raise ModelContextError("agent_context_window_exceeded")
     # The suffix of newest complete messages is monotonic in prompt size.
+    # Keep the exact fitting rendering for the current upper bound.
     low, high = 0, len(messages)
     while low < high:
         mid = (low + high) // 2
-        candidate = {**empty, "messages": messages[mid:]}
-        if fits(render(candidate)):
+        candidate = render({**empty, "messages": messages[mid:]})
+        if fits(candidate):
             high = mid
+            prompt = candidate
         else:
             low = mid + 1
-    return render({**empty, "messages": messages[low:]})
+        del candidate
+    return prompt

@@ -1,6 +1,6 @@
 import hashlib
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import Text, and_, bindparam, cast, func, or_, select
 from sqlalchemy.orm import Session
 
 from backend.app.modules.catalog.models import (CatalogConflict, CatalogExtension,
@@ -32,6 +32,22 @@ def latest_snapshot(session: Session, product: CatalogProduct) -> CatalogSnapsho
     return session.get(CatalogSnapshot, product.current_snapshot_id)
 
 
+def _current_snapshot_read_scope(product):
+    return (
+        CatalogSnapshot.id == product.current_snapshot_id,
+        CatalogSnapshot.product_id == product.id,
+        CatalogSnapshot.organization_id == product.organization_id,
+        CatalogSnapshot.store_id == product.store_id,
+    )
+
+
+def read_latest_snapshot(session: Session, product: CatalogProduct) -> CatalogSnapshot | None:
+    """Only project a snapshot belonging to the already scoped catalog product."""
+    if not product.current_snapshot_id:
+        return None
+    return session.scalar(select(CatalogSnapshot).where(*_current_snapshot_read_scope(product)))
+
+
 def snapshot_by_sha(session: Session, product_id: str, sha: str) -> CatalogSnapshot | None:
     return session.scalar(select(CatalogSnapshot).where(
         CatalogSnapshot.product_id == product_id,
@@ -46,11 +62,19 @@ def extension_for(session: Session, product_id: str) -> CatalogExtension | None:
 
 def pending_conflict(session: Session, product_id: str, field_name: str,
                      source_value: dict) -> CatalogConflict | None:
+    source = CatalogConflict.source_value
+    if session.get_bind(mapper=CatalogConflict).dialect.name == "postgresql":
+        # Native json has no equality operator. Retain the existing JSON
+        # bind serializer and compare exact text, not normalized JSONB.
+        incoming = bindparam("pending_source_value", value=source_value, type_=source.type)
+        same_source = cast(source, Text).collate("C") == cast(incoming, Text)
+    else:
+        same_source = source == source_value
     return session.scalar(select(CatalogConflict).where(
         CatalogConflict.product_id == product_id,
         CatalogConflict.field_name == field_name,
         CatalogConflict.status == "pending",
-        CatalogConflict.source_value == source_value,
+        same_source,
     ))
 
 
@@ -93,7 +117,7 @@ def cache_page(session: Session, organization_id: str, store_id: str, limit: int
                after_code: str | None, after_id: str | None,
                since_version: int | None) -> list[tuple[CatalogProduct, CatalogSnapshot | None]]:
     query = select(CatalogProduct, CatalogSnapshot).outerjoin(
-        CatalogSnapshot, CatalogSnapshot.id == CatalogProduct.current_snapshot_id,
+        CatalogSnapshot, and_(*_current_snapshot_read_scope(CatalogProduct)),
     ).where(
         CatalogProduct.organization_id == organization_id,
         CatalogProduct.store_id == store_id,

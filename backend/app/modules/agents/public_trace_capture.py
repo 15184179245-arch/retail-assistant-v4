@@ -78,7 +78,10 @@ def _binding(session, run, control, native, phase):
         (native.tool_key, native.tool_version, native.pi_name)]
     if len(entries) != 1:
         deny()
-    definition = tool_registry.resolve_tool(native.tool_key, native.tool_version)
+    if (native.tool_key, native.tool_version) in tool_registry.WORKSPACE_TOOLS:
+        definition = tool_registry.workspace_definition(native.tool_key, native.tool_version)
+    else:
+        definition = tool_registry.resolve_tool(native.tool_key, native.tool_version)
     input_schema = definition.input_model.model_json_schema()
     output_schema = definition.output_model.model_json_schema()
     if projection.digest(entries[0]["input_schema"]) != projection.digest(input_schema):

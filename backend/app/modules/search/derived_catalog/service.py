@@ -71,7 +71,66 @@ MAX_OUTPUT_TOKENS = 4096
 DEFAULT_TIMEOUT_SECONDS = 20.0
 PLACEHOLDER_BRANDS = frozenset({"默认品牌", "默认", "无", "其他", "其它", "其他串货类"})
 
-KNOWN_SOURCE_BRANDS: tuple[str, ...] = ("示例牌", "示例品牌", "演示五金")
+KNOWN_SOURCE_BRANDS: tuple[str, ...] = (
+    "佛山照明",
+    "左右之星",
+    "示例甲",
+    "示例丙",
+    "西门子",
+    "示例己",
+    "史丹利",
+    "诺菲尔",
+    "威克士",
+    "凯莎罗",
+    "荣事达",
+    "奥尔特",
+    "圣罗兰",
+    "科越莱",
+    "蓝月亮",
+    "示例乙",
+    "示例丁",
+    "示例辛",
+    "东成",
+    "示例戊",
+    "示例庚",
+    "长城",
+    "示例壬",
+    "金桥",
+    "大桥",
+    "三和",
+    "世达",
+    "绿林",
+    "南孚",
+    "飞利浦",
+    "欧普",
+    "雷士",
+    "松下",
+    "博世",
+    "齐心",
+    "锐奇",
+    "奇特",
+    "福田",
+    "奥博",
+    "德世",
+    "双洋",
+    "视贝",
+    "朗意",
+    "津达",
+    "禄来",
+    "富日",
+    "卡焰",
+    "鹰牌",
+    "星宇",
+    "星马",
+    "沪工",
+    "天逸",
+    "汉斧",
+    "杜邦",
+    "惠普",
+    "晨光",
+    "宏博",
+    "ABB",
+)
 
 _DOTTED_LEGACY_CODE_RE = re.compile(r"^\d{2,3}\.\d{2}\.[A-Za-z0-9.]+$")
 _ALNUM_DOTTED_CODE_RE = re.compile(r"^[A-Za-z0-9]{1,4}\.[A-Za-z0-9]{2,4}\.[A-Za-z0-9.*-]+$")
@@ -268,7 +327,7 @@ def build_deterministic_observations(
       - If dotted legacy format (`001.99.0088` or `004.DMO.E9999`), emit both
         `model` (`observed_field`) and `legacy_code` (`candidate`) or `ambiguous`
         so legacy code lookup works while keeping original `model` observation.
-      - If pure digits (`99000101`, `990201`), emit `unclassified` (`ambiguous`)
+      - If pure digits (`99990001`, `999902`), emit `unclassified` (`ambiguous`)
         alongside `model` (`observed_field`) because it is ambiguous between
         manufacturer part number and legacy code.
     - `barCode` full string:
@@ -549,7 +608,7 @@ def build_deterministic_observations(
                 )
             )
 
-        # If spec starts with evidenced_brand + alphanumeric suffix (e.g. "示例品牌DMX2-2501220V", "示例牌DM41xC型4P63A")
+        # If spec starts with evidenced_brand + alphanumeric suffix (e.g. "示例品牌DMX2-2501220V", "示例品牌DM41xC型4P63A")
         if evidenced_brand and s_val.startswith(evidenced_brand) and len(s_val) > len(evidenced_brand):
             suffix = s_val[len(evidenced_brand) :].strip()
             if suffix:
@@ -809,13 +868,13 @@ def build_batch_prompt(batch: Sequence[WhitelistedProductInput]) -> str:
         "规则：\n"
         "1. 每个 attribute 的 source_field 必须完全等于输入 fields 中的键名（如 raw.raw.spec、raw.raw.model、raw.raw.name、raw.raw.barCode）。\n"
         "2. value 必须是该字段原文的连续子串，start 和 end 为 Python Unicode 字符切片下标，严格满足 field_text[start:end] == value 且 end == start + len(value)。"
-        "例如 field_text=\"示例牌DM41xC型4P63A\"：\"德力西\" 为 start=0,end=3；\"DZ47s\" 为 start=3,end=8；\"C型4P63A\" 为 start=8,end=15。\n"
+        "例如 field_text=\"示例品牌DM41xC型4P63A\"：\"示例甲\" 为 start=0,end=3；\"DM41x\" 为 start=3,end=8；\"C型4P63A\" 为 start=8,end=15。\n"
         "3. kind 仅限：legacy_code（旧系统编号，如 001.99.0088、004.DMO.E9999、01.99.99.088 或条码中的短旧码）、"
         "manufacturer_part_number（厂家货号/订货号）、specification（尺寸/电气参数/规格，如 4P63A、400/5A、M6x20、25*20L）、"
-        "model（产品型号系列，如 DZ47s、LC1D32M7C、CJX2-2501、G86KT250、E9234）、"
-        "brand（原文明确出现的品牌名，如 示例牌、示例品牌、演示五金；严禁抽取“默认品牌”）、"
+        "model（产品型号系列，如 DM41x、LC1D32M7C、CJX2-2501、G86KT250、E9234）、"
+        "brand（原文明确出现的品牌名，如 示例甲、示例乙、示例丙、示例丁、示例戊、示例己、示例庚、示例辛、示例壬；严禁抽取“默认品牌”）、"
         "unclassified（无法区分是旧码、厂家货号还是型号的编码）。\n"
-        "4. 若 spec 或 name 中同时包含品牌、型号、规格或旧码（如 \"示例牌DM41xC型4P63A\" 或 \"01.99.99.088400/5A\" 或 \"30（99012）\"），"
+        "4. 若 spec 或 name 中同时包含品牌、型号、规格或旧码（如 \"示例品牌DM41xC型4P63A\" 或 \"01.99.99.088400/5A\" 或 \"30（99012）\"），"
         "请分别抽取各连续子串及其准确 start/end，保留规格子串，绝不能丢弃旧码后面的规格字符。\n"
         "5. 严禁把尺寸/电气规格（如 500*600、M6x20、220V、50mm）当成 legacy_code。无法确定是 legacy_code 还是 manufacturer_part_number 时，"
         "certainty 填 \"ambiguous\" 或 kind 填 \"unclassified\"。\n"
@@ -971,6 +1030,11 @@ def build_candidate_relations(
             continue
 
         if len(brands) > 1:
+            warning = "，严禁视为同一商品或同厂家货号。"
+            limited = f" 候选总数{len(pids)}，仅展示前200条，已截断。" if len(pids) > 200 else ""
+            note = f"跨品牌同号冲突（涉及品牌：{', '.join(sorted(brands))}）" + warning + limited
+            if len(note) > 500:  # CandidateRelationRecord.note uses NonEmptyStr.
+                note = f"跨品牌同号冲突（涉及{len(brands)}个不同品牌，备注未逐一列出品牌名称）" + warning + limited
             relations.append(
                 CandidateRelationRecord(
                     organization_id=org_id,
@@ -982,7 +1046,7 @@ def build_candidate_relations(
                     product_ids=pids[:200],
                     snapshot_ids=sids[:200],
                     evidence_fields=fields[:200],
-                    note=f"跨品牌同号冲突（涉及品牌：{', '.join(sorted(brands))}），严禁视为同一商品或同厂家货号。"+ (f" 候选总数{len(pids)}，仅展示前200条，已截断。" if len(pids)>200 else ""),
+                    note=note,
                 )
             )
         elif "legacy_code" in kinds:

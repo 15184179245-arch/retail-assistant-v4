@@ -61,7 +61,7 @@ class GuanJiaClient:
             raise ValueError("start_skip must be non-negative")
         skip = start_skip
         fetched = 0
-        last_total: int | None = None
+        known_total: int | None = None
         seen_identities: set[str] = set()
         seen_page_content: set[tuple[str, ...]] = set()
         self._seen_page_signatures.clear()
@@ -71,10 +71,18 @@ class GuanJiaClient:
             if not isinstance(items, list):
                 raise PageError("product_page.items must be a list")
             total = response.get("total")
-            if total is not None and last_total is not None and total < last_total:
-                raise PageError("total_count regressed; refusing to continue")
-            if total is not None and last_total is not None and total != last_total:
-                raise PageError("source total changed during full read; refusing completion")
+            if total is not None:
+                if type(total) is not int or total < 0:
+                    raise PageError("product_page.total must be a nonnegative integer or absent")
+                if known_total is not None and total < known_total:
+                    raise PageError("total_count regressed; refusing to continue")
+                if known_total is not None and total != known_total:
+                    raise PageError("source total changed during full read; refusing completion")
+                known_total = total
+            # A page without a count does not erase an earlier source bound.
+            next_skip = skip + len(items)
+            if known_total is not None and next_skip > known_total:
+                raise PageError("source page exceeds declared total; refusing completion")
             signature = (skip, len(items))
             if signature in self._seen_page_signatures and items:
                 raise PageError("duplicate page offset/size detected")
@@ -92,15 +100,14 @@ class GuanJiaClient:
             if content and content in seen_page_content:
                 raise PageError("duplicate page content across different offsets")
             seen_page_content.add(content)
-            if not items and total is not None and skip < total:
+            if not items and known_total is not None and skip < known_total:
                 raise PageError(
-                    f"source ended early at skip={skip} but total={total}")
+                    f"source ended early at skip={skip} but total={known_total}")
             page = ProductPage(skip=skip, items=tuple(items), total=total)
             yield page
             if not items:
                 return
             fetched += len(items)
-            skip += len(items)  # use actual page length, never assume page_size
-            last_total = total
-            if total is not None and skip >= total:
+            skip = next_skip  # use actual page length, never assume page_size
+            if known_total is not None and skip == known_total:
                 return

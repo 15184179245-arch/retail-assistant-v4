@@ -1,9 +1,16 @@
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from backend.app.core.errors import ApiEnvelope
+
+
+def _display_text(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+SearchDisplayText = Annotated[str | None, BeforeValidator(_display_text)]
 
 
 class SearchMatchOut(BaseModel):
@@ -15,9 +22,9 @@ class SearchMatchOut(BaseModel):
                         "alias_exact", "fuzzy_candidate"]
     original_value: str
     normalized_value: str | None
-    name: str | None
-    spec: str | None
-    unit: str | None
+    name: SearchDisplayText
+    spec: SearchDisplayText
+    unit: SearchDisplayText
     barcode: str | None
     source_system: str
     source_version: str

@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api/client";
 import {
-  authorizedRequest,
+  authorizedRequest, captureSessionScope,
   getScopeVersion, getSession,
 } from "../../lib/auth/session";
 import type { Session } from "../../lib/auth/session";
+import { hasCapability, useCapabilities } from "../../lib/auth/capabilities";
+import { businessPermission } from "../../lib/auth/businessPermissions";
 
 export interface OfficeEvidenceRow {
   id: string;
@@ -64,22 +66,26 @@ export async function downloadOfficeEvidence(row: OfficeEvidenceRow, baseUrl = "
   Promise<void> {
   const session = getSession();
   if (!session) throw new ApiError("请先登录");
-  const response = await authorizedRequest<Response>(
+  const isCurrent = captureSessionScope();
+  const bytes = await authorizedRequest<Blob>(
     baseUrl + "/api/v1/office-intake/evidence/" +
       encodeURIComponent(row.id) + "/content",
     {
-      rawResponse: true,
+      readResponse: async response => {
+        if (response.headers.get("X-Office-Evidence-SHA256") !== row.sha256) {
+          throw new ApiError("原件校验信息缺失", {
+            userMessage: "来源摘要不一致，禁止使用下载结果",
+          });
+        }
+        return response.blob();
+      },
     },
   );
-  if (response.headers.get("X-Office-Evidence-SHA256") !== row.sha256) {
-    throw new ApiError("原件校验信息缺失", {
-      userMessage: "来源摘要不一致，禁止使用下载结果",
-    });
-  }
-  const bytes = await response.blob();
   if (bytes.size !== row.byte_size) {
     throw new ApiError("原件大小异常", { userMessage: "下载内容与证据元数据不符" });
   }
+  // The download is an external side effect after the asynchronous request has settled.
+  if (!isCurrent()) throw new ApiError("身份已改变，下载已取消", { code: "STALE_SCOPE" });
   const url = URL.createObjectURL(bytes);
   try {
     const anchor = document.createElement("a");
@@ -91,6 +97,7 @@ export async function downloadOfficeEvidence(row: OfficeEvidenceRow, baseUrl = "
 }
 
 export function OFC002Page({ session, baseUrl = "", initialItems = [] }: OfficeOFC002Props) {
+  const canWrite = useCapabilities().hasCapability(businessPermission.materials.write);
   const [items, setItems] = useState<OfficeEvidenceRow[]>(initialItems);
   const sessionKey = session ? [session.subjectId, session.organizationId,
     session.storeId, session.accessToken].join(":") : "";
@@ -132,7 +139,7 @@ export function OFC002Page({ session, baseUrl = "", initialItems = [] }: OfficeO
   }, [session?.subjectId, session?.storeId, session?.organizationId, session?.accessToken, baseUrl]);
 
   async function submit(): Promise<void> {
-    if (!session || busy || (!file && !text.trim())) return;
+    if (!session || !hasCapability(businessPermission.materials.write) || busy || (!file && !text.trim())) return;
     setBusy(true); setError(""); setMessage("");
     key.current ??= crypto.randomUUID();
     const currentScope = getScopeVersion();
@@ -159,6 +166,7 @@ export function OFC002Page({ session, baseUrl = "", initialItems = [] }: OfficeO
     <h2>授权材料收件箱</h2>
     <p>仅收件并封存原件；不会自动读取微信、邮件或执行文档中的指令。</p>
     {!session ? <p role="alert">请先登录员工账号。</p> : <>
+      {canWrite ? <>
       <label htmlFor="office-paste">人工粘贴文字</label>
       <textarea id="office-paste" value={text} rows={4} maxLength={131072}
         disabled={busy || file !== null}
@@ -171,6 +179,7 @@ export function OFC002Page({ session, baseUrl = "", initialItems = [] }: OfficeO
       <p>文件上限 12 MiB；文本/表格不执行宏，PDF/音频仅作为隔离附件。</p>
       <button type="button" disabled={busy || (!file && !text.trim())}
         onClick={() => void submit()}>{busy ? "保存中…" : "人工提交并封存"}</button>
+      </> : <p>当前身份只能查看授权证据，不能封存新材料。</p>}
       {error && <p role="alert">{error}</p>}
       {message && <p role="status">{message}</p>}
       <h3>本店授权证据（只显示元数据）</h3>

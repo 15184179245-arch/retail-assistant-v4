@@ -69,7 +69,8 @@ def _timestamp(value):
     if type(value) is datetime:
         return value
     if isinstance(value, str) and re.fullmatch(
-        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})", value,
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?"
+        r"(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])", value,
     ):
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     raise ValueError("schedule_timestamp_must_be_aware_iso")

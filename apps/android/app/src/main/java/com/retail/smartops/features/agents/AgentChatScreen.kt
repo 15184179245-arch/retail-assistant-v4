@@ -530,7 +530,7 @@ fun AgentChatScreen(
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Text("当前离线", fontWeight = FontWeight.Bold)
-                    Text("已禁止提交、确认与取消；不会显示任何“已执行”结论。手工草稿入口仍可用。")
+                    Text("离线时不能发起提交、确认、取消或重新读取。页面可能仍显示之前收到的回执，不代表此刻已重新核验。手工草稿仍可用。")
                 }
             }
         }
@@ -566,7 +566,7 @@ fun AgentChatScreen(
         submittedQuestion?.let {
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(10.dp)) {
-                    Text("本次问题（仅本页显示，未持久保存）", fontWeight = FontWeight.SemiBold)
+                    Text("本次问题（设备不保存此预览副本；服务端受理后会记录问题）", fontWeight = FontWeight.SemiBold)
                     Text(it)
                 }
             }

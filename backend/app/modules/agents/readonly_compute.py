@@ -276,7 +276,11 @@ def invoke(envelope: dict, *, deadline: float, cancel_event=None, command=None) 
         except process_transport.TransportError as error:
             raise WorkerError('worker_transport_failed', error.code) from error
     finally:
-        process_transport.cleanup(process)
+        try:
+            process_transport.cleanup(process)
+        except process_transport.TransportCleanupError as error:
+            # Even an otherwise valid worker reply is unconfirmed after failed cleanup.
+            raise WorkerError('worker_transport_failed', error.code) from error
     if status != 0:
         detail = ''
         try:

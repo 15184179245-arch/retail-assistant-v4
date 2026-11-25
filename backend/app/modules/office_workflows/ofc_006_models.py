@@ -266,19 +266,6 @@ def receipt_immutable_guard_statements(table_name: str, dialect: str) -> list[st
     return []
 
 
-def receipt_immutable_guard_drop_statements(table_name: str, dialect: str) -> list[str]:
-    """Reverse of ``receipt_immutable_guard_statements`` for the 0043 downgrade."""
-    if dialect == "sqlite":
-        return [f"DROP TRIGGER IF EXISTS trg_{table_name}_{action}_deny"
-                for action in ("update", "delete")]
-    if dialect == "postgresql":
-        return [
-            f"DROP TRIGGER IF EXISTS trg_{table_name}_deny ON {table_name}",
-            f"DROP FUNCTION IF EXISTS deny_{table_name}_mutation()",
-        ]
-    return []
-
-
 def install_immutable_receipt_guards(target, connection, **_kw) -> None:
     """Install the real DML guards (SQLAlchemy ``after_create`` listener).
 
@@ -289,14 +276,6 @@ def install_immutable_receipt_guards(target, connection, **_kw) -> None:
     table_name = target if isinstance(target, str) else target.name
     for statement in receipt_immutable_guard_statements(table_name,
                                                          connection.dialect.name):
-        connection.exec_driver_sql(statement)
-
-
-def drop_immutable_receipt_guards(target, connection, **_kw) -> None:
-    """Remove the guards; used by the 0043 downgrade before dropping the table."""
-    table_name = target if isinstance(target, str) else target.name
-    for statement in receipt_immutable_guard_drop_statements(table_name,
-                                                             connection.dialect.name):
         connection.exec_driver_sql(statement)
 
 

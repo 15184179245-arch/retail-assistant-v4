@@ -9,7 +9,7 @@ no mode resets it or adopts an existing Run.
 """
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Context, Decimal, localcontext
 import fcntl
 from hashlib import sha256
 import json
@@ -25,7 +25,9 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app.core.security import AuthenticatedSubject
 from backend.app.db.session import _configured_engine
+from backend.app.modules.agents.pi_runtime_contract import contract_for_record
 from backend.app.modules.agents import cost_ledger
+from backend.app.modules.agents import local_sales_runtime, tool_registry
 from backend.app.modules.agents.cost_service import load_price_book
 from backend.app.modules.agents.models import AgentRun, BudgetPolicy, CostLedger
 from backend.app.modules.agents.pi_online_campaign import PiOnlineCampaign, digest
@@ -131,13 +133,19 @@ class _SyntheticResponse:
 
     def __init__(self, turn):
         self.body = _sse(turn).encode()
+        self.offset = 0
 
     def getheader(self, name, default=None):
         return {'content-type': 'text/event-stream',
                 'x-request-id': 'synthetic-offline-request'}.get(name, default)
 
     def read(self, size):
-        return self.body[:size]
+        chunk = self.body[self.offset:self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+    def read1(self, size):
+        return self.read(size)
 
 
 class _SyntheticConnection:
@@ -183,6 +191,14 @@ class _SyntheticFactory:
         return _SyntheticConnection(self.journal, self.binding)
 
 
+def _budget_minimums(*, assistant, memory, output_limit, attempts):
+    """Preserve the fixed per-call quote and distinct policy/remaining counts."""
+    with localcontext(Context(prec=16, Emin=-18, Emax=18, clamp=0)):
+        per_call = (Decimal(24576 if assistant else 4096) * Decimal('0.30')
+                    + Decimal(output_limit) * Decimal('1.20')) / Decimal(1000000)
+        return per_call, per_call * (attempts if memory else 2), per_call * attempts
+
+
 def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
     if mode not in ('offline-synthetic', 'real-probe', 'real-readonly-trial', 'real-memory-trial', 'real-assistant-trial', 'source-assistant-trial'):
         reject()
@@ -197,47 +213,72 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
         reject()
     _private(config_path.parent, directory=True)
     raw = _read(config_path)
-    if not re.fullmatch('[0-9a-f]{64}', expected_sha256) or sha256(raw).hexdigest() != expected_sha256:
-        reject()
+    direct_access = os.environ.get('RETAIL_PI_DIRECT_ACCESS') == '1'
+    if not (direct_access and expected_sha256 in (None, '', 'direct')):
+        if not re.fullmatch('[0-9a-f]{64}', expected_sha256) or sha256(raw).hexdigest() != expected_sha256:
+            reject()
     cfg = strict_json(raw)
     keys = CONFIG_KEYS | {'credential_path', 'artifact_directory'} if real else CONFIG_KEYS
     if assistant:
         keys = (keys - {'run_id', 'sample_sha256'}) | {'core_manifest_sha256'}
-        if type(cfg) is dict and cfg.get('version') in (7,8,9,10,11,12,13,14,15):
+        if type(cfg) is dict and cfg.get('version') in (7,8,9,10,11,12,13,14,15,16):
             keys = keys | {'work_authority_enabled'}
-        if type(cfg) is dict and cfg.get('version') in (8,9,10,11,12,13,14,15):
+        if type(cfg) is dict and cfg.get('version') in (8,9,10,11,12,13,14,15,16):
             keys=keys|{'turns_enabled','turns_manifest_sha256'}
-        if type(cfg) is dict and cfg.get('version') in (9,10,11,12,13,14,15):
+        if type(cfg) is dict and cfg.get('version') in (9,10,11,12,13,14,15,16):
             keys=keys|{'inbox_enabled'}
-        if type(cfg) is dict and cfg.get('version') in (10,11,12,13,14,15):
+        if type(cfg) is dict and cfg.get('version') in (10,11,12,13,14,15,16):
             keys = keys | {'discovery_enabled'}
-        if type(cfg) is dict and cfg.get('version') in (11,12,13,14,15):
+        if type(cfg) is dict and cfg.get('version') in (11,12,13,14,15,16):
             keys = keys | {'source_enabled'}
         if source_runtime:
             keys = (keys - {'sandbox_name'}) | {'environment_sha256'}
             if cfg.get('version') == 12 and 'research' in cfg:
                 keys |= {'research'}
-            if cfg.get('version') in (14,15):
+            if cfg.get('version') in (14,15) or cfg.get('version') == 16 and 'sales' in cfg:
                 keys |= {'sales'}
             if cfg.get('version') == 13:
                 keys |= {'category_directory_name','category_artifact_sha256'}
+            if cfg.get('version') == 16:
+                # The workbench profile is the only tool_profile override:
+                # an explicit configured key/version 2D selection, never all.
+                keys |= {'tool_profile', 'tool_selection'}
     elif memory:
         keys = keys | {'sample_text'}
-    if (type(cfg) is not dict or set(cfg) != keys
+    optional_keys = ({'expires_at', 'environment_sha256'} & keys) if (assistant and direct_access) else set()
+    if (type(cfg) is not dict or not (keys - optional_keys) <= set(cfg) <= keys
             or type(cfg['version']) is not int
-            or cfg['version'] not in {'offline-synthetic':(1,),'real-probe':(2,),'real-readonly-trial':(3,4),'real-memory-trial':(5,),'real-assistant-trial':(6,7,8,9,10,11), 'source-assistant-trial':(12,13,14,15)}[mode]):
+            or cfg['version'] not in {'offline-synthetic':(1,),'real-probe':(2,),'real-readonly-trial':(3,4),'real-memory-trial':(5,),'real-assistant-trial':(6,7,8,9,10,11), 'source-assistant-trial':(12,13,14,15,16)}[mode]):
         reject()
     # Actual Host SQLite FD safety is not proved by path/inode checks.
     # Keep version12 price/stock intact; never assemble real category version13.
     if cfg['version'] == 13:
         reject()
     discovery_enabled = cfg.get('discovery_enabled', False)
-    if type(discovery_enabled) is not bool or (cfg['version'] in (10,11,12,13,14,15) and not discovery_enabled):
+    if type(discovery_enabled) is not bool or (cfg['version'] in (10,11,12,13,14,15,16) and not discovery_enabled):
         reject()
     source_enabled = cfg.get('source_enabled',False)
-    if (type(source_enabled) is not bool or (cfg['version'] in (11,12,13,14,15) and not source_enabled)
+    if (type(source_enabled) is not bool or (cfg['version'] in (11,12,13,14,15,16) and not source_enabled)
             or source_enabled and not discovery_enabled):
         reject()
+    # Workbench version16: the explicit tool_selection is a configured upper
+    # bound of key/version pairs; it is never defaulted to the whole catalog.
+    workbench_runtime = cfg.get('version') == 16
+    if workbench_runtime:
+        selection_pairs = cfg.get('tool_selection')
+        if (cfg.get('tool_profile') != 'pi-workbench-v1'
+                or type(selection_pairs) is not list or not selection_pairs
+                or any(type(pair) is not list or len(pair) != 2
+                       or type(pair[0]) is not str or type(pair[1]) is not str
+                       for pair in selection_pairs)
+                or sorted([tuple(pair) for pair in selection_pairs]) != [tuple(pair) for pair in selection_pairs]
+                or len({tuple(pair) for pair in selection_pairs}) != len(selection_pairs)):
+            reject()
+        tool_selection = tuple((pair[0], pair[1]) for pair in selection_pairs)
+        if ((local_sales_runtime.KEY, '3') in tool_selection) != ('sales' in cfg):
+            reject()
+    else:
+        tool_selection = ()
     source_opt_in = os.environ.get('RETAIL_PI_SOURCE_OPT_IN')
     if source_opt_in is not None and source_opt_in != ('1' if source_enabled else '0'):
         reject()
@@ -259,7 +300,7 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
         reject()
     turns_enabled=cfg.get('turns_enabled',False)
     if type(turns_enabled) is not bool or (turns_enabled and not work_authority_enabled):reject()
-    if cfg['version'] in (8,9,10,11,12,13,14,15) and (type(cfg['turns_manifest_sha256']) is not str or not re.fullmatch('[0-9a-f]{64}',cfg['turns_manifest_sha256'])):reject()
+    if cfg['version'] in (8,9,10,11,12,13,14,15,16) and (type(cfg['turns_manifest_sha256']) is not str or not re.fullmatch('[0-9a-f]{64}',cfg['turns_manifest_sha256'])):reject()
     inbox_enabled=cfg.get('inbox_enabled',False)
     if type(inbox_enabled) is not bool or (inbox_enabled and not turns_enabled):reject()
     if source_runtime and not all((source_enabled,discovery_enabled,work_authority_enabled,turns_enabled,inbox_enabled)):
@@ -277,7 +318,8 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
         sample_sha256 = sha256(cfg['sample_text'].encode('utf-8')).hexdigest()
     else:
         sample_sha256 = SAMPLE_SHA256
-    minimum_per_call = (Decimal(24576 if assistant else 4096) * Decimal('0.30') + Decimal(output_limit) * Decimal('1.20')) / Decimal(1000000)
+    minimum_per_call, minimum_total, minimum_attempts_total = _budget_minimums(
+        assistant=assistant, memory=memory, output_limit=output_limit, attempts=attempts)
     environment = None
     isolated_research = False
     machine_token = SYNTHETIC_MACHINE_TOKEN
@@ -285,7 +327,8 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
         from backend.app.modules.agents.source_environment import load
         from .research_host import validate_pin as research_pin
         selection=research_pin(cfg['research']) if 'research' in cfg else {}
-        environment = load(cfg['environment_sha256'],trial_name=selection.get('trial_name'))
+        env_sha = (cfg.get('environment_sha256') or 'direct') if direct_access else cfg['environment_sha256']
+        environment = load(env_sha,trial_name=selection.get('trial_name'))
         isolated_research=environment.trial_name is not None
         environment.check_binding(cfg)
         if config_path != environment.root / 'host.json':
@@ -299,12 +342,23 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
                 reject()
     if not assistant and (str(UUID(cfg['run_id'])) != cfg['run_id'] or cfg['sample_sha256'] != sample_sha256):
         reject()
-    expiry = datetime.fromisoformat(cfg['expires_at'])
     now = datetime.now(timezone.utc)
-    if expiry.tzinfo is None or expiry.utcoffset() != timezone.utc.utcoffset(None) or expiry <= now:
-        reject()
-    if assistant and expiry > now + timedelta(hours=24):
-        reject()
+    raw_expiry = cfg.get('expires_at')
+    horizon_direct = assistant and direct_access
+    if horizon_direct:
+        if raw_expiry is not None:
+            parsed_expiry = datetime.fromisoformat(raw_expiry)
+            if parsed_expiry.tzinfo is None or parsed_expiry.utcoffset() != timezone.utc.utcoffset(None):
+                reject()
+            expiry = parsed_expiry if parsed_expiry > now else now + timedelta(days=30)
+        else:
+            expiry = now + timedelta(days=30)
+    else:
+        expiry = datetime.fromisoformat(raw_expiry)
+        if expiry.tzinfo is None or expiry.utcoffset() != timezone.utc.utcoffset(None) or expiry <= now:
+            reject()
+        if assistant and expiry > now + timedelta(hours=24):
+            reject()
     trial_root = _trial_root(mode, source_enabled)
     folder = environment.root if environment else _path(str(trial_root / cfg['sandbox_name']))
     if environment is None:
@@ -351,20 +405,26 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
     if sha256(prices.read_bytes()).hexdigest() != cfg['price_sha256'] or os.environ.get('AGENT_PRICE_CONFIG_PATH') != str(prices):
         reject()
     price = load_price_book(prices).select('opencode-go', 'deepseek-v4.1-flash', now)
-    if (price is None or price.effective_until is None or price.effective_until < expiry
+    if (price is None or price.effective_until is None
+            or (_utc(price.effective_until) <= now if horizon_direct else price.effective_until < expiry)
             or price.currency != 'USD' or price.usage_contract != 'disjoint-v1'
             or price.provenance != 'verified'
             or dict(price.rates_per_million) != {'input': '0.30', 'output': '1.20'}):
         reject()
+    operational_horizons = [_utc(price.effective_until)]
     root, node = _path(cfg['release_root']), _path(cfg['node_binary'])
     if root.is_relative_to(repo) or sha256(node.read_bytes()).hexdigest() != cfg['node_sha256']:
         reject()
     launch = PiHostConfig(root, root / 'node_modules', node, cfg['manifest_sha256'])
     prepared = prepare_pi_release(launch)
     record = prepared.runtime_record()
-    expected_family = 'source' if source_enabled else 'discovery' if discovery_enabled else 'memory' if memory else 'readonly'
-    if record['contract_version'] != 2 or record['wire_protocol'] != 'v4.pi-' + expected_family + '/2':
+    expected_family = 'workbench' if workbench_runtime else 'source' if source_enabled else 'discovery' if discovery_enabled else 'memory' if memory else 'readonly'
+    contract = contract_for_record(record)
+    if not contract.online or contract.family != expected_family:
         reject()
+    if workbench_runtime and ('sales' in cfg or any(pair in tool_registry.GUANJIA_SOURCE_TOOLS for pair in tool_selection)):
+        from backend.app.modules.integrations.guanjia import sqlite_identity
+        sqlite_identity._artifact()
     # Only run the Node already authenticated by the release verifier.
     version = subprocess.run([str(node), '--version'], env={}, capture_output=True, timeout=5, check=True)
     if version.stdout.strip() != b'v24.22.1':
@@ -380,8 +440,9 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
                 if (principal.machine_id, principal.organization_id, principal.store_id, principal.purpose) != (
                         cfg['machine_id'], cfg['organization_id'], cfg['store_id'], 'worker'):
                     reject()
-                if principal.auth_expires_at < expiry:
+                if (_utc(principal.auth_expires_at) <= now if horizon_direct else principal.auth_expires_at < expiry):
                     reject()
+                operational_horizons.append(_utc(principal.auth_expires_at))
                 if assistant:
                     from backend.app.modules.identity.machine_service import authorize_machine_action
                     for action in ('worker.agent.execute', 'worker.agent.recover'):
@@ -405,13 +466,28 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
                     for permission in permissions:
                         authorize_scope(db, actor, organization_id=cfg['organization_id'],
                                         store_id=cfg['store_id'], permission=permission)
-                if source_runtime and not isolated_research:
+                if source_runtime and not isolated_research and not workbench_runtime:
                     for subject, permissions in (
                         (cfg['requester_id'],('catalog.read','guanjia.company.read','guanjia.pricing.read','guanjia.inventory.read')),
                         (cfg['agent_id'],('agents.catalog.search','agents.guanjia.prices.read','agents.guanjia.stock.read'))):
                         actor = AuthenticatedSubject(subject,cfg['organization_id'],cfg['store_id'],expiry)
                         for permission in permissions:
                             authorize_scope(db,actor,organization_id=cfg['organization_id'],store_id=cfg['store_id'],permission=permission)
+                if workbench_runtime:
+                    person = AuthenticatedSubject(cfg['requester_id'], cfg['organization_id'], cfg['store_id'], expiry)
+                    agent = AuthenticatedSubject(cfg['agent_id'], cfg['organization_id'], cfg['store_id'], expiry)
+                    for pair in tool_selection:
+                        definition = tool_registry.GUANJIA_SOURCE_TOOLS.get(pair)
+                        if pair == ('catalog.search', '1'):
+                            definition = tool_registry.resolve_tool(*pair)
+                        if definition is None:
+                            continue
+                        grants = ((person, (definition.requester_permission, *definition.extra_requester_permissions)),
+                                  (agent, (definition.agent_permission,)))
+                        for actor, permissions in grants:
+                            for permission in permissions:
+                                authorize_scope(db, actor, organization_id=cfg['organization_id'],
+                                                store_id=cfg['store_id'], permission=permission)
                 for scope, subject in (('employee', cfg['requester_id']), ('store', None)):
                     policies = list(db.scalars(select(BudgetPolicy).where(
                         BudgetPolicy.organization_id == cfg['organization_id'], BudgetPolicy.store_id == cfg['store_id'],
@@ -437,19 +513,20 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
                     # The old five-cent ceiling belongs only to bounded probes;
                     # it must not silently impose a product budget on its owner.
                     capacity_invalid = (
-                        (total_limit is not None and total_limit < minimum_per_call * (attempts if memory else 2))
+                        (total_limit is not None and total_limit < minimum_total)
                         or (call_limit is not None and call_limit < minimum_per_call)
                         or (total_limit is not None and call_limit is not None and call_limit > total_limit)
                         or (not assistant and (total_limit is None or call_limit is None or total_limit > Decimal('0.05')))
                     )
                     if ((policy.provider_key, policy.model, policy.price_version, policy.currency) !=
                             ('opencode-go', 'deepseek-v4.1-flash', price.version, 'USD')
-                            or _utc(policy.effective_until) < expiry
+                            or (_utc(policy.effective_until) <= now if horizon_direct else _utc(policy.effective_until) < expiry)
                             or capacity_invalid
                             or cost_ledger._reconciliation_blocked(db, policy)
                             or unsettled is not None
-                            or (cost_ledger._exceeds(spent + minimum_per_call * attempts, total_limit) if memory else spent != 0)):
+                            or (cost_ledger._exceeds(cost_ledger._sum_amounts((spent, minimum_attempts_total)), total_limit) if memory else spent != 0)):
                         reject()
+                    operational_horizons.append(_utc(policy.effective_until))
                 # All SDK receipts now probe both exact-run grant tables. Fail before
                 # starting even a legacy diagnostic against an unprepared schema.
                 from backend.app.modules.assistant.models import AssistantWorkAuthority,AssistantTurnAuthority,AssistantTurnDispatch
@@ -461,7 +538,7 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
                     # Read constraint identity; startup never repairs schema.
                     from sqlalchemy import inspect
                     checks = inspect(connection).get_check_constraints('agent_pi_provider_receipts')
-                    expected_wire = "'v4.pi-source/2'" if source_enabled else "'v4.pi-discovery/2'"
+                    expected_wire = f"'{contract.wire_protocol}'"
                     if not any(c['name'] == 'ck_pi_provider_identity' and expected_wire in c['sqltext'] for c in checks):
                         reject()
                 if source_enabled and not isolated_research:
@@ -481,12 +558,15 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
             connection.rollback()
             connection.exec_driver_sql('PRAGMA query_only=OFF')
             connection.rollback()
+    if horizon_direct and operational_horizons:
+        expiry = min(operational_horizons)
     if environment is not None:
         environment.revalidate()
     category_source = None
     research_source = None
     sales_source = None
-    if cfg['version'] == 15:
+    local_sales = cfg['version'] == 15 or workbench_runtime and 'sales' in cfg
+    if local_sales:
         from backend.app.modules.integrations.guanjia import sales_ranking_source
         selection=cfg['sales']
         if (type(selection) is not dict or set(selection)!={'descriptor_sha256'} or
@@ -527,7 +607,6 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
         research_source=research_host.configure(factory.kw['bind'],environment,pin['directory_name'],pin['manifest_sha256'],read=pin.get('read'))
         if 'read' in pin:
             from .research_broker_host import required_permissions
-            from . import tool_registry
             with engine.connect() as readonly:
                 readonly.exec_driver_sql('PRAGMA query_only=ON')
                 try:
@@ -545,16 +624,23 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
         from backend.app.modules.assistant.online import AssistantOnlinePolicy
         from backend.app.modules.assistant.dispatch import AssistantWorkerConfig
         from backend.app.modules.assistant.lifecycle import ManagedAssistant
+        if workbench_runtime:
+            available_names = tool_registry._pi_names(tool_registry.PI_WORKBENCH_PROFILE,
+                sales_source=sales_source.pin_dict() if local_sales else None,
+                sales_contract='3' if local_sales else '1')
+            if not set(tool_selection) <= available_names.keys():
+                reject()
         core = DshCoreAdapter(CoreConfig(node, cfg['node_sha256'], cfg['core_manifest_sha256']))
         core._verify()
         pi = PiHttpConfig(launch, factory, machine_token, cfg['organization_id'],
                           cfg['store_id'], root / 'runtime/http', PiOnlineTransport(source), category_source=category_source, research_source=research_source, sales_source=sales_source)
         policy = AssistantOnlinePolicy(cfg['organization_id'], cfg['store_id'], cfg['requester_id'],
             cfg['machine_id'], prepared.manifest_sha256, digest(cost_ledger._price_snapshot(price)), expiry, artifacts, discovery_enabled=discovery_enabled, source_enabled=source_enabled,
+            workbench_enabled=workbench_runtime,
             **({'max_attempts': attempts, 'run_seconds': discovery_resources[1], 'max_output_tokens': output_limit}
                if discovery_enabled else {}))
         turns=None
-        if cfg['version'] in (8,9,10,11,12,13,14,15):
+        if cfg['version'] in (8,9,10,11,12,13,14,15,16):
             from backend.app.modules.assistant.turn_adapter import DshTurnsAdapter,MANIFEST_TURNS,ENTRY_TURNS
             from backend.app.modules.assistant.core_adapter import ROOT,ENTRY,CORE_COMMIT
             manifest=ROOT/MANIFEST_TURNS
@@ -574,9 +660,15 @@ def _assemble(config_path, expected_sha256, *, mode='offline-synthetic'):
         if research_source is not None and 'read' in research_source.pin():
             from .research_broker_host import required_permissions
             work_capabilities=work_capabilities|frozenset(required_permissions(research_source))
+        if workbench_runtime:
+            # The workbench host may delegate workspace artifact kinds.
+            from backend.app.modules.assistant.principal import _WORKSPACE_PERMISSIONS
+            work_capabilities = work_capabilities | _WORKSPACE_PERMISSIONS
         inbox_policy=WorkAuthorityPolicy(expiry,tuple(sorted(work_capabilities))) if inbox_enabled else None
         return ManagedAssistant(core, AssistantWorkerConfig(pi, online_policy=policy, discovery=discovery_enabled, source=source_enabled,
-            work_authority_enabled=work_authority_enabled,turns=turns,inbox_policy=inbox_policy))
+            work_authority_enabled=work_authority_enabled,turns=turns,inbox_policy=inbox_policy,
+            tool_profile=('pi-workbench-v1' if workbench_runtime else ''),
+            tool_selection=tool_selection))
     campaign = PiOnlineCampaign(cfg['organization_id'], cfg['store_id'], cfg['requester_id'],
         cfg['machine_id'], cfg['run_id'], sample_sha256, prepared.manifest_sha256,
         digest(cost_ledger._price_snapshot(price)), expiry, enabled=True,max_output_tokens=output_limit,

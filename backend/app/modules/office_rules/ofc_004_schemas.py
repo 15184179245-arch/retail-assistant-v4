@@ -3,12 +3,11 @@ from datetime import datetime
 from typing import Annotated, Literal
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 from backend.app.core.errors import ApiEnvelope
+from backend.app.core.iso_datetime import parse_bounded_iso_offset
 
 
 def _iso_datetime(value):
-    if isinstance(value, str):
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return value
+    return parse_bounded_iso_offset(value, invalid_offset="office_rule_utc_offset_invalid")
 
 
 IsoDatetime = Annotated[datetime, BeforeValidator(_iso_datetime)]

@@ -11,6 +11,7 @@ export const ONLINE_PROTOCOL = 'v4.pi-readonly/2' as const;
 export const ONLINE_PROFILE = 'pi-readonly-online-v1' as const;
 export const PROVIDER_PATH = '/inference/go/openai/v1/chat/completions' as const;
 export const PROVIDER_BYTES = 131072;
+export const PROVIDER_CAPACITY_CODE = 'provider_capacity_exceeded';
 export const PROFILE = 'pi-readonly-v1' as const;
 export const MEMORY_PROFILE = 'pi-memory-v1' as const;
 export const MEMORY_ONLINE_PROFILE = 'pi-memory-online-v1' as const;
@@ -24,6 +25,9 @@ export const SOURCE_PROFILE = 'pi-source-v1' as const;
 export const SOURCE_PROTOCOL = 'v4.pi-source/1' as const;
 export const SOURCE_ONLINE_PROTOCOL = 'v4.pi-source/2' as const;
 export const SOURCE_ONLINE_PROFILE = 'pi-source-online-v1' as const;
+export const WORKBENCH_PROFILE = 'pi-workbench-v1' as const;
+export const WORKBENCH_ONLINE_PROFILE = 'pi-workbench-online-v1' as const;
+export const WORKBENCH_ONLINE_PROTOCOL = 'v4.pi-workbench/2' as const;
 export const SDK = Object.freeze({engine: '@earendil-works/pi-coding-agent', version: '1.4.0', adapter_contract: 'host-run-receipt-v1'});
 export const DISCOVERY_SESSION_MS = 900000;
 export const LIMITS = Object.freeze({frame: 262144, total: 8388608, frames: 256, depth: 32, stderr: 262144, handshake: 3000, partial: 5000, session: 45000});
@@ -31,12 +35,13 @@ export const NAMES = Object.freeze(['v4_tasks_list_mine_v1', 'v4_knowledge_searc
 export const MEMORY_NAMES = Object.freeze([...NAMES, 'v4_memory_save_v1', 'v4_memory_correct_v1', 'v4_memory_withdraw_v1']);
 export const DISCOVERY_NAMES = Object.freeze([...MEMORY_NAMES, 'tool_search']);
 export const SOURCE_NAMES = Object.freeze([...DISCOVERY_NAMES, 'v4_guanjia_read_prices_v1', 'v4_guanjia_read_stock_v1', 'v4_guanjia_sales_ranking_v1', 'v4_guanjia_sales_ranking_v2', 'v4_guanjia_local_sales_v1', 'v4_guanjia_category_discovery_v1', 'v4_guanjia_category_products_v1', 'v4_guanjia_category_products_status_v1', 'v4_research_search_v1', 'v4_research_read_v1', 'v4_research_describe_v1', 'v4_research_propose_v1', 'v4_research_probe_v1']);
+export const WORKBENCH_NAMES = Object.freeze([...SOURCE_NAMES, 'v4_artifact_read_v1', 'v4_artifact_create_v1', 'v4_artifact_patch_v1']);
 export type Json = null | boolean | number | string | Json[] | {[key: string]: Json};
 export type JsonObject = {[key: string]: Json};
 export type Identity = {nonce: string; run_id: string; epoch: string};
-export type Frame = Identity & {protocol: typeof STREAM_PROTOCOL | typeof PROTOCOL | typeof ONLINE_PROTOCOL | typeof MEMORY_PROTOCOL | typeof MEMORY_ONLINE_PROTOCOL | typeof DISCOVERY_PROTOCOL | typeof DISCOVERY_ONLINE_PROTOCOL | typeof SOURCE_PROTOCOL | typeof SOURCE_ONLINE_PROTOCOL; seq: number; type: string; reply_to: number | null; body: JsonObject};
+export type Frame = Identity & {protocol: typeof WORKBENCH_ONLINE_PROTOCOL | typeof STREAM_PROTOCOL | typeof PROTOCOL | typeof ONLINE_PROTOCOL | typeof MEMORY_PROTOCOL | typeof MEMORY_ONLINE_PROTOCOL | typeof DISCOVERY_PROTOCOL | typeof DISCOVERY_ONLINE_PROTOCOL | typeof SOURCE_PROTOCOL | typeof SOURCE_ONLINE_PROTOCOL; seq: number; type: string; reply_to: number | null; body: JsonObject};
 export type Tool = {name: string; version: string; description: string; parameters: JsonObject};
-export type Start = {tool_profile: typeof PROFILE | typeof MEMORY_PROFILE | typeof DISCOVERY_PROFILE | typeof SOURCE_PROFILE; toolset_version: string; tools: Tool[]; prompt: string; max_output_tokens?: number};
+export type Start = {tool_profile: typeof WORKBENCH_PROFILE | typeof PROFILE | typeof MEMORY_PROFILE | typeof DISCOVERY_PROFILE | typeof SOURCE_PROFILE; toolset_version: string; tools: Tool[]; prompt: string; max_output_tokens?: number};
 export class ProtocolError extends Error {
   constructor(readonly code: string) { super(code); this.name = 'ProtocolError'; }
 }
@@ -64,8 +69,8 @@ export function nativeId(value: unknown): asserts value is string {
 export function digest(value: unknown, prefixed = false): asserts value is string {
   if (typeof value !== 'string' || !(prefixed ? /^sha256:[a-f0-9]{64}$/ : /^[a-f0-9]{64}$/).test(value)) fail('digest');
 }
-export function nameVersion(name: unknown, version: unknown, memory = false, discovery = false, source = false): void {
-  if (typeof name !== 'string' || !(source ? SOURCE_NAMES : discovery ? DISCOVERY_NAMES : memory ? MEMORY_NAMES : NAMES).includes(name) || version !== (name === 'v4_guanjia_local_sales_v1' ? '3' : name === 'v4_guanjia_sales_ranking_v2' ? '2' : '1')) fail('tool_profile');
+export function nameVersion(name: unknown, version: unknown, memory = false, discovery = false, source = false, workbench = false): void {
+  if (typeof name !== 'string' || !(workbench ? WORKBENCH_NAMES : source ? SOURCE_NAMES : discovery ? DISCOVERY_NAMES : memory ? MEMORY_NAMES : NAMES).includes(name) || version !== (name === 'v4_guanjia_local_sales_v1' ? '3' : name === 'v4_guanjia_sales_ranking_v2' ? '2' : '1')) fail('tool_profile');
 }
 export function shape(value: unknown, depth = 0, finiteNumbers = false): asserts value is Json {
   if (Array.isArray(value) || object(value)) {
@@ -179,12 +184,13 @@ export class Framer {
 }
 const OPS = ['model_begin', 'model_complete', 'tool_request'];
 const CODES = ['host_operation_failed', 'protocol_error', 'runtime_failed'];
-function validateWire(value: unknown, online = false, memory = false, discovery = false, source = false): asserts value is Frame {
+function validateWire(value: unknown, online = false, memory = false, discovery = false, source = false, workbench = false): asserts value is Frame {
+  if (workbench && !(online && memory && discovery && source)) fail('tool_profile');
   if (source && (!memory || !discovery)) fail('tool_profile');
   const f = exact(value, ['protocol', 'nonce', 'run_id', 'epoch', 'seq', 'type', 'reply_to', 'body']);
-  const protocol = source ? (online ? SOURCE_ONLINE_PROTOCOL : SOURCE_PROTOCOL) : discovery ? (online ? DISCOVERY_ONLINE_PROTOCOL : DISCOVERY_PROTOCOL) : memory ? (online ? MEMORY_ONLINE_PROTOCOL : MEMORY_PROTOCOL) : (online ? ONLINE_PROTOCOL : PROTOCOL);
-  const helloProfile = source ? (online ? SOURCE_ONLINE_PROFILE : SOURCE_PROFILE) : discovery ? (online ? DISCOVERY_ONLINE_PROFILE : DISCOVERY_PROFILE) : memory ? (online ? MEMORY_ONLINE_PROFILE : MEMORY_PROFILE) : (online ? ONLINE_PROFILE : PROFILE);
-  const names = source ? SOURCE_NAMES : discovery ? DISCOVERY_NAMES : memory ? MEMORY_NAMES : NAMES;
+  const protocol = workbench ? WORKBENCH_ONLINE_PROTOCOL : source ? (online ? SOURCE_ONLINE_PROTOCOL : SOURCE_PROTOCOL) : discovery ? (online ? DISCOVERY_ONLINE_PROTOCOL : DISCOVERY_PROTOCOL) : memory ? (online ? MEMORY_ONLINE_PROTOCOL : MEMORY_PROTOCOL) : (online ? ONLINE_PROTOCOL : PROTOCOL);
+  const helloProfile = workbench ? WORKBENCH_ONLINE_PROFILE : source ? (online ? SOURCE_ONLINE_PROFILE : SOURCE_PROFILE) : discovery ? (online ? DISCOVERY_ONLINE_PROFILE : DISCOVERY_PROFILE) : memory ? (online ? MEMORY_ONLINE_PROFILE : MEMORY_PROFILE) : (online ? ONLINE_PROFILE : PROFILE);
+  const names = workbench ? WORKBENCH_NAMES : source ? SOURCE_NAMES : discovery ? DISCOVERY_NAMES : memory ? MEMORY_NAMES : NAMES;
   if (f['protocol'] !== protocol) fail('protocol');
   identifier(f['run_id']);
   if (typeof f['nonce'] !== 'string' || !/^[0-9a-f]{32}$/.test(f['nonce'])) fail('nonce');
@@ -198,12 +204,12 @@ function validateWire(value: unknown, online = false, memory = false, discovery 
     const hasOutputLimit = online && object(b) && 'max_output_tokens' in b;
     const body = exact(b, ['tool_profile', 'toolset_version', 'tools', 'prompt', ...(hasOutputLimit ? ['max_output_tokens'] : [])]);
     if (hasOutputLimit) integer(body['max_output_tokens'],1,discovery ? 8192 : 2048);
-    if (body['tool_profile'] !== (source ? SOURCE_PROFILE : discovery ? DISCOVERY_PROFILE : memory ? MEMORY_PROFILE : PROFILE)) fail('tool_profile'); digest(body['toolset_version'], true);
+    if (body['tool_profile'] !== (workbench ? WORKBENCH_PROFILE : source ? SOURCE_PROFILE : discovery ? DISCOVERY_PROFILE : memory ? MEMORY_PROFILE : PROFILE)) fail('tool_profile'); digest(body['toolset_version'], true);
     if (typeof body['prompt'] !== 'string' || body['prompt'].length < 1) fail('start');
     const tools = body['tools']; if (!Array.isArray(tools) || tools.length > names.length) fail('tool_profile');
     const seen = new Set();
     for (const item of tools) {
-      const t = exact(item, ['name', 'version', 'description', 'parameters']); nameVersion(t['name'], t['version'], memory, discovery, source);
+      const t = exact(item, ['name', 'version', 'description', 'parameters']); nameVersion(t['name'], t['version'], memory, discovery, source, workbench);
       if (seen.has(t['name']) || typeof t['description'] !== 'string' || !object(t['parameters'])) fail('tool_profile'); seen.add(t['name']);
     }
   } else if (type === 'request') {
@@ -225,7 +231,7 @@ function validateWire(value: unknown, online = false, memory = false, discovery 
       const isSearch = discovery && object(body['arguments']) && body['arguments']['name'] === 'tool_search';
       const a = exact(body['arguments'], ['call_id', 'name', 'version', 'toolset_version', 'arguments', ...(isSearch ? ['selection'] : [])]);
       if (isSearch && (!Array.isArray(a['selection']) || a['selection'].length > 100 || a['selection'].some(name=>typeof name !== 'string' || name === 'tool_search' || !names.includes(name)))) fail('tool_profile');
-      nativeId(a['call_id']); nameVersion(a['name'], a['version'], memory, discovery, source); digest(a['toolset_version'], true);
+      nativeId(a['call_id']); nameVersion(a['name'], a['version'], memory, discovery, source, workbench); digest(a['toolset_version'], true);
       if (!object(a['arguments'])) fail('arguments');
     } else fail('unsupported_operation');
   } else if (type === 'response') {
@@ -244,14 +250,14 @@ function validateWire(value: unknown, online = false, memory = false, discovery 
         const r = exact(body['result'], ['committed', 'finished', ...(online && object(body['result']) && 'argument_rejection' in body['result'] ? ['argument_rejection'] : [])]); if (r['committed'] !== true || typeof r['finished'] !== 'boolean') fail('commit_receipt');
       } else {
         const r = exact(body['result'], ['call_id', 'name', 'version', 'toolset_version', 'receipt_id', 'step_id', 'output_ref', 'result']);
-        nativeId(r['call_id']); nameVersion(r['name'], r['version'], memory, discovery, source); digest(r['toolset_version'], true); digest(r['output_ref'], true);
+        nativeId(r['call_id']); nameVersion(r['name'], r['version'], memory, discovery, source, workbench); digest(r['toolset_version'], true); digest(r['output_ref'], true);
         identifier(r['receipt_id']); identifier(r['step_id']); if (!object(r['result'])) fail('result');
       }
     } else if (body['result'] !== null || typeof body['code'] !== 'string' || !CODES.includes(body['code'])) fail('error_code');
   } else if (type === 'session_end') {
     const body = exact(b, ['status']); if (body['status'] !== 'ok' && body['status'] !== 'error') fail('status');
   } else if (type === 'error') {
-    const body = exact(b, ['code']); if (typeof body['code'] !== 'string' || !CODES.includes(body['code'])) fail('error_code');
+    const body = exact(b, ['code']); if (typeof body['code'] !== 'string' || ![...CODES, PROVIDER_CAPACITY_CODE].includes(body['code'])) fail('error_code');
   } else fail('unsupported_type');
   shape(f);
 }
@@ -286,7 +292,7 @@ export class Peer {
   private lastCancel:'active'|'late_complete'|null=null;
   get cancelClassification():'active'|'late_complete'|null{return this.lastCancel;}
   clearStreamAnchor():void{this.streamAnchor=null;this.lastCancel=null;}
-  constructor(readonly role: 'host' | 'sdk', public identity: Identity | null = null, private readonly online = false, private readonly memory = false, private readonly discovery = false, private readonly source = false, readonly streaming = false, readonly canonicalResults = false) {}
+  constructor(readonly role: 'host' | 'sdk', public identity: Identity | null = null, private readonly online = false, private readonly memory = false, private readonly discovery = false, private readonly source = false, readonly streaming = false, readonly canonicalResults = false, private readonly workbench = false) {}
   private transition(f: Frame, sending: boolean): void {
     const sender = sending ? this.role : this.role === 'host' ? 'sdk' : 'host'; const t = f.type; const b = f.body;
     if (this.streaming && t.startsWith('provider_')) {
@@ -314,7 +320,7 @@ export class Peer {
   }
   receive(value: unknown): Frame {
     this.lastCancel=null;
-    (this.canonicalResults ? validateCanonical : this.streaming ? validateStream : (v:unknown) => validateWire(v, this.online, this.memory, this.discovery, this.source))(value); const frame = value as Frame; const id = {nonce: frame.nonce, run_id: frame.run_id, epoch: frame.epoch};
+    (this.canonicalResults ? validateCanonical : this.streaming ? validateStream : (v:unknown) => validateWire(v, this.online, this.memory, this.discovery, this.source, this.workbench))(value); const frame = value as Frame; const id = {nonce: frame.nonce, run_id: frame.run_id, epoch: frame.epoch};
     if (this.identity === null) { if (this.role !== 'sdk' || frame.type !== 'hello') fail('hello_required'); }
     else if (id.nonce !== this.identity.nonce || id.run_id !== this.identity.run_id || id.epoch !== this.identity.epoch) fail('identity');
     if (frame.seq !== this.received + 1) fail('sequence');
@@ -323,7 +329,7 @@ export class Peer {
   send(type: string, body: JsonObject, reply_to: number | null = null): Buffer {
     this.lastCancel=null;
     if (this.identity === null) fail('identity_required');
-    const f = {protocol: this.streaming ? STREAM_PROTOCOL : this.source ? (this.online ? SOURCE_ONLINE_PROTOCOL : SOURCE_PROTOCOL) : this.discovery ? (this.online ? DISCOVERY_ONLINE_PROTOCOL : DISCOVERY_PROTOCOL) : this.memory ? (this.online ? MEMORY_ONLINE_PROTOCOL : MEMORY_PROTOCOL) : (this.online ? ONLINE_PROTOCOL : PROTOCOL), ...this.identity, seq: this.sent + 1, type, reply_to, body}; (this.canonicalResults ? validateCanonical : this.streaming ? validateStream : (v:unknown) => validateWire(v, this.online, this.memory, this.discovery, this.source))(f);
+    const f = {protocol: this.streaming ? STREAM_PROTOCOL : this.workbench ? WORKBENCH_ONLINE_PROTOCOL : this.source ? (this.online ? SOURCE_ONLINE_PROTOCOL : SOURCE_PROTOCOL) : this.discovery ? (this.online ? DISCOVERY_ONLINE_PROTOCOL : DISCOVERY_PROTOCOL) : this.memory ? (this.online ? MEMORY_ONLINE_PROTOCOL : MEMORY_PROTOCOL) : (this.online ? ONLINE_PROTOCOL : PROTOCOL), ...this.identity, seq: this.sent + 1, type, reply_to, body}; (this.canonicalResults ? validateCanonical : this.streaming ? validateStream : (v:unknown) => validateWire(v, this.online, this.memory, this.discovery, this.source, this.workbench))(f);
     const raw = encode(f); if (this.sentBytes + raw.length > LIMITS.total) fail('total_bytes');
     this.transition(f, true); this.sent++; this.sentBytes += raw.length; return raw;
   }
@@ -336,6 +342,11 @@ export class OnlinePeer extends Peer {
 
 export function validateMemory(value: unknown): asserts value is Frame { validateWire(value, false, true); }
 export function validateMemoryOnline(value: unknown): asserts value is Frame { validateWire(value, true, true); }
+export function validateWorkbenchOnline(value: unknown): asserts value is Frame { validateWire(value, true, true, true, true, true); }
+export class WorkbenchPeer extends Peer {
+  constructor(role:'host'|'sdk', identity:Identity|null=null) { super(role, identity, true, true, true, true, false, false, true); }
+}
+
 export class MemoryPeer extends Peer {
   constructor(role: 'host' | 'sdk', identity: Identity | null = null, online = false) { super(role, identity, online, true); }
 }

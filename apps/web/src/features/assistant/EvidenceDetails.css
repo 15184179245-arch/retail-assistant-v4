@@ -1,0 +1,8 @@
+.assistant-evidence{max-width:100%;min-width:0;overflow-wrap:anywhere}
+.assistant-evidence-panel{max-width:min(36rem,100%);padding:.5rem 0;line-height:1.6;color:var(--text-secondary,#59636d)}
+.assistant-evidence-panel h4{font-size:.85rem;margin:.35rem 0;font-weight:600}
+.assistant-evidence-panel p{font-size:.8rem;margin:.25rem 0}
+.assistant-evidence-panel ul{padding-left:1.2rem;margin:.4rem 0}
+.assistant-evidence-panel li{margin:.4rem 0;overflow-wrap:anywhere}
+.assistant-evidence-panel small{display:block;font-size:.78rem}
+.assistant-message-meta:has(> .assistant-evidence[open]) > svg{align-self:flex-start;margin-top:2px}

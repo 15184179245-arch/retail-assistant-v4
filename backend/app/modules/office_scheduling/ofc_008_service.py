@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
-from backend.app.modules.identity.command_guard import lock_scope_security_fence
+from backend.app.modules.identity.command_guard import check_command_authority, lock_scope_security_fence
 from backend.app.modules.identity.service import authorize_scope
 from backend.app.modules.office_scheduling import ofc_008_authority as a
 from backend.app.modules.office_scheduling.ofc_008_models import OfficeSchedule, OfficeScheduleGrant
@@ -68,10 +68,10 @@ def _template_input(body):
     return ScheduleTemplateInput.model_validate({k: getattr(body, k) for k in ScheduleTemplateInput.model_fields})
 
 
-def _final(db, actor, row, receipt, capability, *, replayed=False):
+def _final(db, actor, row, receipt, capability, *, epoch, replayed=False):
     result = _view(db, actor, row, command=receipt, replayed=replayed)
     now = a.clock(db)
-    a.allow_person(db, actor, capability, now)
+    check_command_authority(db, actor, permission="office.schedules." + capability, epoch=epoch, now=now)
     if capability == "approve":
         authorize_scope(db, actor, organization_id=actor.organization_id, store_id=actor.store_id,
                         permission="tasks.suggest", now=now)
@@ -89,11 +89,11 @@ def _final(db, actor, row, receipt, capability, *, replayed=False):
 def create_schedule(db, actor, body, key):
     body = a.typed(ScheduleCreateInput, body)
     key = a.key(key)
-    a.guard_person(db, actor, "manage")
+    epoch = a.guard_person(db, actor, "manage")
     request_hash = a.request_digest(actor, "create", None, body)
     old = a.replay(db, actor, key, request_hash)
     if old is not None:
-        return _final(db, actor, a.schedule(db, actor, old.schedule_id), old, "manage", replayed=True)
+        return _final(db, actor, a.schedule(db, actor, old.schedule_id), old, "manage", epoch=epoch, replayed=True)
     now = a.clock(db)
     a.reviewer(db, actor, body.reviewer_id, now)
     snapshot = _template_input(body).model_dump(mode="json")
@@ -106,7 +106,7 @@ def create_schedule(db, actor, body, key):
     db.flush()
     receipt = a.record(db, actor, row, operation="create", request_key=key, request_hash=request_hash,
         now=now, references=dict(template_digest=row.template_digest, reason_digest=sha256(body.reason.encode()).hexdigest()))
-    return _final(db, actor, row, receipt, "manage")
+    return _final(db, actor, row, receipt, "manage", epoch=epoch)
 
 
 def _command(db, actor, ident, body, key, operation):
@@ -114,7 +114,7 @@ def _command(db, actor, ident, body, key, operation):
                        "approve": (ScheduleApproveInput, "approve"),
                        "pause": (SchedulePauseInput, "manage")}[operation]
     body, key = a.typed(cls, body), a.key(key)
-    a.guard_person(db, actor, capability)
+    epoch = a.guard_person(db, actor, capability)
     if operation == "approve":
         authorize_scope(db, actor, organization_id=actor.organization_id, store_id=actor.store_id,
                         permission="tasks.suggest", now=a.clock(db))
@@ -122,7 +122,7 @@ def _command(db, actor, ident, body, key, operation):
     old = a.replay(db, actor, key, request_hash)
     row = a.schedule(db, actor, ident)
     if old is not None:
-        return _final(db, actor, row, old, capability, replayed=True)
+        return _final(db, actor, row, old, capability, epoch=epoch, replayed=True)
     if row.version != body.expected_version:
         a.fail("version_conflict")
     if row.template_digest != body.expected_template_digest:
@@ -140,8 +140,14 @@ def _command(db, actor, ident, body, key, operation):
     else:
         a.reviewer(db, actor, row.reviewer_id, now)
         a.selected_machine(db, actor, body.machine_id, now)
-        if body.expires_at <= max(body.valid_from, now):
+        effective_start = max(body.valid_from, now)
+        if body.expires_at <= effective_start:
             a.fail("authorization_interval_invalid")
+        try:
+            a.utc(effective_start)
+            a.utc(body.expires_at)
+        except OverflowError:
+            a.fail("input_invalid")
         row.state = "active"
     row.version += 1
     row.updated_at = now
@@ -153,14 +159,14 @@ def _command(db, actor, ident, body, key, operation):
             machine_id=body.machine_id, approved_by=actor.subject_id, account_id=actor.account_id,
             account_version=actor.account_version, session_id=actor.session_id,
             authorization_epoch=lock_scope_security_fence(db, actor.organization_id, actor.store_id),
-            valid_from=max(body.valid_from, now), expires_at=body.expires_at,
+            valid_from=effective_start, expires_at=body.expires_at,
             max_occurrences=body.max_occurrences, request_key=key, input_digest=request_hash, created_at=now)
         db.add(grant)
         db.flush()
     receipt = a.record(db, actor, row, operation=operation, request_key=key, request_hash=request_hash,
         now=now, grant=grant, references=dict(template_digest=row.template_digest,
                                             reason_digest=sha256(body.reason.encode()).hexdigest()))
-    return _final(db, actor, row, receipt, capability)
+    return _final(db, actor, row, receipt, capability, epoch=epoch)
 
 
 def replace_schedule(db, actor, ident, body, key):

@@ -102,7 +102,7 @@ internal fun parseReceipt(data: Map<String, Any?>, requirePending: Boolean = tru
     val visible = state == RunState.COMPLETED && status == AnswerStatus.AVAILABLE
     val answer = if (visible) data.text("answer") else null
     val citations = if (visible) objectList(data["citations"] ?: emptyList<Any>()).map {
-        val kind = it.text("kind"); require(kind in setOf("knowledge", "catalog"))
+        val kind = it.text("kind"); require(kind in setOf("knowledge", "catalog", "guanjia_sales_ranking", "memory"))
         val time = it.optionalText("observed_at"); require(time == null || parseIsoInstant(time) != null)
         AnswerCitation(kind, it.text("object_id"), it.text("version_ref"), it.text("version"),
             it.text("label"), it.optionalText("source_ref"), time)

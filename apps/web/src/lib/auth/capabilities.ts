@@ -1,20 +1,6 @@
+import { clearDraftCheckpoint, reconcileDraftCheckpointVersion } from './assistantDraftCheckpoint';
 import { useSyncExternalStore } from "react";
-import { apiRequest } from "../api/client";
-import { getSession } from "./session";
-
-export const ALL_KNOWN_CAPABILITIES = [
-  "catalog.read",
-  "agent.run",
-  "knowledge.read",
-  "purchasing.read",
-  "inventory.stocktake",
-  "tasks.read",
-  "office.materials.read",
-  "office.documents.read",
-  "office.exceptions.read",
-  "analytics.read",
-  "receiving.read",
-];
+import { authorizedRequest, captureSessionScope, getScopeVersion, getSession } from "./session";
 
 export interface IdentityContextData {
   subject_id: string;
@@ -27,17 +13,29 @@ export interface IdentityContextData {
 
 type Listener = () => void;
 
-let currentCapabilities: string[] = [];
-let currentVersion = "v0";
-let isFetching = false;
+export type CapabilityStatus = "unknown" | "loading" | "ready" | "unavailable";
+const EMPTY_CAPABILITIES: string[] = [];
+let context: { status: Exclude<CapabilityStatus, "loading">; capabilities: string[]; version: string } =
+  { status: "unknown", capabilities: EMPTY_CAPABILITIES, version: "v0" };
+let inflight: { scope: number; promise: Promise<string[]> } | null = null;
 const listeners = new Set<Listener>();
+let authorityEpoch = 0;
+
+/** Count authority notifications, not reusable server versions or capability tuples. */
+export function getCapabilityEpoch(): number {
+  return authorityEpoch;
+}
 
 export function getCapabilities(): string[] {
-  return currentCapabilities;
+  return getCapabilityStatus() === "ready" ? context.capabilities : EMPTY_CAPABILITIES;
 }
 
 export function getCapabilityVersion(): string {
-  return currentVersion;
+  return context.version;
+}
+
+export function getCapabilityStatus(): CapabilityStatus {
+  return inflight?.scope === getScopeVersion() ? "loading" : context.status;
 }
 
 export function hasCapability(capability: string): boolean {
@@ -45,12 +43,12 @@ export function hasCapability(capability: string): boolean {
     return true;
   }
   if (capability === "agent.run") {
-    return currentCapabilities.includes("agent.run") || currentCapabilities.includes("agents.run");
+    return getCapabilities().includes("agent.run") || getCapabilities().includes("agents.run");
   }
   if (capability === "receiving.read") {
-    return currentCapabilities.includes("receiving.read") || currentCapabilities.includes("erp.receiving.read");
+    return getCapabilities().includes("receiving.read") || getCapabilities().includes("erp.receiving.read");
   }
-  return currentCapabilities.includes(capability);
+  return getCapabilities().includes(capability);
 }
 
 export function subscribeCapabilities(listener: Listener): () => void {
@@ -59,20 +57,19 @@ export function subscribeCapabilities(listener: Listener): () => void {
 }
 
 function emit(): void {
+  authorityEpoch += 1;
   for (const listener of listeners) {
     listener();
   }
 }
 
 export function setCapabilities(capabilities: string[], version = "v1"): void {
-  currentCapabilities = [...capabilities];
-  currentVersion = version;
+  context = { status: "ready", capabilities: [...capabilities], version };
   emit();
 }
 
 export function clearCapabilities(): void {
-  currentCapabilities = [];
-  currentVersion = "v0";
+  context = { status: "unknown", capabilities: EMPTY_CAPABILITIES, version: "v0" };
   emit();
 }
 
@@ -87,44 +84,52 @@ export async function refreshCapabilities(): Promise<string[]> {
     return [];
   }
 
-  if (isFetching) {
-    return currentCapabilities;
-  }
-
-  isFetching = true;
-  try {
-    const data = await apiRequest<IdentityContextData>("/api/v1/identity/context", {
-      token: session.accessToken,
-    });
-    currentCapabilities = data.capabilities || [];
-    currentVersion = data.capability_version || "v1";
-    emit();
-    return currentCapabilities;
-  } catch (error) {
-    // If forbidden or unauthorized, wipe capabilities
-    if (typeof error === "object" && error !== null && "status" in error) {
-      const status = (error as { status: number }).status;
-      if (status === 401 || status === 403) {
-        clearCapabilities();
+  const scope = getScopeVersion();
+  if (inflight?.scope === scope) return inflight.promise;
+  const isCurrent = captureSessionScope();
+  const promise = (async () => {
+    try {
+      const data = await authorizedRequest<IdentityContextData>("/api/v1/identity/context");
+      if (isCurrent() && data.subject_id === session.subjectId &&
+          data.organization_id === session.organizationId && data.store_id === session.storeId &&
+          Array.isArray(data.capabilities) && data.capabilities.every(cap => typeof cap === "string")) {
+        const version=data.capability_version || "v1";
+        if ((data.capabilities.includes('agent.run') || data.capabilities.includes('agents.run')) &&
+            data.capabilities.includes('tasks.read_self') && data.capabilities.includes('tasks.manage')) {
+          reconcileDraftCheckpointVersion(session,version);
+        } else {
+          clearDraftCheckpoint(session);
+        }
+        setCapabilities(data.capabilities,version);
+      } else if (isCurrent()) {
+        context = { status: "unavailable", capabilities: EMPTY_CAPABILITIES, version: "v0" };
       }
+    } catch {
+      if (isCurrent()) context = { status: "unavailable", capabilities: EMPTY_CAPABILITIES, version: "v0" };
+    } finally {
+      if (inflight?.scope === scope) { inflight = null; emit(); }
     }
-    return currentCapabilities;
-  } finally {
-    isFetching = false;
-  }
+    return getCapabilities();
+  })();
+  inflight = { scope, promise };
+  emit();
+  return promise;
 }
 
 export function useCapabilities(): {
   capabilities: string[];
   version: string;
+  status: CapabilityStatus;
   hasCapability: (cap: string) => boolean;
 } {
   const caps = useSyncExternalStore(subscribeCapabilities, getCapabilities, getCapabilities);
+  const status = useSyncExternalStore(subscribeCapabilities, getCapabilityStatus, getCapabilityStatus);
   const version = useSyncExternalStore(subscribeCapabilities, getCapabilityVersion, getCapabilityVersion);
 
   return {
     capabilities: caps,
     version,
+    status,
     hasCapability: (cap: string) => {
       if (cap === "public" || cap === "authenticated") return true;
       if (cap === "agent.run") {

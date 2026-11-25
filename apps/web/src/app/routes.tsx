@@ -1,10 +1,11 @@
-import type { ReactNode } from "react";
+import { BusinessHome } from "./BusinessHome";
+import { useEffect, type ReactNode } from "react";
 import type { Session } from "../lib/auth/session";
 import { getScopeVersion } from "../lib/auth/session";
+import { businessPermission } from "../lib/auth/businessPermissions";
 import { EmptyState } from "../components/EmptyState";
 import { Button } from "../components/Button";
 import { navigate } from "./router";
-import { AgentChatPage } from "../features/agents/AgentChatPage";
 import { PiTrialPage } from "../features/agents/PiTrialPage";
 import { PiProbePage } from "../features/agents/PiProbePage";
 import { MemoryPage } from "../features/memory/MemoryPage";
@@ -20,6 +21,11 @@ import { AnalyticsPage } from "../features/analytics/AnalyticsPage";
 import { ReceivingReviewPage } from "../features/receiving/ReceivingReviewPage";
 import { CatalogSearchPage } from "../features/catalog/CatalogSearchPage";
 import { SalesWorkbenchPage } from "../features/sales/SalesWorkbenchPage";
+
+function RetiredAgentRoute() {
+  useEffect(() => { navigate("/assistant", { replace: true }); }, []);
+  return <p role="status">旧版 Agent 入口已移除，正在前往「我的助理」。</p>;
+}
 
 export interface RouteItem {
   path: string;
@@ -74,28 +80,32 @@ export function ForbiddenPage({
 }
 
 export const NAV_ROUTES: RouteItem[] = [
+  { path: "/business", title: "人工业务", inNav: false, requiredCapability: "authenticated" },
+  { path: "/workspace", title: "人工草稿工作区", inNav: false, requiredCapability: "authenticated" },
   { path: "/", title: "工作台首页", navLabel: "工作台", inNav: true, requiredCapability: "authenticated", objectCategory: "今日总览", workObjectKind: "today", executionTier: "L0" },
   { path: "/catalog", title: "商品与库存查询", navLabel: "商品查询", inNav: true, requiredCapability: "catalog.read", objectCategory: "销售与客户", workObjectKind: "catalog_lookup", executionTier: "L0" },
-  { path: "/sales", title: "销售草稿与交接复核", navLabel: "销售复核", inNav: true, requiredCapability: "sales.read", objectCategory: "销售与客户", workObjectKind: "sales_workbench", executionTier: "L1" },
+  { path: "/sales", title: "销售草稿与交接复核", navLabel: "销售复核", inNav: true, requiredCapability: businessPermission.sales.read, objectCategory: "销售与客户", workObjectKind: "sales_workbench", executionTier: "L1" },
   { path: "/assistant", title: "我的助理", navLabel: "我的助理", inNav: true, requiredCapability: "agent.run", objectCategory: "系统与线程", workObjectKind: "assistant_work", executionTier: "thread" },
-  { path: "/agents", title: "Agent 工作台", navLabel: "Agent 工作台", inNav: true, requiredCapability: "agent.run", objectCategory: "系统与线程", workObjectKind: "agent_thread", executionTier: "thread" },
+  { path: "/agents", title: "旧版入口重定向", inNav: false, requiredCapability: "authenticated" },
   { path: "/pi-trial", title: "Pi 只读试用", inNav: false, requiredCapability: "agent.run", objectCategory: "系统与线程", workObjectKind: "pi_trial", executionTier: "thread" },
   { path: "/pi-probe", title: "Pi 单次诊断", inNav: false, requiredCapability: "agent.run", objectCategory: "系统与线程", workObjectKind: "pi_probe", executionTier: "thread" },
   { path: "/memory", title: "助理记忆", navLabel: "助理记忆", inNav: true, requiredCapability: "memory.read", objectCategory: "系统与线程", workObjectKind: "assistant_memory", executionTier: "L0" },
-  { path: "/knowledge", title: "知识复核", navLabel: "知识复核", inNav: true, requiredCapability: "knowledge.read", objectCategory: "办公与异常", workObjectKind: "knowledge_review", executionTier: "L2" },
-  { path: "/purchasing", title: "待到货", navLabel: "待到货", inNav: true, requiredCapability: "purchasing.read", objectCategory: "采购与到货", workObjectKind: "purchasing_queue", executionTier: "L0" },
-  { path: "/stocktake", title: "盘点证据与复核", navLabel: "盘点证据与复核", inNav: true, requiredCapability: "inventory.stocktake", objectCategory: "库存与盘点", workObjectKind: "stocktake_session", executionTier: "L2" },
-  { path: "/notifications", title: "站内提醒", navLabel: "站内提醒", inNav: true, requiredCapability: "tasks.read", objectCategory: "办公与异常", workObjectKind: "notification_inbox", executionTier: "L0" },
-  { path: "/materials", title: "材料收件箱", navLabel: "材料收件箱", inNav: true, requiredCapability: "office.materials.read", objectCategory: "办公与异常", workObjectKind: "office_material", executionTier: "L2" },
+  { path: "/knowledge", title: "知识复核", navLabel: "知识复核", inNav: true, requiredCapability: businessPermission.knowledge.review, objectCategory: "办公与异常", workObjectKind: "knowledge_review", executionTier: "L2" },
+  { path: "/purchasing", title: "待到货", navLabel: "待到货", inNav: true, requiredCapability: businessPermission.purchasing.read, objectCategory: "采购与到货", workObjectKind: "purchasing_queue", executionTier: "L0" },
+  { path: "/stocktake", title: "盘点证据与复核", navLabel: "盘点证据与复核", inNav: true, requiredCapability: businessPermission.stocktake.read, objectCategory: "库存与盘点", workObjectKind: "stocktake_session", executionTier: "L2" },
+  { path: "/notifications", title: "站内提醒", navLabel: "站内提醒", inNav: true, requiredCapability: businessPermission.notifications.read, objectCategory: "办公与异常", workObjectKind: "notification_inbox", executionTier: "L0" },
+  { path: "/materials", title: "材料收件箱", navLabel: "材料收件箱", inNav: true, requiredCapability: businessPermission.materials.read, objectCategory: "办公与异常", workObjectKind: "office_material", executionTier: "L2" },
   { path: "/documents", title: "办公文档", navLabel: "办公文档", inNav: true, requiredCapability: "office.documents.read", objectCategory: "办公与异常", workObjectKind: "office_document", executionTier: "L2" },
   { path: "/exceptions", title: "异常与交接", navLabel: "异常与交接", inNav: true, requiredCapability: "office.exceptions.read", objectCategory: "办公与异常", workObjectKind: "office_exception", executionTier: "L2" },
   { path: "/analytics", title: "经营与销售数据分析", navLabel: "经营分析", inNav: true, requiredCapability: "analytics.read", objectCategory: "系统与线程", workObjectKind: "analytics_report", executionTier: "L0" },
-  { path: "/receiving", title: "采购到货清点复核", navLabel: "到货复核", inNav: true, requiredCapability: "receiving.read", objectCategory: "采购与到货", workObjectKind: "receiving_batch", executionTier: "L2" },
+  { path: "/receiving", title: "采购到货清点复核", navLabel: "到货复核", inNav: true, requiredCapability: businessPermission.receiving.read, objectCategory: "采购与到货", workObjectKind: "receiving_batch", executionTier: "L2" },
 ];
 
 export function renderRouteComponent(path: string, session: Session): ReactNode | null {
   const scopeKey = getScopeVersion();
   switch (path) {
+    case "/business": return <BusinessHome />;
+    case "/workspace": return null;
     case "/":
     case "/login":
       return <WelcomeHome session={session} />;
@@ -104,7 +114,7 @@ export function renderRouteComponent(path: string, session: Session): ReactNode 
     case "/sales":
       return <SalesWorkbenchPage key={scopeKey} session={session} />;
     case "/agents":
-      return <AgentChatPage session={session} />;
+      return <RetiredAgentRoute />;
     case "/assistant":
       return <AssistantPage key={scopeKey} session={session} />;
     case "/pi-trial":
@@ -114,13 +124,13 @@ export function renderRouteComponent(path: string, session: Session): ReactNode 
     case "/memory":
       return <MemoryPage key={scopeKey} session={session} />;
     case "/knowledge":
-      return <KnowledgeReviewPage session={session} />;
+      return <KnowledgeReviewPage key={scopeKey} session={session} />;
     case "/purchasing":
-      return <PurchaseIntentPage session={session} />;
+      return <PurchaseIntentPage key={scopeKey} session={session} />;
     case "/stocktake":
-      return <StocktakeReviewPage session={session} />;
+      return <StocktakeReviewPage key={scopeKey} session={session} />;
     case "/notifications":
-      return <NotificationInbox session={session} />;
+      return <NotificationInbox key={scopeKey} session={session} />;
     case "/materials":
       return <OFC002Page key={scopeKey} session={session} />;
     case "/documents":

@@ -26,7 +26,10 @@ router = APIRouter(prefix="/catalog", tags=["catalog"])
 
 
 def _snapshot_out(snapshot: CatalogSnapshot | None) -> CatalogSnapshotOut | None:
-    return CatalogSnapshotOut.model_validate(snapshot) if snapshot is not None else None
+    if snapshot is None:
+        return None
+    return CatalogSnapshotOut.model_validate(snapshot).model_copy(
+        update={"payload": _public_payload(snapshot.payload)})
 
 
 def _product_out(product: CatalogProduct, snapshot: CatalogSnapshot | None) -> CatalogProductOut:
@@ -60,6 +63,20 @@ CACHE_FIELDS = ("name", "spec", "model", "unit", "category", "brand",
                 "barCode", "barcode_flags", "sell_price")
 
 
+def _public_value(field, value):
+    # A safe field name must not smuggle an arbitrary nested source object.
+    if field == "barcode_flags":
+        return list(value) if isinstance(value, list) and all(isinstance(x, str) for x in value) else []
+    if field == "sell_price":
+        return value if type(value) in (int, float) or value is None else None
+    return value if isinstance(value, str) or value is None else None
+
+
+def _public_payload(payload):
+    return {key: _public_value(key, value) for key, value in (payload or {}).items()
+            if key in CACHE_FIELDS}
+
+
 def _encode_cursor(version: str, code: str, product_id: str) -> str:
     raw = json.dumps({"v": version, "k": code, "i": product_id},
                      ensure_ascii=False, separators=(",", ":")).encode()
@@ -86,9 +103,13 @@ def _cache_item(product: CatalogProduct, snapshot: CatalogSnapshot | None) -> Ca
         product_id=product.id, external_code=product.external_code,
         source_system=product.source_system, source_version=product.source_version,
         source_updated_at=product.source_updated_at, active=product.active,
-        version=product.version, name=payload.get("name"), spec=payload.get("spec"),
-        model=payload.get("model"), unit=payload.get("unit"),
-        category=payload.get("category"), brand=payload.get("brand"),
+        version=product.version,
+        name=_public_value("name", payload.get("name")),
+        spec=_public_value("spec", payload.get("spec")),
+        model=_public_value("model", payload.get("model")),
+        unit=_public_value("unit", payload.get("unit")),
+        category=_public_value("category", payload.get("category")),
+        brand=_public_value("brand", payload.get("brand")),
         barcode=payload.get("barCode"), barcode_flags=list(payload.get("barcode_flags") or []),
         sell_price=payload.get("sell_price"),
         price_source_version=(snapshot.source_version if snapshot is not None else product.source_version),
@@ -146,6 +167,16 @@ def cache_route(
                                 user_message="商品缓存已读取。", hint=None)
 
 
+def _conflict_out(item) -> CatalogConflictOut:
+    result = CatalogConflictOut.model_validate(item)
+    # Conflict identities remain visible; arbitrary extension/raw values do not.
+    def project(value):
+        return ({"value": _public_value(item.field_name, value.get("value"))}
+                if item.field_name in CACHE_FIELDS else {})
+    return result.model_copy(update={"source_value": project(result.source_value),
+                                     "local_value": project(result.local_value)})
+
+
 @router.get("/conflicts", response_model=CatalogConflictListEnvelope)
 def conflicts_route(
     actor: Annotated[AuthenticatedSubject, Depends(require_authenticated_subject)],
@@ -158,7 +189,7 @@ def conflicts_route(
                                        store_id=actor.store_id, limit=limit)
     return CatalogConflictListEnvelope(
         success=True,
-        data={"items": [CatalogConflictOut.model_validate(item).model_dump(mode="json")
+        data={"items": [_conflict_out(item).model_dump(mode="json")
                         for item in conflicts]},
         code="OK", error=None, user_message="商品冲突已读取。", hint=None,
     )

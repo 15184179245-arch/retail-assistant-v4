@@ -3,16 +3,34 @@ export interface ProgressStep {
   sequence: number; label: string; state: string; updatedAt: string;
   kind?: 'model' | 'tool' | 'checkpoint'; id?: string; createdAt?: string;
   toolIdentity?: string; inputDigest?: string; outputDigest?: string;
-  inputTokens?: number; outputTokens?: number; error?: string;
+  inputTokens?: number; outputTokens?: number; error?: string; guidance?: string;
   safeTrace?: { state: 'available' | 'withheld'; acceptedAt?: string; resultAt?: string; arguments: TraceField[]; result: TraceField[] };
   tone?: 'neutral' | 'active' | 'success' | 'warning' | 'error';
 }
 /** Display only Host receipt facts; never infer effects or authorize a retry. */
+export type SourceReadIssue={label:string;state:'failed'|'unknown'};
+export type SavedStockObservationStep={id:string;sequence:number;version:'1'|'2';outputDigest:string};
+export type SavedStockLossStep={id:string;sequence:number;outputDigest:string};
+export type SavedWarehouseDirectoryStep={id:string;sequence:number;outputDigest:string};
+export type SavedLegacyProductStep={id:string;sequence:number;version:'1'|'2';outputDigest:string};
 export interface WorkProgress {
   activity?: string;
   explanation?: string;
   uncertain: boolean;
   stopRecorded?: boolean;
+  /** Only the Host's finite model-inflight phase; no private content. */
+  awaitingModelRecord?: true;
+  /** Bound successful tool-step outputs, not business successes or final answers. */
+  savedToolRecords?: number;
+  /** Candidate receipt only; the explicit source list proves its operation and current rights. */
+  hasStoredSalesCoverageCandidate?: true;
+  /** Candidate steps only; reading requires explicit choice and fresh Host authorization. */
+  savedStockObservationSteps?: SavedStockObservationStep[];
+  savedStockLossSteps?: SavedStockLossStep[];
+  savedWarehouseDirectorySteps?: SavedWarehouseDirectoryStep[];
+  savedLegacyProductSteps?: SavedLegacyProductStep[];
+  /** Names from the fixed supported source list and statuses from the bound Work receipt. */
+  sourceReadIssues?: SourceReadIssue[];
   traceState?: 'not_recorded' | 'available' | 'withheld';
   steps: ProgressStep[];
 }
@@ -37,6 +55,42 @@ const tools: Record<string, string> = {
   'stocktake.read_evidence': '读取盘点依据', 'purchasing.extract_candidates': '提取采购候选',
   'purchasing.explain_discrepancies': '核对采购差异',
 };
+// These fixed receipt labels identify business steps, not final Work outcomes.
+// They never enable safe trace or disclose tool arguments or returned data.
+const businessLabels: Record<string,string> = {
+  'cache.sales.read': '查询历史销售缓存',
+  'guanjia.sales_ranking.read': '查询历史销售排行',
+  'guanjia.api.product_get': '读取商品资料',
+  'guanjia.product_image': '读取商品图片',
+  'assistant.history_image': '读取对话历史图片',
+  'guanjia.api.purchase_orders_query': '查询采购订单',
+  'guanjia.api.purchase_order_detail': '查看采购订单明细',
+  'guanjia.api.purchase_receipts_query': '查询采购入库',
+  'guanjia.api.purchase_receipt_detail': '查看采购入库单明细',
+  'guanjia.api.purchase_returns': '查询采购退货',
+  'guanjia.api.purchase_return_detail': '查看采购退货单明细',
+  'guanjia.api.sales_query': '查询销售单据',
+  'guanjia.api.sales_lines': '查询销售明细',
+  'guanjia.api.sales_returns': '查询销售退货',
+  'guanjia.api.sales_return_detail': '查看销售退货单明细',
+  'guanjia.api.stock_transfers': '查询本店调拨列表',
+  'guanjia.api.stock_transfer_detail': '查询本店调拨明细',
+  'guanjia.api.warehouse_directory': '查询门店仓库目录',
+  'guanjia.api.stock_losses_query': '查询报损单据',
+};
+const operationalSourceLabels:Record<string,string>={
+  'guanjia.api.sales_query':'销售单据',
+  'guanjia.api.sales_lines':'销售商品明细',
+  'guanjia.api.sales_returns':'销售退货单',
+  'guanjia.api.sales_return_detail':'销售退货单明细',
+  'guanjia.api.purchase_orders_query':'采购订单',
+  'guanjia.api.purchase_order_detail':'采购订单商品明细',
+  'guanjia.api.purchase_receipts_query':'采购入库单列表',
+  'guanjia.api.purchase_receipt_detail':'采购入库单明细',
+  'guanjia.api.purchase_returns':'采购退货单',
+};
+const productImageRecorded = '这一步已保存工具回执，不能据此判断有图或无图。请查看答复中可核实的商品图片依据；“刷新工作”只查原记录，不会重跑。';
+const productImageUnconfirmed = '商品图片读取结果尚未核实，不代表无图。可点“刷新工作”查看原记录，不会重新执行。';
 const failures: Record<string, string> = {
   pi_provider_http_400: '模型服务拒绝了请求格式（HTTP 400），需要修复连接配置。原请求已保留。',
   pi_provider_http_401: '模型服务认证失败（HTTP 401），需要核对连接凭据。原请求已保留。',
@@ -51,6 +105,7 @@ const failures: Record<string, string> = {
   pi_provider_http_503: '模型服务暂时不可用（HTTP 503）。执行与用量仍需核对，未自动重发。',
   pi_provider_http_504: '模型服务网关超时（HTTP 504）。执行与用量仍需核对，未自动重发。',
   agent_budget_exceeded: '这次工作的用量达到当前执行额度，处理已停止。',
+  pi_workbench_page_capacity: '这次工作可用的工具步数不足，没能取齐。可在原记录核对进度；如需继续，请说明尚未查到的范围。',
   agent_deadline_exceeded: '这次工作超过执行时限，处理已停止；已有执行结果需按记录核对。',
   tool_scope_denied: '这次工具操作不在当前授权范围内。',
   tool_agent_permission_denied: '助理没有执行这次工具操作的权限。',
@@ -101,10 +156,12 @@ export function parseProgress(status: string, value: Record<string, unknown> | n
         !['none', 'local_task_committed', 'external_unknown'].includes(execution.effect_status)) throw Error('执行记录格式异常。');
     if (execution.cancel_requested === (execution.cancel_resolution === 'not_requested')) throw Error('停止记录不一致。');
     if (active && phase !== 'terminal') result.activity = phases[phase];
+    if (active && phase === 'model_inflight') result.awaitingModelRecord = true;
     if (execution.cancel_requested) result.stopRecorded = true;
     if (execution.effect_status === 'external_unknown' || execution.cancel_resolution === 'unknown') result.uncertain = true;
   }
   let lastFailure: unknown;
+  let lastFailureIsProductImage = false;
   if (value?.steps !== undefined) {
     if (!Array.isArray(value.steps) || value.steps.length > 1000) throw Error('执行记录格式异常。');
     let previous = 0;
@@ -116,9 +173,18 @@ export function parseProgress(status: string, value: Record<string, unknown> | n
       previous = step.sequence_no as number;
       const kind = member(step.kind, { model: '模型', tool: '工具', checkpoint: '检查' });
       const state = member(step.state, stepStates);
+      const imageStep = kind === 'tool' && step.tool_key === 'guanjia.product_image';
       if (state === 'unknown') result.uncertain = true;
-      if (state === 'failed' || state === 'unknown') lastFailure = step.error_code;
-      const toolLabel = typeof step.tool_key === 'string' && Object.hasOwn(tools, step.tool_key) ? tools[step.tool_key] : '调用工具';
+      if (state === 'failed' || state === 'unknown') {
+        lastFailure = step.error_code;
+        lastFailureIsProductImage = imageStep;
+      }
+      const terminalPending = ['failed', 'completed', 'cancelled'].includes(status) && ['pending', 'running'].includes(state);
+      const businessLabel = typeof step.tool_key === 'string' && Object.hasOwn(businessLabels, step.tool_key)
+        ? businessLabels[step.tool_key] : undefined;
+      const toolLabel = businessLabel
+        ? (state === 'running' && !terminalPending ? '正在' + businessLabel : businessLabel)
+        : (typeof step.tool_key === 'string' && Object.hasOwn(tools, step.tool_key) ? tools[step.tool_key] : '调用工具');
       const id = optionalId(step.id);
       if (id && ids.has(id)) throw Error('执行记录标识重复。');
       if (id) ids.add(id);
@@ -126,20 +192,49 @@ export function parseProgress(status: string, value: Record<string, unknown> | n
       const createdAt = step.created_at == null ? undefined : recordedTime(step.created_at);
       if (createdAt && Date.parse(createdAt) > Date.parse(step.updated_at)) throw Error('执行记录时间不一致。');
       if (step.tool_version != null && typeof step.tool_version !== 'string') throw Error('执行记录版本异常。');
-      const terminalPending = ['failed', 'completed', 'cancelled'].includes(status) && ['pending', 'running'].includes(state);
       const error = typeof step.error_code === 'string' && Object.hasOwn(failures, step.error_code)
         ? failures[step.error_code] : step.error_code === 'pi_attempt_response_unknown'
           ? '发送结果尚未确定；保留原记录，未自动重发。'
-          : (state === 'failed' || state === 'unknown') ? '具体原因未记录为可展示的错误，请核对原回执。' : undefined;
+          : (state === 'failed' || state === 'unknown')
+            ? (imageStep ? productImageUnconfirmed : '具体原因未记录为可展示的错误，请核对原回执。') : undefined;
+      // A succeeded tool step records transport/receipt; even a canonical no-effect
+      // image result can have this state. It discloses neither image nor absence.
+      const imageReceipt = imageStep && state === 'succeeded';
+      const outputDigest = safeDigest(step.output_ref);
+      if(kind==='tool'&&step.tool_version==='1'&&(state==='failed'||state==='unknown')&&
+          typeof step.tool_key==='string'&&Object.hasOwn(operationalSourceLabels,step.tool_key)){
+        const label=operationalSourceLabels[step.tool_key];
+        const issues=result.sourceReadIssues??(result.sourceReadIssues=[]);
+        if(!issues.some(issue=>issue.label===label&&issue.state===state))issues.push({label,state});
+      }
+      if (kind === 'tool' && state === 'succeeded' && outputDigest) {
+        result.savedToolRecords = (result.savedToolRecords ?? 0) + 1;
+        if ((status==='completed'||status==='failed') && id && typeof value.run_id==='string' && uuid.test(value.run_id) &&
+            step.tool_key==='guanjia.sales_ranking.read' && step.tool_version==='3')
+          result.hasStoredSalesCoverageCandidate=true;
+        if(status==='completed'&&id&&typeof value.run_id==='string'&&uuid.test(value.run_id)&&
+           step.tool_key==='guanjia.read_stock'&&(step.tool_version==='1'||step.tool_version==='2'))
+          (result.savedStockObservationSteps??=[]).push({id,sequence:previous,version:step.tool_version,outputDigest});
+        if(status==='completed'&&id&&typeof value.run_id==='string'&&uuid.test(value.run_id)&&
+           step.tool_key==='guanjia.api.stock_losses_query'&&step.tool_version==='1')
+          (result.savedStockLossSteps??=[]).push({id,sequence:previous,outputDigest});
+        if(status==='completed'&&id&&typeof value.run_id==='string'&&uuid.test(value.run_id)&&
+           step.tool_key==='guanjia.api.warehouse_directory'&&step.tool_version==='1')
+          (result.savedWarehouseDirectorySteps??=[]).push({id,sequence:previous,outputDigest});
+        if(status==='completed'&&id&&typeof value.run_id==='string'&&uuid.test(value.run_id)&&
+           step.tool_key==='guanjia.api.product_get'&&(step.tool_version==='1'||step.tool_version==='2'))
+          (result.savedLegacyProductSteps??=[]).push({id,sequence:previous,version:step.tool_version,outputDigest});
+      }
       return { sequence: previous, label: kind === 'model' ? '助理思考' : kind === 'tool' ? toolLabel : '执行检查',
         kind: kind as ProgressStep['kind'], id, createdAt, updatedAt: step.updated_at,
-        state: terminalPending ? '未记录终态' : stepStates[state],
-        tone: (terminalPending || state === 'unknown' ? 'warning' : state === 'succeeded' ? 'success'
+        state: terminalPending ? '未记录终态' : imageReceipt ? '已保存回执' : stepStates[state],
+        tone: (terminalPending || state === 'unknown' ? 'warning' : state === 'succeeded' && !imageReceipt ? 'success'
           : state === 'failed' ? 'error' : state === 'running' ? 'active' : 'neutral') as ProgressStep['tone'],
         toolIdentity: kind === 'tool' && typeof step.tool_key === 'string' && Object.hasOwn(tools, step.tool_key)
           && step.tool_version === '1' ? step.tool_key + '@1' : undefined,
-        inputDigest: safeDigest(step.input_ref), outputDigest: safeDigest(step.output_ref),
-        inputTokens: usage(step.input_tokens), outputTokens: usage(step.output_tokens), error };
+        inputDigest: safeDigest(step.input_ref), outputDigest,
+        inputTokens: usage(step.input_tokens), outputTokens: usage(step.output_tokens), error,
+        ...(imageReceipt ? {guidance:productImageRecorded} : {}) };
     });
   }
   if (lastFailure === 'pi_attempt_response_unknown' || value?.error_code === 'pi_attempt_response_unknown' ||
@@ -147,6 +242,7 @@ export function parseProgress(status: string, value: Record<string, unknown> | n
   if (status === 'failed' || status === 'needs_attention') {
     const code = lastFailure ?? value?.error_code;
     result.explanation = typeof code === 'string' && Object.hasOwn(failures, code) ? failures[code]
+      : lastFailureIsProductImage ? productImageUnconfirmed
       : '这次工作未能完成，现有回执尚不能确定具体原因。原请求与执行记录已保留。';
   } else if (status === 'blocked') {
     result.explanation = '执行前检查未通过，工作已保留；需要核对当前授权和运行条件。';

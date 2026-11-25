@@ -6,6 +6,7 @@ recognition results. Candidates are NEVER authoritative product/cost/quantity.
 """
 from __future__ import annotations
 import csv
+from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
@@ -173,6 +174,41 @@ def _csv_spans(raw):
         raise ExtractionError("office_extraction_csv_invalid") from exc
 
 
+def _xlsx_grid_spans(grid, *, sheet):
+    spans, headers = [], {}
+    for r, cells in sorted(grid.items()):
+        possible = {}
+        for c, (value, _, _) in cells.items():
+            label = str(value).strip().lower()
+            matches = [key for key, aliases in ALIASES.items() if label in aliases]
+            if matches:
+                possible[c] = matches
+        if len(possible) >= 2:
+            # An uncertain heading can signal a new section, but cannot name
+            # a field. Do not carry the prior section's labels through it.
+            counts = Counter(key for matches in possible.values() for key in matches)
+            headers = {c: matches[0] for c, matches in possible.items()
+                       if len(matches) == 1 and counts[matches[0]] == 1
+                       and not cells[c][1] and not cells[c][2]}
+            if len(headers) < 2:
+                headers = {}
+            for c, (value, warning, merged_flag) in sorted(cells.items()):
+                ambiguous = not headers or (c in possible and c not in headers)
+                spans.append(_span(str(value), None, {"type": "cell", "sheet": sheet,
+                    "cell": f"{_col(c)}{r}"}, warning=warning or (
+                        "merged_header" if merged_flag else "ambiguous_header" if ambiguous else "header")))
+            continue
+        subtotal = any(str(x[0]).lower().startswith(("合计","总计","subtotal","total"))
+                       for x in cells.values())
+        for c, (value, warning, merged_flag) in sorted(cells.items()):
+            spans.append(_span(str(value), headers.get(c) if not (warning or merged_flag or subtotal) else None,
+                {"type": "cell", "sheet": sheet, "cell": f"{_col(c)}{r}"},
+                warning=warning or ("merged_needs_review" if merged_flag else
+                    "subtotal_or_total" if subtotal else
+                    "unlabeled_cell" if not headers.get(c) else None)))
+    return spans
+
+
 def _xlsx_spans(raw):
     # Only OOXML spreadsheet data, never macros, formulas, external links, or
     # spreadsheet evaluation. Office Intake already screens active ZIP content.
@@ -181,6 +217,8 @@ def _xlsx_spans(raw):
             names = zipf.namelist()
             if len(names) > 2500:
                 _fail("office_extraction_limit")
+            if len(set(names)) != len(names):
+                _fail("office_extraction_spreadsheet_invalid")
             shared = []
             if "xl/sharedStrings.xml" in names:
                 root = ET.fromstring(zipf.read("xl/sharedStrings.xml"))
@@ -189,8 +227,10 @@ def _xlsx_spans(raw):
                 r"xl/worksheets/sheet[0-9]+\.xml", n))
             if not sheets:
                 _fail("office_extraction_sheet_missing")
+            if len(sheets) > 30:
+                _fail("office_extraction_sheet_limit")
             spans = []
-            for path in sheets[:30]:
+            for path in sheets:
                 root = ET.fromstring(zipf.read(path))
                 # A merged range hides multiple source cells, not only its
                 # top-left anchor; mark ALL overlapping candidates uncertain.
@@ -219,11 +259,13 @@ def _xlsx_spans(raw):
                             return True
                     return False
                 grid = {}
+                declared = set()
                 for cell in root.findall(".//" + _NS + "c"):
                     address = cell.attrib.get("r", "")
                     match = _CELL.fullmatch(address)
-                    if match is None:
+                    if match is None or address in declared:
                         _fail("office_extraction_cell_invalid")
+                    declared.add(address)
                     value_node = cell.find(_NS + "v")
                     formula = cell.find(_NS + "f")
                     inline = cell.find(_NS + "is")
@@ -248,30 +290,11 @@ def _xlsx_spans(raw):
                     for ch in match.group(1):
                         c = c * 26 + ord(ch) - 64
                     grid.setdefault(r, {})[c] = (value, warning, overlaps(address))
-                headers = {}
-                for r, cells in sorted(grid.items()):
-                    guessed_headers = {
-                        c: next(iter([key for key, aliases in ALIASES.items()
-                                      if str(info[0]).strip().lower() in aliases]), None)
-                        for c, info in cells.items()
-                    }
-                    if sum(v is not None for v in guessed_headers.values()) >= 2:
-                        headers = guessed_headers
-                        for c, (v, warning, merged_flag) in sorted(cells.items()):
-                            spans.append(_span(str(v), None, {"type": "cell", "sheet": path,
-                                "cell": f"{_col(c)}{r}"}, warning=warning or
-                                "merged_header" if merged_flag else warning or "header"))
-                        continue
-                    subtotal = any(str(x[0]).lower().startswith(("合计","总计","subtotal","total"))
-                                   for x in cells.values())
-                    for c, (value, warning, merged_flag) in sorted(cells.items()):
-                        spans.append(_span(str(value), headers.get(c) if not (warning or merged_flag or subtotal) else None,
-                            {"type": "cell", "sheet": path, "cell": f"{_col(c)}{r}"},
-                            warning=warning or ("merged_needs_review" if merged_flag else
-                                "subtotal_or_total" if subtotal else
-                                "unlabeled_cell" if not headers.get(c) else None)))
+                spans.extend(_xlsx_grid_spans(grid, sheet=path))
             return spans
     except (ValueError, KeyError, ET.ParseError, IndexError, OverflowError) as exc:
+        if isinstance(exc, ExtractionError) and exc.code == "office_extraction_sheet_limit":
+            raise
         raise ExtractionError("office_extraction_spreadsheet_invalid") from exc
 
 
@@ -416,6 +439,11 @@ def extract_evidence(db: Session, actor: AuthenticatedSubject, *,
     return _out(row)
 
 
+def _verify_evidence_version(evidence, version, digest):
+    if evidence.version != version or evidence.sha256 != digest:
+        _fail("office_extraction_source_changed")
+
+
 def get_extraction(db, actor, extraction_id):
     _require_actor(db, actor, "office.extraction.read")
     row = db.scalar(select(OfficeExtraction).where(
@@ -425,8 +453,7 @@ def get_extraction(db, actor, extraction_id):
     if row is None:
         _fail("office_extraction_not_found")
     evidence, _raw = intake.get_bytes(db, actor, row.evidence_id)
-    if evidence.version != row.evidence_version or evidence.sha256 != row.evidence_sha256:
-        _fail("office_extraction_source_changed")
+    _verify_evidence_version(evidence, row.evidence_version, row.evidence_sha256)
     reconstructed = {"source_kind": row.source_kind,
                      "extractor_key": row.extractor_key,
                      "extractor_version": row.extractor_version,
@@ -438,14 +465,18 @@ def get_extraction(db, actor, extraction_id):
     return row
 
 
-def review_receipts(db, actor, extraction_id):
-    row = get_extraction(db, actor, extraction_id)
+def _review_receipts_for_verified_id(db, actor, verified_id):
     items = db.scalars(select(OfficeFieldReview).where(
         OfficeFieldReview.organization_id == actor.organization_id,
         OfficeFieldReview.store_id == actor.store_id,
-        OfficeFieldReview.extraction_id == row.id,
+        OfficeFieldReview.extraction_id == verified_id,
     ).order_by(OfficeFieldReview.created_at, OfficeFieldReview.id)).all()
     return [_review_out(x) for x in items]
+
+
+def review_receipts(db, actor, extraction_id):
+    row = get_extraction(db, actor, extraction_id)
+    return _review_receipts_for_verified_id(db, actor, row.id)
 
 
 def review_field(db, actor, *, extraction_id, field_id, extraction_sha256,
@@ -578,10 +609,14 @@ def extraction_get(
     db: Annotated[Session, Depends(get_session)],
 ):
     try:
-        row = get_extraction(db, actor, extraction_id)
-        return _env({**_out(row),
-                     "reviews": review_receipts(db, actor, extraction_id)},
-                    ExtractionEnvelope)
+        data = _out(get_extraction(db, actor, extraction_id))
+        # Keep the latest read authority and metadata binding for the receipts,
+        # but do not re-read or re-hash the blob verified by this GET.
+        _require_actor(db, actor, "office.extraction.read")
+        evidence = intake.get_evidence(db, actor, data["evidence_id"])
+        _verify_evidence_version(evidence, data["evidence_version"], data["evidence_sha256"])
+        data["reviews"] = _review_receipts_for_verified_id(db, actor, data["id"])
+        return _env(data, ExtractionEnvelope)
     except ExtractionError as exc:
         raise _http_error(exc) from exc
 

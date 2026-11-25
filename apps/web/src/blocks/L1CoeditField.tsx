@@ -94,7 +94,7 @@ export interface L1CoeditFieldProps {
   min?: number;
   max?: number;
   step?: number | string;
-  disabled?: boolean;
+  readOnly?: boolean;
   aiEdited?: boolean;
   aiOpId?: string;
   aiPreviousValue?: string | number;
@@ -106,7 +106,6 @@ export interface L1CoeditFieldProps {
   onUnlock?: (fieldKey: string) => void;
   onAcceptSuggestion?: (fieldKey: string, suggestedValue: string | number) => void;
   onIgnoreSuggestion?: (fieldKey: string) => void;
-  onRejectAiField?: (fieldKey: string, opId?: string) => void;
   onUndoWholeOp?: (opId: string) => void;
   partialUndoConflictCount?: number;
   partialUndoSkippedFields?: readonly string[];
@@ -124,7 +123,7 @@ export function L1CoeditField({
   min,
   max,
   step,
-  disabled = false,
+  readOnly = false,
   aiEdited = false,
   aiOpId,
   aiPreviousValue,
@@ -136,7 +135,6 @@ export function L1CoeditField({
   onUnlock,
   onAcceptSuggestion,
   onIgnoreSuggestion,
-  onRejectAiField,
   onUndoWholeOp,
   partialUndoConflictCount = 0,
   partialUndoSkippedFields = [],
@@ -190,12 +188,12 @@ export function L1CoeditField({
           min={min}
           max={max}
           step={step}
-          disabled={disabled}
+          readOnly={readOnly || !onChange}
           value={String(value)}
           className={styles.coeditInput}
-          onChange={(event) => onChange?.(event.target.value)}
+          onChange={!readOnly && onChange ? (event) => onChange(event.target.value) : undefined}
         />
-        {locked && onUnlock ? (
+        {!readOnly && locked && onUnlock ? (
           <Button
             size="sm"
             variant="secondary"
@@ -204,7 +202,7 @@ export function L1CoeditField({
           >
             解锁
           </Button>
-        ) : !locked && onLock ? (
+        ) : !readOnly && !locked && onLock ? (
           <Button
             size="sm"
             variant="ghost"
@@ -216,33 +214,21 @@ export function L1CoeditField({
         ) : null}
       </div>
 
-      {showAiEncoding && (onRejectAiField || (onUndoWholeOp && aiOpId)) ? (
+      {!readOnly && showAiEncoding && onUndoWholeOp && aiOpId ? (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' }}>
           {aiPreviousValue !== undefined ? (
             <span style={{ fontSize: '12px', color: 'var(--muted, #65736f)' }}>
               原值：{String(aiPreviousValue)}
             </span>
           ) : null}
-          {onRejectAiField ? (
-            <Button
-              size="sm"
-              variant="secondary"
-              onClick={() => onRejectAiField(fieldKey, aiOpId)}
-              data-reject-ai-field={fieldKey}
-            >
-              拒绝此字段
-            </Button>
-          ) : null}
-          {onUndoWholeOp && aiOpId ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => onUndoWholeOp(aiOpId)}
-              data-undo-whole-op={aiOpId}
-            >
-              整次撤销
-            </Button>
-          ) : null}
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => onUndoWholeOp(aiOpId)}
+            data-undo-whole-op={aiOpId}
+          >
+            整次撤销
+          </Button>
         </div>
       ) : null}
 
@@ -263,26 +249,30 @@ export function L1CoeditField({
           {pendingSuggestion.reason ? (
             <div>理由：{pendingSuggestion.reason}</div>
           ) : null}
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
-            <Button
-              size="sm"
-              variant="primary"
-              onClick={() =>
-                onAcceptSuggestion?.(fieldKey, pendingSuggestion.value)
-              }
-              data-accept-suggestion={fieldKey}
-            >
-              接受建议（保持人工锁定）
-            </Button>
-            <Button
-              size="sm"
-              variant="secondary"
-              onClick={() => onIgnoreSuggestion?.(fieldKey)}
-              data-ignore-suggestion={fieldKey}
-            >
-              忽略建议
-            </Button>
-          </div>
+          {!readOnly && (onAcceptSuggestion || onIgnoreSuggestion) ? (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+              {onAcceptSuggestion ? (
+                <Button
+                  size="sm"
+                  variant="primary"
+                  onClick={() => onAcceptSuggestion(fieldKey, pendingSuggestion.value)}
+                  data-accept-suggestion={fieldKey}
+                >
+                  接受建议（保持人工锁定）
+                </Button>
+              ) : null}
+              {onIgnoreSuggestion ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => onIgnoreSuggestion(fieldKey)}
+                  data-ignore-suggestion={fieldKey}
+                >
+                  忽略建议
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       ) : null}
 

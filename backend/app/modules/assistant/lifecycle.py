@@ -1,9 +1,9 @@
 """Explicit local assistant service; browser lifetime does not own the worker."""
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from threading import Event, Thread
 
+from backend.app.modules.agents import pi_online_campaign as campaign_contract
 from backend.app.modules.assistant.core_adapter import DshCoreAdapter
 from backend.app.modules.assistant.dispatch import AssistantWorkerConfig, run_until_stopped, _config
 
@@ -18,13 +18,14 @@ class ManagedAssistant:
         self.thread = None
         self.failed = False
 
-    def accepts(self, actor):
+    def accepts(self, actor, *, require_dispatch_window=True):
         policy = self.config.online_policy
         return (self.thread is not None and self.thread.is_alive()
                 and not self.stop.is_set() and not self.failed
-                and datetime.now(timezone.utc) < policy.expires_at
                 and (actor.organization_id, actor.store_id, actor.subject_id) ==
-                    (policy.organization_id, policy.store_id, policy.requester_id))
+                    (policy.organization_id, policy.store_id, policy.requester_id)
+                and (policy.dispatch_window_open() if require_dispatch_window
+                     else campaign_contract.utc_now() < policy.expires_at))
 
     def _run(self):
         try:
@@ -58,10 +59,11 @@ class ManagedAssistant:
                 raise RuntimeError('assistant_shutdown_unresolved')
 
 
-def available_core(app, actor):
+def available_core(app, actor, *, require_dispatch_window=True):
     core = getattr(app.state, 'assistant_core', None)
     host = getattr(app.state, 'assistant_host', None)
-    if host is not None and (type(host) is not ManagedAssistant or host.core is not core or not host.accepts(actor)):
+    if host is not None and (type(host) is not ManagedAssistant or host.core is not core
+                             or not host.accepts(actor, require_dispatch_window=require_dispatch_window)):
         return None
     return core if type(core) is DshCoreAdapter else None
 
@@ -74,7 +76,7 @@ def intake_work_policy(app, session, actor):
     host = getattr(app.state, 'assistant_host', None)
     if type(host) is not ManagedAssistant or not host.config.work_authority_enabled:
         return None
-    if not host.accepts(actor):
+    if not host.accepts(actor, require_dispatch_window=False):
         raise ValueError('assistant_host_unavailable')
     permissions, _ = resolve_effective_capabilities(session, actor)
     allowed=DEFAULT_CAPABILITIES
@@ -94,11 +96,11 @@ def intake_work_policy(app, session, actor):
         tuple(sorted(allowed.intersection(permissions))))
 
 
-def available_turn_core(app,actor):
+def available_turn_core(app,actor,*,require_dispatch_window=True):
     """Unlike legacy intake, followups require an actually running managed Host."""
     host=getattr(app.state,'assistant_host',None)
     if (type(host) is not ManagedAssistant or not host.config.work_authority_enabled
-            or available_core(app,actor) is None):return None
+            or available_core(app,actor,require_dispatch_window=require_dispatch_window) is None):return None
     return host.config.turns
 
 
@@ -113,12 +115,14 @@ def inbox_enabled(app, actor):
 def available_inbox_policy(app, session, actor):
     from backend.app.modules.assistant.authority import WorkAuthorityPolicy
     from backend.app.modules.assistant.inbox import REQUIRED
-    if not inbox_enabled(app, actor) or available_turn_core(app, actor) is None: return None
+    # Inbox receipts are distinct from direct dispatch intake.
+    if (not inbox_enabled(app, actor)
+            or available_turn_core(app, actor, require_dispatch_window=False) is None):return None
     host = app.state.assistant_host
     current = intake_work_policy(app, session, actor)
     permissions = tuple(sorted(set(current.permissions).intersection(host.config.inbox_policy.permissions)))
     expiry = min(current.expires_at, host.config.inbox_policy.expires_at)
-    if not REQUIRED <= set(permissions) or datetime.now(timezone.utc) >= expiry: return None
+    if not REQUIRED <= set(permissions) or campaign_contract.utc_now() >= expiry: return None
     return WorkAuthorityPolicy(expiry, permissions)
 
 
@@ -127,5 +131,21 @@ def unavailable_reason(app, actor):
     if type(host) is ManagedAssistant:
         policy = host.config.online_policy
         if (actor.organization_id,actor.store_id,actor.subject_id) == (policy.organization_id,policy.store_id,policy.requester_id):
-            if datetime.now(timezone.utc) >= policy.expires_at: return 'trial_expired'
+            if campaign_contract.utc_now() >= policy.expires_at: return 'trial_expired'
     return 'unavailable'
+
+
+def workspace_context_available(app, actor):
+    """Host readiness only, never a grant for a specific thread/kind/operation."""
+    host = getattr(app.state, 'assistant_host', None)
+    if (type(host) is not ManagedAssistant or not host.accepts(actor)
+            or not host.config.work_authority_enabled
+            or getattr(host.config, 'tool_profile', None) != 'pi-workbench-v1'):
+        return False
+    from backend.app.modules.agents.tool_registry import resolve_tool, ToolRegistryError
+    try:
+        for operation in ('read', 'create', 'patch'):
+            resolve_tool('artifact.' + operation, '1')
+    except ToolRegistryError:
+        return False
+    return True

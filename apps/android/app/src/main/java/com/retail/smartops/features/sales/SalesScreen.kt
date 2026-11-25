@@ -10,8 +10,11 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -27,9 +30,15 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -43,6 +52,7 @@ fun SalesScreen(
 ) {
     val state by viewModel.state.collectAsState()
     val scrollState = rememberScrollState()
+    var archiveOpen by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -68,11 +78,10 @@ fun SalesScreen(
                         fontWeight = FontWeight.Bold,
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (state.stage == "ready") Text("本机已确认 · 本次未发送")
+                        else StatusBadge(status = StatusKind.WAITING)
                         StatusBadge(
-                            status = if (state.stage == "ready") StatusKind.FACT else StatusKind.WAITING,
-                        )
-                        StatusBadge(
-                            status = if (state.status == "paid") StatusKind.SETTLED else StatusKind.UNVERIFIED,
+                            status = if (state.handoff?.isSettled == true) StatusKind.SETTLED else StatusKind.UNVERIFIED,
                         )
                     }
                 }
@@ -85,7 +94,7 @@ fun SalesScreen(
                 if (state.syncState == "pending_sync") {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "● 离线暂存（待恢复联机后同步）",
+                        text = "● 本机暂存；不会自动发起交接",
                         style = MaterialTheme.typography.bodySmall,
                         color = Color(0xFFD97706),
                         fontWeight = FontWeight.Medium,
@@ -199,6 +208,52 @@ fun SalesScreen(
             }
         }
 
+        when (state.saveStatus) {
+            DraftSaveStatus.SAVING -> Text("正在保存本机草稿…")
+            DraftSaveStatus.SAVED -> Text("已保存本机草稿")
+            DraftSaveStatus.FAILED -> OutlinedButton(
+                onClick = viewModel::retryLocalSave,
+                enabled = !state.isOpeningDraft,
+            ) { Text("重试保存") }
+            DraftSaveStatus.READ_ONLY -> Text("原草稿只读，保留原件及原意图。")
+            DraftSaveStatus.EMPTY -> Unit
+        }
+        OutlinedButton(
+            onClick = { archiveOpen = !archiveOpen; if (archiveOpen) viewModel.refreshSavedDrafts() },
+            enabled = !state.isOpeningDraft,
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text(if (archiveOpen) "收起本机草稿" else "打开本机已存草稿") }
+        if (archiveOpen) {
+            val archive = state.archive
+            val feedback = when (archive) {
+                SalesDraftArchive.Idle -> null
+                SalesDraftArchive.Loading -> "正在读取本机草稿…"
+                SalesDraftArchive.Failed -> "无法读取本机草稿。"
+                is SalesDraftArchive.Loaded -> if (archive.drafts.isEmpty()) {
+                    "此员工在本门店暂无已存草稿。"
+                } else "已读取 ${archive.drafts.size} 份本机草稿。"
+            }
+            feedback?.let {
+                Text(it, modifier = Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite })
+            }
+            if (archive == SalesDraftArchive.Failed) {
+                OutlinedButton(onClick = viewModel::refreshSavedDrafts, modifier = Modifier.fillMaxWidth()) {
+                    Text("重试读取本机草稿")
+                }
+            }
+            if (archive is SalesDraftArchive.Loaded && archive.drafts.isNotEmpty()) {
+                LazyColumn(Modifier.heightIn(max = 220.dp)) {
+                    items(archive.drafts, key = { it.id }) { saved ->
+                        OutlinedButton(
+                            onClick = { viewModel.reopenDraft(saved.id) },
+                            enabled = saved.id != state.draftId && !state.isOpeningDraft && !state.isLoading,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("打开草稿 ${saved.id.take(16)}") }
+                    }
+                }
+            }
+        }
+
         // 6. Cart Line Items Section
         Text(
             text = "已确认明细 (${state.lines.size} 项)",
@@ -243,7 +298,7 @@ fun SalesScreen(
                                 fontWeight = FontWeight.Bold,
                             )
                             Text(
-                                text = "¥%.2f".format(line.lineSubtotal),
+                                text = "¥${formatDraftMoney(line.exactSubtotal)}",
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.primary,
@@ -251,7 +306,11 @@ fun SalesScreen(
                         }
                         Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            text = "编码: ${line.productId} · 单价: ¥%.2f / ${line.packagingUnit}".format(line.unitPrice),
+                            text = "商品 ID: ${line.productId} · 单价: ¥${line.unitPriceText} / ${line.packagingUnit}（${when (line.unitSource) {
+                                DraftUnitSource.CATALOG -> "目录来源"
+                                DraftUnitSource.OPERATOR -> "人工填报"
+                                null -> "单位待核"
+                            }}）",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -266,17 +325,17 @@ fun SalesScreen(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
                                 OutlinedButton(
-                                    onClick = { viewModel.updateLineQuantity(line.lineKey, line.quantity - 1.0) },
+                                    onClick = { viewModel.adjustLineQuantity(line.lineKey, -1) },
                                 ) {
                                     Text("-")
                                 }
                                 Text(
-                                    text = "%.2f".format(line.quantity).trimEnd('0').trimEnd('.'),
+                                    text = formatDraftQuantity(line.quantity),
                                     style = MaterialTheme.typography.bodyLarge,
                                     fontWeight = FontWeight.SemiBold,
                                 )
                                 OutlinedButton(
-                                    onClick = { viewModel.updateLineQuantity(line.lineKey, line.quantity + 1.0) },
+                                    onClick = { viewModel.adjustLineQuantity(line.lineKey, 1) },
                                 ) {
                                     Text("+")
                                 }
@@ -307,11 +366,11 @@ fun SalesScreen(
             ) {
                 Column {
                     Text(
-                        text = "合计数量: %.2f（不同单位请分行核对）".format(state.totalQuantity),
+                        text = "数量及单位以各商品行为准，不合并不同口径。",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Text(
-                        text = "应收总计: ¥%.2f".format(state.totalAmount),
+                        text = "本机估算合计: ¥${formatDraftMoney(state.totalAmount)}",
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onPrimaryContainer,
@@ -339,11 +398,11 @@ fun SalesScreen(
                     Text("商品 ID: ${selected.productId} · 原码: ${selected.externalCode}")
                     Text("来源声明: ${selected.sourceSystem} · 版本: ${selected.sourceVersion}")
                     Text("仅人工选品；此处未核验报价，数量和单价需明确填写。", style = MaterialTheme.typography.bodySmall)
-                    val sourceUnit = selected.unit?.takeIf { it.isNotBlank() }
+                    val sourceUnit = state.catalogSalesUnit
                     if (sourceUnit != null) {
                         Text("来源单位: $sourceUnit")
                     } else {
-                        Text("来源未提供单位，请人工填写并在加入时确认。", color = MaterialTheme.colorScheme.error)
+                        Text("来源未提供可用单位，请人工填写并在加入时确认。", color = MaterialTheme.colorScheme.error)
                         OutlinedTextField(
                             value = state.manualUnitInput,
                             onValueChange = viewModel::updatePendingUnit,
@@ -385,24 +444,27 @@ fun SalesScreen(
         ) {
             OutlinedButton(
                 onClick = { viewModel.newDraft() },
+                enabled = !state.isOpeningDraft && !state.isLoading,
                 modifier = Modifier.weight(1f),
             ) {
                 Text("新建草稿")
             }
             Button(
                 onClick = { viewModel.markReady() },
-                enabled = state.stage == "draft" && state.lines.isNotEmpty(),
+                enabled = state.stage == "draft" && state.lines.isNotEmpty() &&
+                    !state.isOpeningDraft && !state.submissionLocked,
                 modifier = Modifier.weight(1f),
             ) {
-                Text("确认就绪")
+                Text("确认本机草稿")
             }
             Button(
                 onClick = { viewModel.submitHandoff() },
-                enabled = state.stage == "ready" && state.lines.isNotEmpty(),
+                enabled = state.lines.isNotEmpty() && !state.isOpeningDraft && !state.isLoading &&
+                    state.saveStatus in setOf(DraftSaveStatus.SAVED, DraftSaveStatus.READ_ONLY),
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                 modifier = Modifier.weight(1f),
             ) {
-                Text("发起交接")
+                Text("查看交接限制")
             }
         }
 

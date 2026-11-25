@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
-import json
 import re
 from typing import Any
 from uuid import uuid4
@@ -28,8 +27,6 @@ from backend.app.modules.agents.models import (
     AgentToolCall,
     SkillVersion,
 )
-from backend.app.modules.agents.skill_service import create_draft
-from backend.app.modules.audit.service import record_event
 from backend.app.modules.identity.models import Subject
 from backend.app.modules.identity.service import authorize_scope
 from backend.app.modules.memory.models import PersonalMemory
@@ -409,48 +406,4 @@ def propose_skill_draft_from_pattern(
             )
 
     _revalidate_pattern_sources(session, actor, pattern, current)
-    spec = generate_skill_spec(pattern, prompt_template=prompt_template)
-    canonical_json = json.dumps(spec, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    spec_sha256 = sha256(canonical_json.encode("utf-8")).hexdigest()
-
-    # Call SKL-001 create_draft: creates SkillVersion in 'draft' state
-    draft_result = create_draft(
-        session,
-        actor,
-        skill_key=pattern.suggested_skill_key,
-        release_tag=release_tag,
-        provider_key=provider_key,
-        model=model,
-        prompt_version=prompt_version,
-        toolset_version=toolset_version,
-        spec_sha256=spec_sha256,
-        reason=reason,
-        request_id=request_id,
-        now=current,
-    )
-
-    record_event(
-        session,
-        actor_id=actor.subject_id,
-        organization_id=actor.organization_id,
-        store_id=actor.store_id,
-        action="skill.pattern_draft_proposed",
-        target_type="skill_version",
-        target_id=draft_result["skill_id"],
-        idempotency_key=f"propose-pat:{request_id}",
-        occurred_at=current,
-        details={
-            "pattern_id": pattern.pattern_id,
-            "tool_sequence": pattern.tool_sequence,
-            "frequency": pattern.frequency,
-            "spec_sha256": spec_sha256,
-            "eval_cases_count": len(spec["eval_cases"]),
-        },
-    )
-
-    return {
-        **draft_result,
-        "pattern_id": pattern.pattern_id,
-        "spec_sha256": spec_sha256,
-        "eval_cases": spec["eval_cases"],
-    }
+    raise PatternDiscoveryError("pattern_business_outcome_unverified")

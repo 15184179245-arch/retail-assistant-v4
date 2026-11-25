@@ -58,7 +58,12 @@ def reconcile_archived_response(*, session_factory, machine_token, directory,
             organization_id=organization_id, store_id=store_id, run_id=run_id,
             model_step_id=model_step_id, request_sha256=request_sha256,
             response_sha256=response_sha256)
-        source = receipt.wire_protocol == 'v4.pi-source/2'
+        # Workbench rides the source level of the admission lattice
+        # (WorkbenchPeer: online+memory+discovery+source all true). Static-dict
+        # recovery therefore authenticates text, tool_search, memory and source
+        # tool calls; artifact-call recovery would need the admitted-schemas
+        # path, which no current campaign envelope exercises.
+        source = receipt.wire_protocol in ('v4.pi-source/2', 'v4.pi-workbench/2')
         discovery = source or receipt.wire_protocol == 'v4.pi-discovery/2'
         memory = discovery or receipt.wire_protocol == 'v4.pi-memory/2'
         if discovery and envelope['mode'] != 'real-assistant-trial':

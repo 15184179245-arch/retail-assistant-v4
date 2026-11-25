@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 from backend.app.core.errors import ApiEnvelope
 
@@ -52,6 +52,13 @@ class TaskAssignment(BaseModel):
     reason: str = Field(min_length=1, max_length=4000)
 
 
+def _stored_task_time_json(value, handler):
+    # Task writers normalize to UTC; SQLite's result type drops the offset.
+    if value is not None and value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return handler(value)
+
+
 class TaskResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", from_attributes=True)
     id: str
@@ -81,6 +88,11 @@ class TaskResponse(BaseModel):
     close_reason: str | None
     created_at: datetime
 
+    _json_times = field_serializer(
+        "accepted_at", "assigned_at", "due_at", "started_at", "verified_at", "closed_at", "created_at",
+        mode="wrap", when_used="json",
+    )(_stored_task_time_json)
+
 
 class TaskEventResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", from_attributes=True)
@@ -96,6 +108,10 @@ class TaskEventResponse(BaseModel):
     due_at: datetime | None
     reason: str
     occurred_at: datetime
+
+    _json_times = field_serializer("due_at", "occurred_at", mode="wrap", when_used="json")(
+        _stored_task_time_json,
+    )
 
 
 class TaskEnvelope(ApiEnvelope):

@@ -86,8 +86,7 @@ def _leaves(events: list[StocktakeObservation]) -> list[tuple[StocktakeObservati
             raise HTTPException(409, "stocktake_correction_chain_invalid")
         parent = by_id[event.supersedes_id]
         if (parent.event_seq >= event.event_seq or
-                (parent.product_id, parent.location_id, parent.unit) !=
-                (event.product_id, event.location_id, event.unit) or
+                not existing._same_correction_target(parent, event) or
                 event.supersedes_id in children):
             raise HTTPException(409, "stocktake_correction_chain_ambiguous")
         children[event.supersedes_id] = event.id
@@ -117,7 +116,7 @@ def review_preview(session: Session, actor: AuthenticatedSubject, sid: str) -> d
     active = _leaves(_rows(session, actor, sid))
     lines = []
     totals = defaultdict(Decimal)
-    units = defaultdict(list)
+    grouped = defaultdict(list)
     for event, chain in active:
         quantity = Decimal(event.quantity)
         if not quantity.is_finite() or quantity < 0:
@@ -155,24 +154,23 @@ def review_preview(session: Session, actor: AuthenticatedSubject, sid: str) -> d
         lines.append(line)
         if event.product_id is not None and event.location_id is not None:
             group_key = (event.product_id, event.location_id)
-            units[group_key].append(event.unit)
+            grouped[group_key].append(line)
             if normalized is not None:
                 totals[group_key] += normalized
     # Incomplete group cannot expose a seemingly authoritative total. Units
     # kg/meter and boxes without evidence remain raw lines only.
     summary = []
-    for (product, location), grouped_units in sorted(units.items()):
-        own = [line for line in lines if (line["product_id"], line["location_id"]) ==
-               (product, location)]
-        complete = all(line["normalized_piece_quantity"] is not None for line in own)
+    for (product, location), own in sorted(grouped.items()):
+        incomplete = [line["conversion_status"] for line in own
+                      if line["normalized_piece_quantity"] is None]
+        complete = not incomplete
         summary.append({
             "product_id": product, "location_id": location,
             "normalized_piece_quantity": format(totals[(product, location)], "f") if complete else None,
             "unit": "piece" if complete else None,
             "conversion_complete": complete,
             "observation_ids": [line["observation_id"] for line in own],
-            "incomplete_reasons": [line["conversion_status"] for line in own
-                                   if line["normalized_piece_quantity"] is None],
+            "incomplete_reasons": incomplete,
         })
     decisions = _receipts(session, actor, sid, "review.decide")
     return {
@@ -228,6 +226,15 @@ def verify_conversion(session: Session, actor: AuthenticatedSubject, sid: str,
                 old_end = aware_utc(datetime.fromisoformat(receipt["expires_at"]))
                 if start < old_end and old_start < expiry:
                     raise HTTPException(409, "stocktake_conversion_overlap")
+        # Independence is required for the active observations this new
+        # receipt could normalize, not merely for the person who opened the session.
+        if any(event.observed_by == actor.subject_id
+               and event.product_id == data.product_id
+               and event.location_id is not None
+               and event.unit == data.source_unit
+               and start <= aware_utc(event.observed_at) < expiry
+               for event, _ in _leaves(_rows(session, actor, sid))):
+            raise HTTPException(403, "stocktake_independent_reviewer_required")
         new_version = _session_version_cas(session, actor, sid,
                                            data.expected_session_version)
         receipt_id = str(uuid4())

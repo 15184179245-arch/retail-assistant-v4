@@ -47,8 +47,8 @@ from backend.app.modules.agents.schemas import (
 )
 from backend.app.modules.agents.tool_registry import (
     ToolRegistryError, invoke_tool, legacy_code_tool, model_tool_descriptions, resolve_tool,
-    toolset_digest, verify_toolset_digest, PI_READONLY_PROFILE, PI_PROFILES,
-    freeze_pi_binding, pi_binding_digest,
+    toolset_digest, verify_toolset_digest, PI_READONLY_PROFILE, PI_PROFILES, PI_ALL_PROFILES,
+    freeze_pi_binding, pi_binding_digest, PI_WORKBENCH_PROFILE, GUANJIA_CATEGORY_TOOLS,
 )
 from backend.app.modules.audit.service import record_event
 from backend.app.modules.audit.repository import get_by_idempotency_key
@@ -643,7 +643,7 @@ def cancel_run(session: Session, actor: AuthenticatedSubject, run_id: str) -> di
 
 
 def _decode_decision(text: str) -> dict:
-    if not isinstance(text, str) or not 1 <= len(text.encode("utf-8")) <= 16_384:
+    if not isinstance(text, str):
         raise AgentRuntimeError("agent_decision_invalid")
 
     def pairs(items: list[tuple[str, object]]) -> dict:
@@ -655,8 +655,21 @@ def _decode_decision(text: str) -> dict:
         return result
 
     try:
+        if not 1 <= len(text.encode("utf-8")) <= 16_384:
+            raise ValueError
         data = json.loads(text, object_pairs_hook=pairs,
                           parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()))
+        # JSON escapes can decode to strings that are not valid UTF-8.
+        pending = [data]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, str):
+                value.encode("utf-8")
+            elif isinstance(value, dict):
+                pending.extend(value)
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
     except (ValueError, TypeError, RecursionError):
         raise AgentRuntimeError("agent_decision_invalid") from None
     if not isinstance(data, dict):
@@ -765,13 +778,19 @@ def _transition(session: Session, run: AgentRun, state: RunState) -> AgentRun:
 
 
 def _fail_run(session: Session, actor: AuthenticatedSubject,
-              run: AgentRun, code: str) -> dict:
+              run: AgentRun, code: str, *, failed_step: AgentStep | None = None) -> dict:
     run = get_run(session, run.organization_id, run.store_id, run.id)
     if run is None:
         raise AgentRuntimeError("agent_conflict", 409)
     if run.state not in (RunState.CREATED.value, RunState.RUNNING.value):
         return _state_result(run, replayed=True)
     try:
+        if failed_step is not None:
+            # Only the caller-owned, known-denied step is closed. Keep this and
+            # the Run terminal transition in one transaction; unknown effects
+            # retain their separate recovery path.
+            run = _finish_step(session, actor, run, failed_step,
+                StepTransition(to_state=StepState.FAILED, error_code=code), commit=False)
         run = _transition(session, run, RunState.FAILED)
         _audit(session, actor, run.id, "agent_run.failed", code)
         session.commit()
@@ -798,15 +817,56 @@ def _start_step(session: Session, run: AgentRun, kind: StepKind,
 
 
 def _finish_step(session: Session, actor: AuthenticatedSubject,
-                 run: AgentRun, step: AgentStep, change: StepTransition) -> AgentRun:
+                 run: AgentRun, step: AgentStep, change: StepTransition,
+                 *, commit: bool = True) -> AgentRun:
     transition_step(session, organization_id=run.organization_id,
         store_id=run.store_id, run_id=run.id, step_id=step.id,
         expected_run_version=run.version, expected_step_version=step.version,
         change=change)
     _audit(session, actor, run.id, f"agent_step.{step.id}.{change.to_state.value}",
            change.error_code or "ok")
-    session.commit()
+    if commit:
+        session.commit()
     return get_run(session, run.organization_id, run.store_id, run.id)
+
+
+def _close_inline_memory_timeout(session, actor, root, scope, run_id, run_version,
+                                 step_id, step_version):
+    # A released memory savepoint has not finished the caller-owned root.
+    # Never write timeout metadata into that effect root or retry the call.
+    if (root is None or session.get_transaction() is not root
+            or not root.is_active or session.in_nested_transaction()):
+        raise AgentRuntimeError("agent_conflict", 409)
+    try:
+        session.rollback()
+    except Exception:
+        raise AgentRuntimeError("agent_conflict", 409) from None
+    if session.in_transaction() or scope != (actor.organization_id, actor.store_id, actor.subject_id):
+        raise AgentRuntimeError("agent_conflict", 409)
+
+    organization_id, store_id, requester_id = scope
+    _human_guard(session, actor)
+    run = get_run(session, organization_id, store_id, run_id)
+    if (run is None or (run.requester_id, run.version, run.state) !=
+            (requester_id, run_version, RunState.RUNNING.value)
+            or execution_for(session, organization_id, store_id, run_id) is not None):
+        raise AgentRuntimeError("agent_conflict", 409)
+    step = session.scalar(select(AgentStep).where(
+        AgentStep.organization_id == organization_id, AgentStep.store_id == store_id,
+        AgentStep.run_id == run_id, AgentStep.id == step_id,
+    ).execution_options(populate_existing=True))
+    if (step is None or (step.version, step.state, step.kind) !=
+            (step_version, StepState.RUNNING.value, StepKind.TOOL.value)):
+        raise AgentRuntimeError("agent_conflict", 409)
+
+    code = "agent_tool_timeout"
+    try:
+        run = _finish_step(session, actor, run, step, StepTransition(
+            to_state=StepState.UNKNOWN, error_code=code), commit=False)
+    except AgentPersistenceError as error:
+        session.rollback()
+        raise AgentRuntimeError("agent_conflict", 409) from error
+    return _fail_run(session, actor, run, code)
 
 
 def _worker_queued_receipt(session: Session, actor: AuthenticatedSubject,
@@ -815,6 +875,27 @@ def _worker_queued_receipt(session: Session, actor: AuthenticatedSubject,
     result = read_run_receipt(session, actor, run.id, _public_trace=False)
     result["replayed"] = replayed
     return result
+
+
+def _validate_approved_tool(session, actor, run, confirmation):
+    if not supported_prompt(run):
+        raise AgentRuntimeError("agent_prompt_version_unsupported", 409)
+    try:
+        definition = resolve_tool(confirmation.tool_key,
+                                  confirmation.tool_version,
+                                  store_id=run.store_id)
+    except ToolRegistryError:
+        raise AgentRuntimeError("agent_confirmation_conflict", 409) from None
+    if definition.mode != "write":
+        raise AgentRuntimeError("agent_confirmation_conflict", 409)
+    agent = _agent_actor(session, actor, actor.auth_expires_at)
+    authorize_scope(session, actor, organization_id=run.organization_id,
+                    store_id=run.store_id, permission=definition.requester_permission)
+    authorize_scope(session, agent, organization_id=run.organization_id,
+                    store_id=run.store_id, permission=definition.agent_permission)
+    if _digest(_canonical(confirmation.arguments)) != confirmation.input_digest:
+        raise AgentRuntimeError("agent_confirmation_conflict", 409)
+    return definition, agent
 
 
 def _decide_worker_confirmation(session: Session, actor: AuthenticatedSubject,
@@ -859,11 +940,18 @@ def _decide_worker_confirmation(session: Session, actor: AuthenticatedSubject,
         result["task_id"] = confirmation.result_task_id
         return result
     if confirmation.state == "rejected" and decision == "reject":
-        # Only a real human rejection replays, keeping its original reason and
-        # writing nothing (no audit, no version bump). A cancellation also
-        # rejects the pending row, and that must never be mistaken for this
-        # employee's own decision.
-        if confirmation.decision_reason == "requester_cancelled":
+        # Cancellation also rejects the pending row. Only the scoped original
+        # manual decision's audit, never caller-supplied reason text, proves replay.
+        if ((run.organization_id, run.store_id, run.requester_id)
+                != (actor.organization_id, actor.store_id, actor.subject_id)
+                or confirmation.requester_id != actor.subject_id):
+            raise AgentRuntimeError("agent_confirmation_conflict", 409)
+        action = "agent_confirmation.rejected"
+        rejection = get_by_idempotency_key(session, run.organization_id, run.store_id,
+            f"agent_run:{run.id}:{action}")
+        if (rejection is None or rejection.details != {"code": "worker_v2"}
+                or (rejection.actor_id, rejection.action, rejection.target_type, rejection.target_id)
+                != (actor.subject_id, action, "agent_run", run.id)):
             raise AgentRuntimeError("agent_confirmation_conflict", 409)
         result = read_run_receipt(session, actor, run.id, _public_trace=False)
         result["replayed"] = True
@@ -900,23 +988,7 @@ def _decide_worker_confirmation(session: Session, actor: AuthenticatedSubject,
             session.rollback()
             raise AgentRuntimeError("agent_conflict", 409) from exc
         return _command_receipt(session, actor, run.id)
-    if not supported_prompt(run):
-        raise AgentRuntimeError("agent_prompt_version_unsupported", 409)
-    try:
-        definition = resolve_tool(confirmation.tool_key,
-                                  confirmation.tool_version,
-                                  store_id=run.store_id)
-    except ToolRegistryError:
-        raise AgentRuntimeError("agent_confirmation_conflict", 409) from None
-    if definition.mode != "write":
-        raise AgentRuntimeError("agent_confirmation_conflict", 409)
-    agent = _agent_actor(session, actor, actor.auth_expires_at)
-    authorize_scope(session, actor, organization_id=run.organization_id,
-                    store_id=run.store_id, permission=definition.requester_permission)
-    authorize_scope(session, agent, organization_id=run.organization_id,
-                    store_id=run.store_id, permission=definition.agent_permission)
-    if _digest(_canonical(confirmation.arguments)) != confirmation.input_digest:
-        raise AgentRuntimeError("agent_confirmation_conflict", 409)
+    _validate_approved_tool(session, actor, run, confirmation)
     context = control.frozen_context
     evidence = context.get("evidence") if isinstance(context, dict) else None
     valid_sources, _ = answer_receipts.validate_evidence(session, actor, evidence)
@@ -1018,23 +1090,7 @@ def decide_confirmation(session: Session, actor: AuthenticatedSubject, run_id: s
             session.rollback()
             raise AgentRuntimeError("agent_confirmation_conflict", 409) from exc
         return _state_result(run)
-    if not supported_prompt(run):
-        raise AgentRuntimeError("agent_prompt_version_unsupported", 409)
-    try:
-        definition = resolve_tool(confirmation.tool_key,
-                                  confirmation.tool_version,
-                                  store_id=run.store_id)
-    except ToolRegistryError:
-        raise AgentRuntimeError("agent_confirmation_conflict", 409) from None
-    if definition.mode != "write":
-        raise AgentRuntimeError("agent_confirmation_conflict", 409)
-    agent = _agent_actor(session, actor, actor.auth_expires_at)
-    authorize_scope(session, actor, organization_id=run.organization_id,
-                    store_id=run.store_id, permission=definition.requester_permission)
-    authorize_scope(session, agent, organization_id=run.organization_id,
-                    store_id=run.store_id, permission=definition.agent_permission)
-    if _digest(_canonical(confirmation.arguments)) != confirmation.input_digest:
-        raise AgentRuntimeError("agent_confirmation_conflict", 409)
+    definition, agent = _validate_approved_tool(session, actor, run, confirmation)
     # B0: policy refusal is not a human rejection and cannot fail a pending Step.
     with session.no_autoflush:
         if skill_service.runtime_pin(session, run) is not None:
@@ -1281,336 +1337,352 @@ async def create_and_execute(session: Session, actor: AuthenticatedSubject,
             choice["binding"]["skill_key"] if choice is not None else selection_reason))
     run = _transition(session, run, RunState.RUNNING)
     session.commit()
-    _CANCEL_EVENTS[run.id] = threading.Event()
-    if not supported_prompt(run):
-        return _fail_run(session, actor, run, "agent_prompt_version_unsupported")
+    cancel_event = threading.Event()
     try:
-        provider = _provider_factory()
-    except ProviderError as exc:
-        return _fail_run(session, actor, run, exc.code)
-    # A real network adapter must use the identity frozen in this Run, even
-    # if deployment configuration changed between submission and dispatch.
-    if isinstance(provider, ChatCompletionsProvider) and provider.config.model != run.model:
-        return _fail_run(session, actor, run, "agent_provider_configuration_invalid")
-
-    tool_result: dict | None = None
-    skill_prompt = ({
-        "skill_key": choice["binding"]["skill_key"],
-        "release_tag": choice["binding"]["release_tag"],
-        "spec_sha256": choice["binding"]["spec_sha256"],
-        "instruction": choice["instruction"],
-    } if choice is not None else None)
-    sequence_no = 1
-    while sequence_no <= run.max_steps:
-        if _cancelled(run_id):
-            run = _cancel_active_run(session, actor, run)
-            return _state_result(run)
-        run = get_run(session, actor.organization_id, actor.store_id, run_id)
-        if run is None or run.state != RunState.RUNNING.value:
-            raise AgentRuntimeError("agent_conflict", 409)
-        if choice is None:
-            try:
-                _verify_ordinary_toolset(session, actor, agent, run)
-            except ToolRegistryError as exc:
-                return _fail_run(session, actor, run, exc.code)
+        _CANCEL_EVENTS[run_id] = cancel_event
         if not supported_prompt(run):
             return _fail_run(session, actor, run, "agent_prompt_version_unsupported")
-        if _now() >= _utc(run.deadline_at):
-            return _fail_run(session, actor, run, "agent_deadline_exceeded")
-        steps = list_steps(session, actor.organization_id, actor.store_id, run.id)
-        if sum(s.kind == StepKind.MODEL.value for s in steps) >= run.max_model_calls:
-            return _fail_run(session, actor, run, "agent_budget_exceeded")
-        remaining_in = run.max_input_tokens - sum(s.input_tokens or 0 for s in steps)
-        remaining_out = run.max_output_tokens - sum(s.output_tokens or 0 for s in steps)
-        if remaining_in <= 0 or remaining_out <= 0:
-            return _fail_run(session, actor, run, "agent_budget_exceeded")
-        if choice is not None:
-            try:
-                skill_service.verify_runtime_binding(session, actor, agent, run)
-            except (skill_service.SkillReleaseError, HTTPException):
-                return _fail_run(session, actor, run, "skill_runtime_revoked")
         try:
-            remaining_in = input_capacity(run.model, output_tokens=remaining_out,
-                                          remaining_input=remaining_in)
-            prompt_text = fit_prompt(
-                lambda history: _prompt(text, tool_result, history,
-                    tool_descriptions, approved_skill=skill_prompt),
-                None if choice is not None else context, remaining_in)
-        except ModelContextError as exc:
-            return _fail_run(session, actor, run, exc.code)
-        try:
-            run, step = _start_step(session, run, StepKind.MODEL, sequence_no,
-                                    input_ref="sha256:" + _digest(prompt_text))
-        except AgentPersistenceError as exc:
-            session.rollback()
-            return _fail_run(session, actor, run, exc.code)
-        # Reserve before the request leaves the process. Any configuration,
-        # budget or boundedness failure stops here with zero model calls.
-        try:
-            cost_ledger.reserve_cost(
-                session, actor, run, step,
-                max_input_tokens=remaining_in, max_output_tokens=remaining_out)
-        except cost_ledger.CostLedgerError as exc:
-            run = _finish_step(session, actor, run, step, StepTransition(
-                to_state=StepState.FAILED, error_code=exc.code))
-            return _fail_run(session, actor, run, exc.code)
-        if _cancelled(run_id):
-            # Explicit pre-call rejection is the only release path.
-            try:
-                cost_ledger.release_cost(session, actor, run, step,
-                                         reason="agent_request_cancelled")
-            except cost_ledger.CostLedgerError:
-                session.rollback()
-            run = _cancel_active_run(session, actor, run)
-            return _state_result(run)
-        run = get_run(session, actor.organization_id, actor.store_id, run_id)
-        if not supported_prompt(run):
-            cost_ledger.release_cost(session, actor, run, step,
-                                    reason="agent_prompt_version_unsupported")
-            run = _finish_step(session, actor, run, step, StepTransition(
-                to_state=StepState.FAILED, error_code="agent_prompt_version_unsupported"))
-            return _fail_run(session, actor, run, "agent_prompt_version_unsupported")
-        # A1: reservation is durable but this physical request has not left yet.
-        if choice is None:
-            try:
-                _verify_ordinary_toolset(session, actor, agent, run)
-            except ToolRegistryError as exc:
-                code = exc.code
-                try:
-                    cost_ledger.release_cost(session, actor, run, step, reason=code)
-                except cost_ledger.CostLedgerError as release_error:
-                    session.rollback()
-                    code = release_error.code
-                run = _finish_step(session, actor, run, step, StepTransition(
-                    to_state=StepState.FAILED, error_code=code))
-                return _fail_run(session, actor, run, code)
-        try:
-            response = await provider.complete(ProviderRequest(
-                organization_id=actor.organization_id, store_id=actor.store_id,
-                requester_id=actor.subject_id, task_id=run.id,
-                purpose="shop_assistant", input_text=prompt_text,
-                budget=CallBudget(remaining_in, remaining_out),
-                deadline_at=_utc(run.deadline_at)))
-            if not isinstance(response, ProviderResponse):
-                raise ProviderError("provider_invalid_response")
+            provider = _provider_factory()
         except ProviderError as exc:
-            if _cancelled(run_id):
-                try:
-                    cost_ledger.mark_cost_unknown(
-                        session, actor, run, step, reason="agent_request_cancelled")
-                except cost_ledger.CostLedgerError:
-                    session.rollback()
-                run = _cancel_active_run(session, actor, run)
-                return _state_result(run)
-            try:
-                if exc.input_tokens is not None and exc.output_tokens is not None:
-                    cost_ledger.settle_cost(session, actor, run, step,
-                        input_tokens=exc.input_tokens, output_tokens=exc.output_tokens)
-                else:
-                    cost_ledger.mark_cost_unknown(session, actor, run, step,
-                                                  reason=exc.code)
-            except cost_ledger.CostLedgerError:
-                session.rollback()
-            run = _finish_step(session, actor, run, step, StepTransition(
-                to_state=StepState.FAILED, error_code=exc.code,
-                input_tokens=exc.input_tokens, output_tokens=exc.output_tokens))
             return _fail_run(session, actor, run, exc.code)
-        except asyncio.CancelledError:
-            try:
-                cost_ledger.mark_cost_unknown(session, actor, run, step,
-                                              reason="agent_request_cancelled")
-            except cost_ledger.CostLedgerError:
-                session.rollback()
-            run = _finish_step(session, actor, run, step, StepTransition(
-                to_state=StepState.UNKNOWN, error_code="agent_request_cancelled"))
-            _fail_run(session, actor, run, "agent_request_cancelled")
-            raise
-        except Exception:
-            if _cancelled(run_id):
-                try:
-                    cost_ledger.mark_cost_unknown(
-                        session, actor, run, step, reason="agent_request_cancelled")
-                except cost_ledger.CostLedgerError:
-                    session.rollback()
-                run = _cancel_active_run(session, actor, run)
-                return _state_result(run)
-            try:
-                cost_ledger.mark_cost_unknown(session, actor, run, step,
-                                              reason="agent_provider_error")
-            except cost_ledger.CostLedgerError:
-                session.rollback()
-            run = _finish_step(session, actor, run, step, StepTransition(
-                to_state=StepState.FAILED, error_code="agent_provider_error"))
-            return _fail_run(session, actor, run, "agent_provider_error")
+        # A real network adapter must use the identity frozen in this Run, even
+        # if deployment configuration changed between submission and dispatch.
+        if isinstance(provider, ChatCompletionsProvider) and provider.config.model != run.model:
+            return _fail_run(session, actor, run, "agent_provider_configuration_invalid")
 
-        run = _finish_step(session, actor, run, step, StepTransition(
-            to_state=StepState.SUCCEEDED,
-            input_tokens=response.input_tokens, output_tokens=response.output_tokens,
-            output_ref="sha256:" + _digest(response.suggestion)))
-        try:
-            cost_ledger.settle_cost(session, actor, run, step,
-                input_tokens=response.input_tokens, output_tokens=response.output_tokens)
-        except cost_ledger.CostLedgerError as exc:
-            return _fail_run(session, actor, run, exc.code)
-        if _cancelled(run_id):
-            run = _cancel_active_run(session, actor, run)
-            return _state_result(run)
-        if response.input_tokens > remaining_in or response.output_tokens > remaining_out:
-            return _fail_run(session, actor, run, "agent_budget_exceeded")
-        if choice is None:
-            try:
-                _verify_ordinary_toolset(session, actor, agent, run)
-            except ToolRegistryError as exc:
-                return _fail_run(session, actor, run, exc.code)
-        if not supported_prompt(run):
-            return _fail_run(session, actor, run, "agent_prompt_version_unsupported")
-        if choice is not None:
-            try:
-                skill_service.verify_runtime_binding(session, actor, agent, run)
-            except (skill_service.SkillReleaseError, HTTPException):
-                return _fail_run(session, actor, run, "skill_runtime_revoked")
-        try:
-            decision = _decode_decision(response.suggestion)
-        except AgentRuntimeError as exc:
-            return _fail_run(session, actor, run, exc.code)
-        if decision["action"] == "final":
+        tool_result: dict | None = None
+        skill_prompt = ({
+            "skill_key": choice["binding"]["skill_key"],
+            "release_tag": choice["binding"]["release_tag"],
+            "spec_sha256": choice["binding"]["spec_sha256"],
+            "instruction": choice["instruction"],
+        } if choice is not None else None)
+        sequence_no = 1
+        while sequence_no <= run.max_steps:
+            if _cancelled(run_id):
+                run = _cancel_active_run(session, actor, run)
+                return _state_result(run)
+            run = get_run(session, actor.organization_id, actor.store_id, run_id)
+            if run is None or run.state != RunState.RUNNING.value:
+                raise AgentRuntimeError("agent_conflict", 409)
+            if choice is None:
+                try:
+                    _verify_ordinary_toolset(session, actor, agent, run)
+                except ToolRegistryError as exc:
+                    return _fail_run(session, actor, run, exc.code)
+            if not supported_prompt(run):
+                return _fail_run(session, actor, run, "agent_prompt_version_unsupported")
+            if _now() >= _utc(run.deadline_at):
+                return _fail_run(session, actor, run, "agent_deadline_exceeded")
+            steps = list_steps(session, actor.organization_id, actor.store_id, run.id)
+            if sum(s.kind == StepKind.MODEL.value for s in steps) >= run.max_model_calls:
+                return _fail_run(session, actor, run, "agent_budget_exceeded")
+            remaining_in = run.max_input_tokens - sum(s.input_tokens or 0 for s in steps)
+            remaining_out = run.max_output_tokens - sum(s.output_tokens or 0 for s in steps)
+            if remaining_in <= 0 or remaining_out <= 0:
+                return _fail_run(session, actor, run, "agent_budget_exceeded")
             if choice is not None:
                 try:
                     skill_service.verify_runtime_binding(session, actor, agent, run)
                 except (skill_service.SkillReleaseError, HTTPException):
                     return _fail_run(session, actor, run, "skill_runtime_revoked")
             try:
-                run = _transition(session, run, RunState.COMPLETED)
-                message = conversation_service.append_message(
-                    session, actor, conversation_id=conversation.id, role="assistant",
-                    content=decision["answer"], source_ref=f"run:{run.id}")
-                record_answer(session, run=run, message=message, evidence=evidence,
-                    own_evidence=own_tool_evidence)
-                _audit(session, actor, run.id, "agent_run.completed", "ok")
-                session.commit()
-            except Exception:
-                session.rollback()
-                raise
-            result = read_run_receipt(session, actor, run.id, _public_trace=False)
-            result["replayed"] = False
-            return result
-
-        tool_key, version, arguments = (decision["tool_key"],
-                                        decision["version"], decision["arguments"])
-        if not _IDENTIFIER.fullmatch(tool_key) or not _IDENTIFIER.fullmatch(version):
-            return _fail_run(session, actor, run, "agent_decision_invalid")
-        if legacy_code_tool(tool_key, version, store_id=actor.store_id):
-            return _fail_run(session, actor, run, "tool_legacy_code_execution_disabled")
-        try:
-            definition = resolve_tool(tool_key, version, store_id=actor.store_id)
-        except ToolRegistryError:
-            return _fail_run(session, actor, run, "tool_not_registered")
-        if choice is not None and (tool_key, version) not in choice["plan"].allowed_tools:
-            return _fail_run(session, actor, run, "skill_tool_not_allowed")
-        if sequence_no >= run.max_steps or sum(s.kind == StepKind.TOOL.value for s in steps) >= run.max_tool_calls:
-            return _fail_run(session, actor, run, "agent_budget_exceeded")
-        if _cancelled(run_id):
-            run = _cancel_active_run(session, actor, run)
-            return _state_result(run)
-        if definition is not None and definition.mode == "write" and definition.confirmation != "none":
+                remaining_in = input_capacity(run.model, output_tokens=remaining_out,
+                                              remaining_input=remaining_in)
+                prompt_text = fit_prompt(
+                    lambda history: _prompt(text, tool_result, history,
+                        tool_descriptions, approved_skill=skill_prompt),
+                    None if choice is not None else context, remaining_in)
+            except ModelContextError as exc:
+                return _fail_run(session, actor, run, exc.code)
             try:
-                validated = definition.input_model.model_validate(arguments)
-                arguments = validated.model_dump(mode="json")
-                authorize_scope(session, actor, organization_id=run.organization_id,
-                                store_id=run.store_id, permission=definition.requester_permission)
-                authorize_scope(session, agent, organization_id=run.organization_id,
-                                store_id=run.store_id, permission=definition.agent_permission)
-            except (ValidationError, HTTPException):
-                session.rollback()
-                return _fail_run(session, actor, run, "agent_tool_confirmation_denied")
-            if _cancelled(run_id):
-                run = _cancel_active_run(session, actor, run)
-                return _state_result(run)
-            call_key = f"{run.id}:{sequence_no + 1}"
-            digest = _digest(_canonical(arguments))
-            try:
-                step = append_step(session, StepCreate(id=str(uuid4()),
-                    organization_id=run.organization_id, store_id=run.store_id,
-                    run_id=run.id, sequence_no=sequence_no + 1, kind=StepKind.TOOL,
-                    tool_call=ToolCallCreate(id=str(uuid4()), tool_key=tool_key,
-                        tool_version=version, idempotency_key=call_key,
-                        input_digest=digest)), expected_run_version=run.version)
-                run = get_run(session, run.organization_id, run.store_id, run.id)
-                now = _now()
-                confirmation = create_confirmation(session, AgentConfirmation(
-                    run_id=run.id, organization_id=run.organization_id,
-                    store_id=run.store_id, step_id=step.id,
-                    requester_id=actor.subject_id, tool_key=tool_key,
-                    tool_version=version, arguments=arguments,
-                    input_digest=digest, state="pending", version=1,
-                    expires_at=now + timedelta(seconds=CONFIRMATION_SECONDS),
-                    created_at=now, updated_at=now))
-                run = _transition(session, run, RunState.WAITING_FOR_HUMAN)
-                _audit(session, actor, run.id, "agent_confirmation.requested", "pending")
-                session.commit()
+                run, step = _start_step(session, run, StepKind.MODEL, sequence_no,
+                                        input_ref="sha256:" + _digest(prompt_text))
             except AgentPersistenceError as exc:
                 session.rollback()
+                return _fail_run(session, actor, run, exc.code)
+            # Reserve before the request leaves the process. Any configuration,
+            # budget or boundedness failure stops here with zero model calls.
+            try:
+                cost_ledger.reserve_cost(
+                    session, actor, run, step,
+                    max_input_tokens=remaining_in, max_output_tokens=remaining_out)
+            except cost_ledger.CostLedgerError as exc:
+                run = _finish_step(session, actor, run, step, StepTransition(
+                    to_state=StepState.FAILED, error_code=exc.code))
+                return _fail_run(session, actor, run, exc.code)
+            if _cancelled(run_id):
+                # Explicit pre-call rejection is the only release path.
+                try:
+                    cost_ledger.release_cost(session, actor, run, step,
+                                             reason="agent_request_cancelled")
+                except cost_ledger.CostLedgerError:
+                    session.rollback()
+                run = _cancel_active_run(session, actor, run)
+                return _state_result(run)
+            run = get_run(session, actor.organization_id, actor.store_id, run_id)
+            if not supported_prompt(run):
+                cost_ledger.release_cost(session, actor, run, step,
+                                        reason="agent_prompt_version_unsupported")
+                run = _finish_step(session, actor, run, step, StepTransition(
+                    to_state=StepState.FAILED, error_code="agent_prompt_version_unsupported"))
+                return _fail_run(session, actor, run, "agent_prompt_version_unsupported")
+            # A1: reservation is durable but this physical request has not left yet.
+            if choice is None:
+                try:
+                    _verify_ordinary_toolset(session, actor, agent, run)
+                except ToolRegistryError as exc:
+                    code = exc.code
+                    try:
+                        cost_ledger.release_cost(session, actor, run, step, reason=code)
+                    except cost_ledger.CostLedgerError as release_error:
+                        session.rollback()
+                        code = release_error.code
+                    run = _finish_step(session, actor, run, step, StepTransition(
+                        to_state=StepState.FAILED, error_code=code))
+                    return _fail_run(session, actor, run, code)
+            try:
+                response = await provider.complete(ProviderRequest(
+                    organization_id=actor.organization_id, store_id=actor.store_id,
+                    requester_id=actor.subject_id, task_id=run.id,
+                    purpose="shop_assistant", input_text=prompt_text,
+                    budget=CallBudget(remaining_in, remaining_out),
+                    deadline_at=_utc(run.deadline_at)))
+                if not isinstance(response, ProviderResponse):
+                    raise ProviderError("provider_invalid_response")
+            except ProviderError as exc:
+                if _cancelled(run_id):
+                    try:
+                        cost_ledger.mark_cost_unknown(
+                            session, actor, run, step, reason="agent_request_cancelled")
+                    except cost_ledger.CostLedgerError:
+                        session.rollback()
+                    run = _cancel_active_run(session, actor, run)
+                    return _state_result(run)
+                try:
+                    if exc.input_tokens is not None and exc.output_tokens is not None:
+                        cost_ledger.settle_cost(session, actor, run, step,
+                            input_tokens=exc.input_tokens, output_tokens=exc.output_tokens)
+                    else:
+                        cost_ledger.mark_cost_unknown(session, actor, run, step,
+                                                      reason=exc.code)
+                except cost_ledger.CostLedgerError:
+                    session.rollback()
+                run = _finish_step(session, actor, run, step, StepTransition(
+                    to_state=StepState.FAILED, error_code=exc.code,
+                    input_tokens=exc.input_tokens, output_tokens=exc.output_tokens))
+                return _fail_run(session, actor, run, exc.code)
+            except asyncio.CancelledError:
+                try:
+                    cost_ledger.mark_cost_unknown(session, actor, run, step,
+                                                  reason="agent_request_cancelled")
+                except cost_ledger.CostLedgerError:
+                    session.rollback()
+                run = _finish_step(session, actor, run, step, StepTransition(
+                    to_state=StepState.UNKNOWN, error_code="agent_request_cancelled"))
+                _fail_run(session, actor, run, "agent_request_cancelled")
+                raise
+            except Exception:
+                if _cancelled(run_id):
+                    try:
+                        cost_ledger.mark_cost_unknown(
+                            session, actor, run, step, reason="agent_request_cancelled")
+                    except cost_ledger.CostLedgerError:
+                        session.rollback()
+                    run = _cancel_active_run(session, actor, run)
+                    return _state_result(run)
+                try:
+                    cost_ledger.mark_cost_unknown(session, actor, run, step,
+                                                  reason="agent_provider_error")
+                except cost_ledger.CostLedgerError:
+                    session.rollback()
+                run = _finish_step(session, actor, run, step, StepTransition(
+                    to_state=StepState.FAILED, error_code="agent_provider_error"))
+                return _fail_run(session, actor, run, "agent_provider_error")
+
+            run = _finish_step(session, actor, run, step, StepTransition(
+                to_state=StepState.SUCCEEDED,
+                input_tokens=response.input_tokens, output_tokens=response.output_tokens,
+                output_ref="sha256:" + _digest(response.suggestion)))
+            try:
+                cost_ledger.settle_cost(session, actor, run, step,
+                    input_tokens=response.input_tokens, output_tokens=response.output_tokens)
+            except cost_ledger.CostLedgerError as exc:
                 return _fail_run(session, actor, run, exc.code)
             if _cancelled(run_id):
                 run = _cancel_active_run(session, actor, run)
                 return _state_result(run)
-            return {**_state_result(run), "pending_action": _pending_payload(confirmation, run, step)}
-        call_key = f"{run.id}:{sequence_no + 1}"
-        call = ToolCallCreate(id=str(uuid4()), tool_key=tool_key,
-            tool_version=version, idempotency_key=call_key,
-            input_digest=_digest(_canonical(arguments)))
-        try:
-            run, step = _start_step(session, run, StepKind.TOOL,
-                                    sequence_no + 1, tool_call=call)
-        except AgentPersistenceError as exc:
-            session.rollback()
-            return _fail_run(session, actor, run, exc.code)
-        limit = definition.timeout_seconds
-        start = time.monotonic()
-        if _now() >= _utc(run.deadline_at):
-            run = _finish_step(session, actor, run, step, StepTransition(
-                to_state=StepState.UNKNOWN, error_code="agent_tool_timeout"))
-            return _fail_run(session, actor, run, "agent_tool_timeout")
-        if _cancelled(run_id):
-            run = _cancel_active_run(session, actor, run)
-            return _state_result(run)
-        try:
+            if response.input_tokens > remaining_in or response.output_tokens > remaining_out:
+                return _fail_run(session, actor, run, "agent_budget_exceeded")
             if choice is None:
-                # A3: the tool Step is committed; rejection must close that Step.
-                _verify_ordinary_toolset(session, actor, agent, run)
+                try:
+                    _verify_ordinary_toolset(session, actor, agent, run)
+                except ToolRegistryError as exc:
+                    return _fail_run(session, actor, run, exc.code)
+            if not supported_prompt(run):
+                return _fail_run(session, actor, run, "agent_prompt_version_unsupported")
             if choice is not None:
-                # The same platform tool gateway enforces grants on each call.
-                skill_service.verify_runtime_binding(session, actor, agent, run)
-            result = invoke_tool(session, requester=actor, agent=agent,
-                tool_key=tool_key, version=version, arguments=arguments,
-                idempotency_key=call_key if definition.idempotency == "required" else None)
-        except (skill_service.SkillReleaseError, HTTPException):
-            return _fail_run(session, actor, run, "skill_runtime_revoked")
-        except ToolRegistryError as exc:
-            run = _finish_step(session, actor, run, step, StepTransition(
-                to_state=StepState.FAILED, error_code=exc.code))
-            return _fail_run(session, actor, run, exc.code)
-        if time.monotonic() - start > limit or _now() >= _utc(run.deadline_at):
-            run = _finish_step(session, actor, run, step, StepTransition(
-                to_state=StepState.UNKNOWN, error_code="agent_tool_timeout"))
-            return _fail_run(session, actor, run, "agent_tool_timeout")
-        try:
-            captured = answer_receipts.capture_tool_evidence(session, actor, tool_key=tool_key,
-                    permission=definition.requester_permission, result=result)
-            evidence = answer_receipts.merge_evidence(evidence, captured)
-            own_tool_evidence = answer_receipts.merge_evidence(own_tool_evidence, captured)
-        except answer_receipts.EvidenceError as exc:
-            run = _finish_step(session, actor, run, step, StepTransition(
-                to_state=StepState.FAILED, error_code=str(exc)))
-            return _fail_run(session, actor, run, str(exc))
-        run = _finish_step(session, actor, run, step, StepTransition(
-            to_state=StepState.SUCCEEDED,
-            output_ref="sha256:" + _digest(_canonical(result))))
-        tool_result = {"key": tool_key, "version": version, "data": result}
-        # A model step follows every tool step. Sequence numbers count both.
-        sequence_no += 2
+                try:
+                    skill_service.verify_runtime_binding(session, actor, agent, run)
+                except (skill_service.SkillReleaseError, HTTPException):
+                    return _fail_run(session, actor, run, "skill_runtime_revoked")
+            try:
+                decision = _decode_decision(response.suggestion)
+            except AgentRuntimeError as exc:
+                return _fail_run(session, actor, run, exc.code)
+            if decision["action"] == "final":
+                if choice is not None:
+                    try:
+                        skill_service.verify_runtime_binding(session, actor, agent, run)
+                    except (skill_service.SkillReleaseError, HTTPException):
+                        return _fail_run(session, actor, run, "skill_runtime_revoked")
+                try:
+                    run = _transition(session, run, RunState.COMPLETED)
+                    message = conversation_service.append_message(
+                        session, actor, conversation_id=conversation.id, role="assistant",
+                        content=decision["answer"], source_ref=f"run:{run.id}")
+                    record_answer(session, run=run, message=message, evidence=evidence,
+                        own_evidence=own_tool_evidence)
+                    _audit(session, actor, run.id, "agent_run.completed", "ok")
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    raise
+                result = read_run_receipt(session, actor, run.id, _public_trace=False)
+                result["replayed"] = False
+                return result
 
-    return _fail_run(session, actor, run, "agent_budget_exceeded")
+            tool_key, version, arguments = (decision["tool_key"],
+                                            decision["version"], decision["arguments"])
+            if not _IDENTIFIER.fullmatch(tool_key) or not _IDENTIFIER.fullmatch(version):
+                return _fail_run(session, actor, run, "agent_decision_invalid")
+            if legacy_code_tool(tool_key, version, store_id=actor.store_id):
+                return _fail_run(session, actor, run, "tool_legacy_code_execution_disabled")
+            try:
+                definition = resolve_tool(tool_key, version, store_id=actor.store_id)
+            except ToolRegistryError:
+                return _fail_run(session, actor, run, "tool_not_registered")
+            if choice is not None and (tool_key, version) not in choice["plan"].allowed_tools:
+                return _fail_run(session, actor, run, "skill_tool_not_allowed")
+            if sequence_no >= run.max_steps or sum(s.kind == StepKind.TOOL.value for s in steps) >= run.max_tool_calls:
+                return _fail_run(session, actor, run, "agent_budget_exceeded")
+            if _cancelled(run_id):
+                run = _cancel_active_run(session, actor, run)
+                return _state_result(run)
+            if definition is not None and definition.mode == "write" and definition.confirmation != "none":
+                try:
+                    validated = definition.input_model.model_validate(arguments)
+                    arguments = validated.model_dump(mode="json")
+                    authorize_scope(session, actor, organization_id=run.organization_id,
+                                    store_id=run.store_id, permission=definition.requester_permission)
+                    authorize_scope(session, agent, organization_id=run.organization_id,
+                                    store_id=run.store_id, permission=definition.agent_permission)
+                except (ValidationError, HTTPException):
+                    session.rollback()
+                    return _fail_run(session, actor, run, "agent_tool_confirmation_denied")
+                if _cancelled(run_id):
+                    run = _cancel_active_run(session, actor, run)
+                    return _state_result(run)
+                call_key = f"{run.id}:{sequence_no + 1}"
+                digest = _digest(_canonical(arguments))
+                try:
+                    step = append_step(session, StepCreate(id=str(uuid4()),
+                        organization_id=run.organization_id, store_id=run.store_id,
+                        run_id=run.id, sequence_no=sequence_no + 1, kind=StepKind.TOOL,
+                        tool_call=ToolCallCreate(id=str(uuid4()), tool_key=tool_key,
+                            tool_version=version, idempotency_key=call_key,
+                            input_digest=digest)), expected_run_version=run.version)
+                    run = get_run(session, run.organization_id, run.store_id, run.id)
+                    now = _now()
+                    confirmation = create_confirmation(session, AgentConfirmation(
+                        run_id=run.id, organization_id=run.organization_id,
+                        store_id=run.store_id, step_id=step.id,
+                        requester_id=actor.subject_id, tool_key=tool_key,
+                        tool_version=version, arguments=arguments,
+                        input_digest=digest, state="pending", version=1,
+                        expires_at=now + timedelta(seconds=CONFIRMATION_SECONDS),
+                        created_at=now, updated_at=now))
+                    run = _transition(session, run, RunState.WAITING_FOR_HUMAN)
+                    _audit(session, actor, run.id, "agent_confirmation.requested", "pending")
+                    session.commit()
+                except AgentPersistenceError as exc:
+                    session.rollback()
+                    return _fail_run(session, actor, run, exc.code)
+                if _cancelled(run_id):
+                    run = _cancel_active_run(session, actor, run)
+                    return _state_result(run)
+                return {**_state_result(run), "pending_action": _pending_payload(confirmation, run, step)}
+            call_key = f"{run.id}:{sequence_no + 1}"
+            call = ToolCallCreate(id=str(uuid4()), tool_key=tool_key,
+                tool_version=version, idempotency_key=call_key,
+                input_digest=_digest(_canonical(arguments)))
+            try:
+                run, step = _start_step(session, run, StepKind.TOOL,
+                                        sequence_no + 1, tool_call=call)
+            except AgentPersistenceError as exc:
+                session.rollback()
+                return _fail_run(session, actor, run, exc.code)
+            limit = definition.timeout_seconds
+            start = time.monotonic()
+            if _now() >= _utc(run.deadline_at):
+                run = _finish_step(session, actor, run, step, StepTransition(
+                    to_state=StepState.UNKNOWN, error_code="agent_tool_timeout"))
+                return _fail_run(session, actor, run, "agent_tool_timeout")
+            if _cancelled(run_id):
+                run = _cancel_active_run(session, actor, run)
+                return _state_result(run)
+            try:
+                if choice is None:
+                    # A3: the tool Step is committed; rejection must close that Step.
+                    _verify_ordinary_toolset(session, actor, agent, run)
+                if choice is not None:
+                    # The same platform tool gateway enforces grants on each call.
+                    skill_service.verify_runtime_binding(session, actor, agent, run)
+                memory_timeout_claim = None
+                if (version == "1" and tool_key in ("memory.save", "memory.correct", "memory.withdraw")
+                        and definition.mode == "write" and definition.handler_id == f"{tool_key}.v1"):
+                    memory_timeout_claim = (
+                        session.get_transaction(), (run.organization_id, run.store_id, run.requester_id),
+                        run.id, run.version, step.id, step.version)
+                result = invoke_tool(session, requester=actor, agent=agent,
+                    tool_key=tool_key, version=version, arguments=arguments,
+                    idempotency_key=call_key if definition.idempotency == "required" else None)
+            except (skill_service.SkillReleaseError, HTTPException):
+                # Discard any uncommitted handler writes before recording the known
+                # rejection against the already committed exact tool Step.
+                session.rollback()
+                return _fail_run(session, actor, run, "skill_runtime_revoked", failed_step=step)
+            except ToolRegistryError as exc:
+                run = _finish_step(session, actor, run, step, StepTransition(
+                    to_state=StepState.FAILED, error_code=exc.code))
+                return _fail_run(session, actor, run, exc.code)
+            if time.monotonic() - start > limit or _now() >= _utc(run.deadline_at):
+                if memory_timeout_claim is not None:
+                    return _close_inline_memory_timeout(session, actor, *memory_timeout_claim)
+                run = _finish_step(session, actor, run, step, StepTransition(
+                    to_state=StepState.UNKNOWN, error_code="agent_tool_timeout"))
+                return _fail_run(session, actor, run, "agent_tool_timeout")
+            try:
+                captured = answer_receipts.capture_tool_evidence(session, actor, tool_key=tool_key,
+                        permission=definition.requester_permission, result=result)
+                evidence = answer_receipts.merge_evidence(evidence, captured)
+                own_tool_evidence = answer_receipts.merge_evidence(own_tool_evidence, captured)
+            except answer_receipts.EvidenceError as exc:
+                run = _finish_step(session, actor, run, step, StepTransition(
+                    to_state=StepState.FAILED, error_code=str(exc)))
+                return _fail_run(session, actor, run, str(exc))
+            run = _finish_step(session, actor, run, step, StepTransition(
+                to_state=StepState.SUCCEEDED,
+                output_ref="sha256:" + _digest(_canonical(result))))
+            tool_result = {"key": tool_key, "version": version, "data": result}
+            # A model step follows every tool step. Sequence numbers count both.
+            sequence_no += 2
+
+        return _fail_run(session, actor, run, "agent_budget_exceeded")
+    finally:
+        if _CANCEL_EVENTS.get(run_id) is cancel_event:
+            del _CANCEL_EVENTS[run_id]
 
 
 def submit_worker_run(session: Session, actor: AuthenticatedSubject, text: str,
@@ -1620,7 +1692,8 @@ def submit_worker_run(session: Session, actor: AuthenticatedSubject, text: str,
                       pi_runtime_record: dict | None = None,
                       category_source: dict | None = None,
                       category_products_contract: str | None = None, research_source: dict | None = None,
-                      sales_source: dict | None = None) -> dict:
+                      sales_source: dict | None = None,
+                      tool_selection: list | None = None) -> dict:
     """Persist a bounded queued run; never dispatch a Provider in HTTP.
 
     Controlled feature gate is OFF until all AGT-020 security-fence writers and
@@ -1632,11 +1705,24 @@ def submit_worker_run(session: Session, actor: AuthenticatedSubject, text: str,
     # Trusted Host-only opt-in, not an HTTP/model-configurable tool export.
     # Existing routes and experimental bridge keep their original default.
     if tool_profile is not None and (
-            type(tool_profile) is not str or tool_profile not in PI_PROFILES
+            type(tool_profile) is not str or tool_profile not in PI_ALL_PROFILES
             or expected_runtime != runtime_repository.SDK_RUNTIME):
         raise AgentRuntimeError("agent_pi_profile_invalid", 409)
+    # Workbench runs must carry an explicit configured tool_selection upper
+    # bound; omission never defaults to all tools, and other profiles never
+    # accept one.
+    if tool_profile == 'pi-workbench-v1':
+        if (type(tool_selection) is not list or not tool_selection
+                or any(type(item) is not dict or set(item) != {"tool_key", "version"}
+                       or type(item.get("tool_key")) is not str or type(item.get("version")) is not str
+                       for item in tool_selection)
+                or sorted({(item["tool_key"], item["version"]) for item in tool_selection})
+                    != [(item["tool_key"], item["version"]) for item in tool_selection]):
+            raise AgentRuntimeError("agent_pi_toolset_invalid", 409)
+    elif tool_selection is not None:
+        raise AgentRuntimeError("agent_pi_profile_invalid", 409)
     if pi_runtime_record is not None:
-        if tool_profile not in PI_PROFILES:
+        if tool_profile not in PI_ALL_PROFILES:
             raise AgentRuntimeError("agent_pi_profile_invalid", 409)
         try:
             pi_runtime_record = runtime_repository.validate_pi_runtime_record(pi_runtime_record)
@@ -1648,7 +1734,7 @@ def submit_worker_run(session: Session, actor: AuthenticatedSubject, text: str,
         from . import research_host
         try:research_source=research_host.current(session.get_bind(),actor,pin=research_source).pin()
         except (ValueError,TypeError,KeyError,OSError):raise AgentRuntimeError('agent_pi_research_source_invalid',409) from None
-        if tool_profile!='pi-source-v1' or pi_runtime_record is None or pi_runtime_record['wire_protocol']!='v4.pi-source/2':
+        if tool_profile not in ('pi-source-v1', 'pi-workbench-v1') or pi_runtime_record is None or pi_runtime_record['wire_protocol'] not in ('v4.pi-source/2', 'v4.pi-workbench/2'):
             raise AgentRuntimeError('agent_pi_research_source_invalid',409)
     if category_source is not None:
         from backend.app.modules.integrations.guanjia import category_host
@@ -1657,12 +1743,12 @@ def submit_worker_run(session: Session, actor: AuthenticatedSubject, text: str,
             category_source = current.pin()
         except (ValueError,TypeError,KeyError,OSError):
             raise AgentRuntimeError('agent_pi_category_source_invalid',409) from None
-        if tool_profile != 'pi-source-v1' or pi_runtime_record is None or pi_runtime_record['wire_protocol'] != 'v4.pi-source/2':
+        if tool_profile not in ('pi-source-v1', 'pi-workbench-v1') or pi_runtime_record is None or pi_runtime_record['wire_protocol'] not in ('v4.pi-source/2', 'v4.pi-workbench/2'):
             raise AgentRuntimeError('agent_pi_category_source_invalid',409)
     if category_products_contract is not None and (
             type(category_products_contract) is not str
             or category_products_contract != 'v4.guanjia-category/2'
-            or tool_profile != 'pi-source-v1' or category_source is None):
+            or tool_profile not in ('pi-source-v1', 'pi-workbench-v1') or category_source is None):
         raise AgentRuntimeError('agent_pi_category_source_invalid', 409)
     if sales_source is not None:
         from backend.app.modules.integrations.guanjia import sales_ranking_source
@@ -1671,8 +1757,8 @@ def submit_worker_run(session: Session, actor: AuthenticatedSubject, text: str,
                                                          pin=sales_source).pin_dict()
         except (ValueError, TypeError, KeyError, OSError):
             raise AgentRuntimeError('agent_pi_sales_source_invalid', 409) from None
-        if (tool_profile != 'pi-source-v1' or pi_runtime_record is None
-                or pi_runtime_record['wire_protocol'] != 'v4.pi-source/2'):
+        if (tool_profile not in ('pi-source-v1', 'pi-workbench-v1') or pi_runtime_record is None
+                or pi_runtime_record['wire_protocol'] not in ('v4.pi-source/2', 'v4.pi-workbench/2')):
             raise AgentRuntimeError('agent_pi_sales_source_invalid', 409)
     runtime_repository._reject_runtime_mutations(session)
     # Copy the exact accepted value before any transaction or caller mutation.
@@ -1701,7 +1787,7 @@ def submit_worker_run(session: Session, actor: AuthenticatedSubject, text: str,
     from backend.app.modules.assistant import principal as work_principal
     delegated = type(actor) is work_principal.WorkPrincipal
     if delegated:
-        if (expected_runtime != runtime_repository.SDK_RUNTIME or tool_profile not in PI_PROFILES
+        if (expected_runtime != runtime_repository.SDK_RUNTIME or tool_profile not in PI_ALL_PROFILES
                 or actor.run_id != run_id or key != run_id or pi_runtime_record is None):
             raise AgentRuntimeError('assistant_work_submission_denied', 403)
         work_principal.check(session, actor, lock=True)
@@ -1749,7 +1835,8 @@ def submit_worker_run(session: Session, actor: AuthenticatedSubject, text: str,
         if has_profile and (
                 frozen['pi_readonly_binding'].get('category_source') != category_source
                 or frozen['pi_readonly_binding'].get('category_products_contract') != category_products_contract
-                or frozen['pi_readonly_binding'].get('research_source') != research_source):
+                or frozen['pi_readonly_binding'].get('research_source') != research_source
+                or frozen['pi_readonly_binding'].get('tool_selection') != tool_selection):
             raise AgentRuntimeError('agent_idempotency_runtime_conflict',409)
         return read_run_receipt(session, actor, run_id, _public_trace=False)
     # The worker does not receive the employee token. The exact authenticated
@@ -1766,16 +1853,36 @@ def submit_worker_run(session: Session, actor: AuthenticatedSubject, text: str,
     except AgentPersistenceError as exc:
         session.rollback()
         raise AgentRuntimeError("agent_execution_authorization_unknown", 409) from exc
+    def freeze_binding(agent):
+        return freeze_pi_binding(
+            session, actor, agent, run_id=run_id, profile=tool_profile, category_source=category_source,
+            category_products_contract=category_products_contract, research_source=research_source,
+            sales_source=sales_source, tool_selection=tool_selection,
+            **({'sales_contract':'3'} if sales_source is not None and sales_source.get('version')==3 else {}))
+
+    agent = readonly_binding = None
+    if tool_profile == PI_WORKBENCH_PROFILE and category_source is not None:
+        # Only the authorized, frozen tool entries determine whether this
+        # staged combination needs unsupported category readback.
+        agent = _agent_actor(session, actor, deadline)
+        readonly_binding = freeze_binding(agent)
+        if any((entry['tool_key'], entry['version']) in GUANJIA_CATEGORY_TOOLS
+               for entry in readonly_binding['tools']):
+            raise AgentRuntimeError('agent_pi_category_workbench_unsupported', 409)
     conversation = conversation_service.get_or_create_conversation(session, actor)
-    context = conversation_service.context_for_agent(session, actor,
-        budget_tokens=input_capacity(output_tokens=MAX_OUTPUT_TOKENS,
-                                     remaining_input=MAX_INPUT_TOKENS))
+    try:
+        capacity = input_capacity(output_tokens=MAX_OUTPUT_TOKENS,
+                                  remaining_input=MAX_INPUT_TOKENS)
+    except ModelContextError as exc:
+        raise AgentRuntimeError(exc.code, 503) from None
+    context = conversation_service.context_for_agent(session, actor, budget_tokens=capacity)
     evidence = context["evidence"]
     message = conversation_service.append_message(session, actor,
         conversation_id=conversation.id, role="user", content=text)
     evidence = answer_receipts.merge_evidence(
         evidence, [answer_receipts.message_reference(message)])
-    agent = _agent_actor(session, actor, deadline)
+    if agent is None:
+        agent = _agent_actor(session, actor, deadline)
     descriptions = model_tool_descriptions(session, actor, agent)
     model = os.environ.get("AGENT_PROVIDER_MODEL", "unconfigured")
     if (not isinstance(model, str) or not model.isascii() or
@@ -1785,17 +1892,13 @@ def submit_worker_run(session: Session, actor: AuthenticatedSubject, text: str,
     # mutable legacy environment defaults. Never accept client provider input.
     online_pi = (pi_runtime_record is not None
                  and pi_runtime_record['contract_version'] in (2, 3)
-                 and tool_profile in PI_PROFILES)
+                 and tool_profile in PI_ALL_PROFILES)
     provider_key = 'opencode-go' if online_pi else 'chat-completions'
     if online_pi:
         model = 'deepseek-v4.1-flash'
-    readonly_binding = None
-    if tool_profile in PI_PROFILES:
-        readonly_binding = freeze_pi_binding(
-            session, actor, agent, run_id=run_id, profile=tool_profile, category_source=category_source,
-            category_products_contract=category_products_contract, research_source=research_source,
-            sales_source=sales_source,
-            **({'sales_contract':'3'} if sales_source is not None and sales_source.get('version')==3 else {}))
+    if tool_profile in PI_ALL_PROFILES:
+        if readonly_binding is None:
+            readonly_binding = freeze_binding(agent)
         choice, selection_reason = None, tool_profile
     else:
         choice, selection_reason = skill_service.choose_runtime_skill(

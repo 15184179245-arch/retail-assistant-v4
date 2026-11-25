@@ -1,0 +1,26 @@
+.ar-verified-directory {
+  min-width: 0;
+  margin: .45rem 0 .65rem;
+  padding: .55rem .6rem;
+  border: 1px solid #d2e3db;
+  border-radius: .55rem;
+  background: #f6faf8;
+}
+.ar-verified-directory :is(h3, p) { margin: .25rem 0; }
+.ar-verified-directory p { font-size: .86rem; }
+.ar-verified-directory ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem;
+  margin: .35rem 0;
+  padding: 0;
+  list-style: none;
+}
+.ar-verified-directory li { max-width: 100%; min-width: 0; }
+.ar-verified-directory button {
+  min-height: 44px;
+  text-align: start;
+  overflow-wrap: anywhere;
+}
+.ar-verified-source-anchor { scroll-margin-block-start: .6rem; }
+.ar-verified-source-anchor:focus-visible { outline: 2px solid #196852; outline-offset: -2px; }

@@ -10,7 +10,7 @@ Guarantees:
 - each stream is capped *while receiving*, not after ``communicate()`` returns;
 - a cancellation event wakes the loop even when the child emits no stdout;
 - timeout/cancellation/oversize raise before any partial output is trusted;
-- :func:`cleanup` kills the child's whole new session and reaps it.
+- :func:`cleanup` bounds both reap waits and fails closed if cleanup is unconfirmed.
 """
 from __future__ import annotations
 
@@ -40,6 +40,11 @@ class TransportCancelled(TransportError):
 class TransportOutputTooLarge(TransportError):
     def __init__(self):
         super().__init__('transport_output_too_large')
+
+
+class TransportCleanupError(TransportError):
+    def __init__(self):
+        super().__init__('transport_cleanup_unconfirmed')
 
 
 def exchange(process, payload: bytes, deadline: float, *, max_stdout: int,
@@ -117,26 +122,107 @@ def exchange(process, payload: bytes, deadline: float, *, max_stdout: int,
         if remaining <= 0:
             raise TransportTimeout()
         time.sleep(min(remaining, poll_seconds))
+    if time.monotonic() >= deadline:
+        raise TransportTimeout()
     return bytes(out), bytes(err), process.returncode
 
 
-def cleanup(process) -> None:
-    """Kill our child's whole new session and reap it; never leak FDs."""
+_CLEANUP_WAIT_SECONDS = 5
+
+
+def _kill_owned(process, *, whole_session):
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        try:
+        if whole_session:
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
             process.kill()
-        except ProcessLookupError:
-            pass
-        process.wait()
-    for stream in (process.stdin, process.stdout, process.stderr):
-        if stream is not None:
+    except ProcessLookupError:
+        pass  # Nothing remains to signal. Still reap the direct child.
+    except OSError:
+        return False
+    return True
+
+
+def _cleanup_owned(process, *, whole_session):
+    incomplete = False
+    interrupted_close = None
+    try:
+        incomplete = not _kill_owned(process, whole_session=whole_session)
+        try:
+            status = process.wait(timeout=_CLEANUP_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            if not whole_session:
+                raise
+            incomplete |= not _kill_owned(process, whole_session=False)
+            status = process.wait(timeout=_CLEANUP_WAIT_SECONDS)
+        incomplete |= type(status) is not int
+    except Exception:
+        incomplete = True
+    finally:
+        # A failed signal, wait or close must not prevent visiting the other
+        # descriptors. Never return a result if ownership remains unresolved.
+        for name in ('stdin', 'stdout', 'stderr'):
             try:
-                stream.close()
-            except OSError:
-                pass
+                stream = getattr(process, name, None)
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                incomplete = True
+            except BaseException as error:
+                if interrupted_close is None:
+                    interrupted_close = error
+        if interrupted_close is not None:
+            raise interrupted_close
+    if incomplete:
+        raise TransportCleanupError()
+
+
+def cleanup(process) -> None:
+    """Signal the owned session and reap its child; unconfirmed cleanup raises."""
+    _cleanup_owned(process, whole_session=True)
+
+
+def _cleanup_nested(process):
+    # This child shares the outer worker's group. Never signal that group.
+    _cleanup_owned(process, whole_session=False)
+
+
+def exchange_committed(request, *, command, cwd, nested, nested_modes, encode,
+                       decode_request, decode_reply, digest, timeout, spawn,
+                       communicate, cleanup_outer, deadline=None, check_deadline=False):
+    """Run one fixed adapter command and bind its committed reply to the request.
+
+    Adapters retain their own schemas, timeouts and nested operation allowlists.
+    Any I/O/cleanup error is unknown (None), never a replay or an approval.
+    """
+    process = result = None
+    try:
+        if nested and request.get('mode') not in nested_modes:
+            raise ValueError()
+        raw = encode(request).encode()
+        if decode_request(raw) != request:
+            raise ValueError()
+        seconds = timeout(request) if callable(timeout) else timeout
+        ceiling = time.monotonic() + seconds
+        deadline = ceiling if deadline is None else min(deadline, ceiling)
+        if check_deadline and time.monotonic() >= deadline:
+            raise ValueError()
+        process = spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, start_new_session=not nested,
+                        close_fds=True, cwd=cwd, env={'PATH': os.defpath, 'LANG': 'C.UTF-8'})
+        output, status = communicate(process, raw, deadline)
+        value = decode_reply(output)
+        if (status != 0 or type(value) is not dict or set(value) != {'version', 'code', 'request_sha256', 'result'}
+                or type(value['version']) is not int or value['version'] != 1 or value['code'] != 'committed'
+                or value['request_sha256'] != digest(request)):
+            raise ValueError()
+        result = value['result']
+    except BaseException:
+        pass
+    finally:
+        if process is not None:
+            try:
+                (_cleanup_nested if nested else cleanup_outer)(process)
+            except BaseException:
+                result = None
+    return result

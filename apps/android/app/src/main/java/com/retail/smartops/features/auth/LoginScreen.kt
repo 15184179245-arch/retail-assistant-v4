@@ -1,7 +1,5 @@
 package com.retail.smartops.features.auth
 
-import android.os.Handler
-import android.os.Looper
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -15,10 +13,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -27,31 +25,28 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
-import com.retail.smartops.core.auth.Session
 import com.retail.smartops.core.auth.SessionRepository
 import com.retail.smartops.core.network.ApiResult
 import com.retail.smartops.core.ui.ErrorPanel
 import com.retail.smartops.core.ui.StatusBadge
 import com.retail.smartops.core.ui.StatusKind
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun LoginScreen(
     repository: SessionRepository,
-    onLoggedIn: (Session) -> Unit,
+    localClearFailed: Boolean,
+    logoutNotice: String?,
+    onRetryLogout: () -> Unit,
 ) {
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var hint by remember { mutableStateOf<String?>(null) }
     var pending by remember { mutableStateOf(false) }
-    val executor: ExecutorService = remember { Executors.newSingleThreadExecutor() }
-    val mainHandler = remember { Handler(Looper.getMainLooper()) }
-
-    DisposableEffect(Unit) {
-        onDispose { executor.shutdownNow() }
-    }
+    val coroutineScope = rememberCoroutineScope()
 
     MaterialTheme {
         Column(
@@ -119,8 +114,18 @@ fun LoginScreen(
                 )
             }
 
+            if (localClearFailed) {
+                ErrorPanel(
+                    userMessage = "未能确认已清除本机登录。",
+                    hint = "请重试退出，或等待设备存储恢复。",
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Button(enabled = !pending, onClick = onRetryLogout) { Text("重试退出") }
+            }
+            logoutNotice?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+
             Button(
-                enabled = !pending && username.isNotBlank() && password.isNotBlank(),
+                enabled = !pending && !localClearFailed && username.isNotBlank() && password.isNotBlank(),
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(min = 44.dp),
@@ -128,21 +133,22 @@ fun LoginScreen(
                     pending = true
                     error = null
                     hint = null
-                    executor.execute {
-                        val result = repository.login(username.trim(), password)
-                        mainHandler.post {
-                            pending = false
-                            when (result) {
-                                is ApiResult.Success -> {
-                                    password = ""
-                                    onLoggedIn(result.data)
-                                }
+                    val submittedUser = username.trim()
+                    val submittedPassword = password
+                    coroutineScope.launch {
+                        try {
+                            when (val result = withContext(Dispatchers.IO) {
+                                repository.login(submittedUser, submittedPassword)
+                            }) {
+                                is ApiResult.Success -> password = ""
                                 is ApiResult.Failure -> {
                                     error = result.userMessage
                                     hint = result.hint
                                 }
                                 ApiResult.Cancelled -> Unit
                             }
+                        } finally {
+                            pending = false
                         }
                     }
                 },

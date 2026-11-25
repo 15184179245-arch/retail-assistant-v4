@@ -51,6 +51,7 @@ if (process.argv.length === 4 && process.argv[2]?.endsWith('/pi-release.json')) 
       || (manifest['profile'] === `host-pi-discovery-node24-${process.platform}-online-v1` && manifest['wire_protocol'] === 'v4.pi-discovery/2')) family = 'discovery';
   if ((manifest['profile'] === `host-pi-memory-node24-${process.platform}-v1` && manifest['wire_protocol'] === 'v4.pi-memory/1')
       || (manifest['profile'] === `host-pi-memory-node24-${process.platform}-online-v1` && manifest['wire_protocol'] === 'v4.pi-memory/2')) family = 'memory';
+  if (manifest['profile'] === `host-pi-workbench-node24-${process.platform}-online-v1` && manifest['wire_protocol'] === 'v4.pi-workbench/2') family = 'workbench';
   online = manifest['profile'] === `host-pi-${family}-node24-${process.platform}-online-v1`
     && manifest['wire_protocol'] === `v4.pi-${family}/2`;
 }

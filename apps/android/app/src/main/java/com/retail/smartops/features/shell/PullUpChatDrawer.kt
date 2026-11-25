@@ -240,7 +240,6 @@ fun PullUpChatDrawer(
                                         UiBlockView(
                                             block = block,
                                             online = state.isNetworkReachable,
-                                            coeditState = state.activeArtifactCoedit,
                                             callbacks = blockCallbacks,
                                         )
                                     }

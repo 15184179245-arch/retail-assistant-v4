@@ -1,32 +1,17 @@
-from datetime import datetime, timezone
+from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKeyConstraint, Index, Integer, JSON, String, Text, UniqueConstraint, text
-from sqlalchemy.engine import Dialect
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, ForeignKeyConstraint, Index, Integer, JSON, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
 from backend.app.db.base import Base
+from backend.app.db.types import UTCDateTime as _UTCDateTime
 
 
-class UTCDateTime(TypeDecorator[datetime]):
+class UTCDateTime(_UTCDateTime):
     """Store aware timestamps as UTC; normalize SQLite's naive result values."""
 
-    impl = DateTime(timezone=True)
     cache_ok = True
-
-    def process_bind_param(self, value: datetime | None, dialect: Dialect) -> datetime | None:
-        if value is None:
-            return None
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("timezone-aware datetime required")
-        return value.astimezone(timezone.utc)
-
-    def process_result_value(self, value: datetime | None, dialect: Dialect) -> datetime | None:
-        if value is None:
-            return None
-        if value.tzinfo is None or value.utcoffset() is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
 
 
 class AgentRun(Base):
@@ -455,7 +440,7 @@ class AgentPiProviderReceipt(Base):
         UniqueConstraint("permit_digest", name="uq_pi_provider_permit"),
         UniqueConstraint("organization_id","store_id","run_id","request_id", name="uq_pi_provider_request"),
         CheckConstraint("model_kind = 'model' AND epoch > 0 AND model = 'deepseek-v4.1-flash' "
-            "AND wire_protocol IN ('v4.pi-readonly/2', 'v4.pi-memory/2', 'v4.pi-discovery/2', 'v4.pi-source/2', 'v4.pi-readonly/3')", name="ck_pi_provider_identity"),
+            "AND wire_protocol IN ('v4.pi-readonly/2', 'v4.pi-memory/2', 'v4.pi-discovery/2', 'v4.pi-source/2', 'v4.pi-readonly/3', 'v4.pi-workbench/2')", name="ck_pi_provider_identity"),
         CheckConstraint("length(permit_digest) = 64 AND length(input_digest) = 64 AND length(request_digest) = 64 "
             "AND length(manifest_digest) = 64 AND length(request_id) > 0 AND length(toolset_version) > 0 "
             "AND (response_digest IS NULL OR length(response_digest) = 64)", name="ck_pi_provider_digests"),

@@ -1,0 +1,14 @@
+/* Purchase-return detail only, including phones beyond the portrait breakpoint. */
+.ar-purchase-return-reading .ar-operational-detail-range > button.ar-read {
+  box-sizing: border-box;
+  min-block-size: 44px;
+  min-inline-size: 44px;
+  max-inline-size: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.ar-purchase-return-reading .ar-operational-detail-lines h4:focus-visible {
+  outline: 2px solid #196852;
+  outline-offset: 2px;
+}

@@ -99,7 +99,8 @@ def _batch(db, actor, row, intent):
     latest = {d.discrepancy_id: d for d in decisions}
     if any(d.id not in latest or latest[d.id].decision != 'accept_observation' for d in diffs):
         fail('discrepancy_unresolved')
-    if any(d.discrepancy_id not in {x.id for x in diffs} for d in decisions):
+    discrepancy_ids = {x.id for x in diffs}
+    if any(d.discrepancy_id not in discrepancy_ids for d in decisions):
         fail('source_invalid')
     values = []
     originals = {x.id: x for x in intent.lines}
@@ -108,9 +109,6 @@ def _batch(db, actor, row, intent):
         if (line.unknown_product_label is not None or original is None
                 or (line.product_id, line.product_version) != (original.product_id, original.product_version)):
             fail('product_binding_invalid')
-        products = _rows(db, CatalogProduct, actor, CatalogProduct.id == line.product_id, maximum=1)
-        if not products or not products[0].active or products[0].version != line.product_version:
-            fail('product_changed')
         priced = (line.quoted_price, line.delivered_price, line.price_evidence_sha256)
         if any(v is not None for v in priced) and any(v is None for v in priced):
             fail('price_incomplete')
@@ -142,6 +140,17 @@ def _batch(db, actor, row, intent):
             created_at=latest[d.id].created_at) for d in diffs]))
 
 
+def _check_catalog_products(db, actor, batches):
+    # Only lines already bound to verified intent lines reach this check.
+    expected = {(line.product_id, line.product_version) for batch in batches for line in batch.lines}
+    ids = sorted({product_id for product_id, _ in expected})
+    active = {(row.id, row.version) for row in _rows(
+        db, CatalogProduct, actor, CatalogProduct.id.in_(ids),
+        maximum=len(ids), order=(CatalogProduct.id,)) if row.active}
+    if not expected <= active:
+        fail('product_changed')
+
+
 def snapshot(db, actor, batch_id):
     """Freeze the COMPLETE related-batch set under the employee/store fence.
 
@@ -161,6 +170,7 @@ def snapshot(db, actor, batch_id):
         related = _rows(db, ReceivingBatch, actor, ReceivingBatch.intent_id == intent.id,
             order=(ReceivingBatch.created_at, ReceivingBatch.id))
         batches = [_batch(db, actor, row, intent) for row in related]
+        _check_catalog_products(db, actor, batches)
         batch = next(b for b in batches if b.id == batch_id)
         if any(line.line_total is None for line in batch.lines):
             fail('price_incomplete')

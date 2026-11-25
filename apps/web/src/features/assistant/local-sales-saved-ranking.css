@@ -1,0 +1,9 @@
+.ar-saved-sales-ranking { overflow-wrap: anywhere; }
+.ar-saved-sales-select { display: grid; gap: .35rem; }
+.ar-saved-sales-select select { box-sizing: border-box; width: 100%; min-width: 0; min-height: 2.5rem; }
+.ar-saved-sales-select button { justify-self: start; }
+.ar-saved-sales-ranking-rows { padding-inline-start: 2rem; }
+.ar-saved-sales-ranking-rows > li { border-block-start: 1px solid #e2e9e6; padding-block: .4rem; }
+.ar-saved-sales-ranking-rows dl { display: flex; flex-wrap: wrap; gap: .3rem 1rem; }
+.ar-saved-sales-ranking-rows dd { margin: 0; white-space: pre-wrap; }
+.ar-saved-sales-product { font-weight: 600; }

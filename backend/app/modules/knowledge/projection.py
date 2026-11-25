@@ -34,7 +34,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from uuid import uuid4
 
 import sqlalchemy as sa
@@ -348,10 +348,10 @@ def window_entries(session: Session, threshold: datetime, window_limit: int = WI
 def _window_expiry(entries: list[KnowledgeEntry]) -> datetime | None:
     """Earliest natural expiry of any row inside the pre-ACL window.
 
-    An unexpiring row makes the window time-independent (``None``).  This bound
-    is the only silent, DML-free way a legitimate window can shrink, so the read
-    path rejects the build once the bound passes instead of pretending the
-    smaller remainder is the original window.
+    The bound is ``None`` only when the window is empty or no row expires.  A
+    finite expiry can shrink an otherwise unchanged window without DML, so the
+    read path rejects the build at the bound instead of treating the smaller
+    remainder as the original window.
     """
     bound: datetime | None = None
     for entry in entries:
@@ -986,6 +986,35 @@ def _require_read(session: Session, actor, timestamp: datetime) -> None:
     knowledge_service._require(session, actor, knowledge_service.READ_PERMISSION, timestamp)
 
 
+def _published_build_read_reason(
+    generation: KnowledgeSourceGeneration, build: KnowledgeProjectionBuild, *,
+    count_rows: Callable[[], int | None], now: datetime | None,
+) -> str | None:
+    """Check the read head's structure and expiry, not historical digests or ACL."""
+    if build.state != "published":
+        return "build_not_published"
+    if (build.resolver_version, build.normalizer_version, build.projection_schema_version) != (
+        RESOLVER_VERSION, NORMALIZER_VERSION, PROJECTION_SCHEMA_VERSION,
+    ):
+        return "build_version"
+    if build.source_generation != generation.generation:
+        return "stale"
+    if build.entry_count != generation.entry_count:
+        return "entry_count_mismatch"
+    if count_rows() != build.entry_count:
+        return "row_count_mismatch"
+    if build.window_expires_at is not None:
+        bound = build.window_expires_at
+        if bound.tzinfo is None:
+            bound = bound.replace(tzinfo=timezone.utc)
+        # The pre-ACL window keeps rows with ``expires_at > now``.  At the exact
+        # expiry second the legacy window has already rolled, so ``>`` here
+        # would silently serve a shrunken window as a false no-match.
+        if _now(now) >= bound:
+            return "source_window_expired"
+    return None
+
+
 def published_head(session: Session, *, now: datetime | None = None) -> tuple[KnowledgeSourceGeneration, KnowledgeProjectionBuild]:
     generation = session.get(KnowledgeSourceGeneration, 1)
     if generation is None:
@@ -997,33 +1026,18 @@ def published_head(session: Session, *, now: datetime | None = None) -> tuple[Kn
     build = session.get(KnowledgeProjectionBuild, generation.build_id)
     if build is None:
         raise KnowledgeProjectionUnavailable("build_missing")
-    if build.state != "published":
-        raise KnowledgeProjectionUnavailable("build_not_published")
-    if (build.resolver_version, build.normalizer_version, build.projection_schema_version) != (
-        RESOLVER_VERSION, NORMALIZER_VERSION, PROJECTION_SCHEMA_VERSION,
-    ):
-        raise KnowledgeProjectionUnavailable("build_version")
-    if build.source_generation != generation.generation:
-        raise KnowledgeProjectionUnavailable("stale")
-    if build.entry_count != generation.entry_count:
-        raise KnowledgeProjectionUnavailable("entry_count_mismatch")
-    # count(<column>), not count(*): the commit-guard read-only filter rejects
-    # SQLAlchemy's literal `*` column node, and the pin must stay a plain read.
-    row_count = session.scalar(
-        select(func.count(KnowledgeEntryProjection.entry_id))
-        .where(KnowledgeEntryProjection.build_id == build.build_id)
-    )
-    if row_count != build.entry_count:
-        raise KnowledgeProjectionUnavailable("row_count_mismatch")
-    if build.window_expires_at is not None:
-        bound = build.window_expires_at
-        if bound.tzinfo is None:
-            bound = bound.replace(tzinfo=timezone.utc)
-        # The pre-ACL window keeps rows with ``expires_at > now``.  At the exact
-        # expiry second the legacy window has already rolled, so ``>`` here
-        # would silently serve a shrunken window as a false no-match.
-        if _now(now) >= bound:
-            raise KnowledgeProjectionUnavailable("source_window_expired")
+
+    def count_rows() -> int | None:
+        # count(<column>), not count(*): the commit-guard read-only filter rejects
+        # SQLAlchemy's literal `*` column node, and the pin must stay a plain read.
+        return session.scalar(
+            select(func.count(KnowledgeEntryProjection.entry_id))
+            .where(KnowledgeEntryProjection.build_id == build.build_id)
+        )
+
+    reason = _published_build_read_reason(generation, build, count_rows=count_rows, now=now)
+    if reason is not None:
+        raise KnowledgeProjectionUnavailable(reason)
     return generation, build
 
 
@@ -1460,8 +1474,8 @@ class KnowledgeProjectionHandler:
         return f"knowledge_projection:{result['build_id']}:{result['generation']}"
 
 
-def projection_status(session: Session) -> dict[str, Any]:
-    """Doctor/read model for operators; never raises for absent state."""
+def projection_status(session: Session, *, now: datetime | None = None) -> dict[str, Any]:
+    """Report historical consistency separately from present read-head eligibility."""
     generation = session.get(KnowledgeSourceGeneration, 1)
     report: dict[str, Any] = {
         "available": False,
@@ -1469,20 +1483,23 @@ def projection_status(session: Session) -> dict[str, Any]:
         "format_version": generation.format_version if generation is not None else None,
         "build_id": generation.build_id if generation is not None else None,
         "reason": None,
+        "read_eligible": False,
+        "read_reason": None,
     }
+
+    def missing(reason: str) -> dict[str, Any]:
+        report["reason"] = report["read_reason"] = reason
+        return report
+
     if generation is None:
-        report["reason"] = "generation_missing"
-        return report
+        return missing("generation_missing")
     if generation.format_version != PROJECTION_SCHEMA_VERSION:
-        report["reason"] = "generation_format"
-        return report
+        return missing("generation_format")
     if not generation.build_id:
-        report["reason"] = "projection_missing"
-        return report
+        return missing("projection_missing")
     build = session.get(KnowledgeProjectionBuild, generation.build_id)
     if build is None:
-        report["reason"] = "build_missing"
-        return report
+        return missing("build_missing")
     report.update({
         "build_state": build.state,
         "build_source_generation": build.source_generation,
@@ -1491,15 +1508,27 @@ def projection_status(session: Session) -> dict[str, Any]:
         "built_at": _iso(build.built_at),
         "published_at": _iso(build.published_at),
     })
+    rows: list[KnowledgeEntryProjection] | None = None
+
+    def load_rows() -> list[KnowledgeEntryProjection]:
+        nonlocal rows
+        if rows is None:
+            rows = list(session.scalars(
+                select(KnowledgeEntryProjection).where(KnowledgeEntryProjection.build_id == build.build_id)
+            ))
+        return rows
+
+    report["read_reason"] = _published_build_read_reason(
+        generation, build, count_rows=lambda: len(load_rows()), now=now,
+    )
+    report["read_eligible"] = report["read_reason"] is None
     if build.state != "published":
         report["reason"] = "build_not_published"
         return report
     if build.source_generation != generation.generation:
         report["reason"] = "stale"
         return report
-    rows = list(session.scalars(
-        select(KnowledgeEntryProjection).where(KnowledgeEntryProjection.build_id == build.build_id)
-    ))
+    rows = load_rows()
     report["row_count"] = len(rows)
     report["entry_count_matches"] = len(rows) == build.entry_count == generation.entry_count
     report["projection_digest_matches"] = _projection_digest(rows) == build.projection_digest

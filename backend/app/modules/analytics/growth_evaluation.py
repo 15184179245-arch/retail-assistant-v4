@@ -7,19 +7,22 @@ service. No model, network, SQL, Tasks, ERP or business mutations occur.
 """
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from hashlib import sha256
 import json
 import re
 from typing import Any
 
 from backend.app.modules.analytics.sales_facts import (
-    FORMULA_VERSION as SALES_FORMULA_VERSION, project_sales_facts,
+    FORMULA_VERSION as SALES_FORMULA_VERSION,
+    _digest as _sales_source_digest, _ident as _sales_source_identity,
+    _instant as _sales_source_instant, _validated_facts as _validate_sales_chain,
+    project_sales_facts,
 )
 
 PILOT_CONTRACT_VERSION = "ana-007-offline-v1"
+REPORT_CONTRACT_VERSION_V2 = "ana-007-offline-report-v2"
 METRIC_VERSION = "1.0.0"
 READ_ONLY_ACTIONS = frozenset((
     "manual_display_review", "manual_customer_information_review",
@@ -308,19 +311,74 @@ def _operating_guardrails(observations: object, plan: dict
     }
 
 
+def _pinned_source_rows(raw: list[dict], projection: dict, snapshot: datetime) -> tuple[dict, dict]:
+    """Index only the rows ANA-004 admitted at this snapshot, including context."""
+    pins = {item["event_id"]: (item["source_version"], item["source_digest"])
+            for item in projection["provenance"]["source_versions"]}
+    matched = {}
+    for row in raw:
+        event_id = row["event_id"]
+        pin = pins.get(event_id)
+        if (pin is not None and event_id not in matched and row["source_version"] == pin[0]
+                and _sales_source_instant(row["recorded_at"]) <= snapshot
+                and _sales_source_digest(row) == pin[1]):
+            matched[event_id] = row
+    if len(matched) != len(pins):
+        _fail("growth_event_unmatched")
+    return pins, matched
+
+
+def _reconciled_source_rows(period_inputs: dict, projections: dict, snapshot: datetime) -> dict:
+    """Verify one common as-of sale/refund/reversal chain without reallocating periods."""
+    seen_events: set[str] = set()
+    asof_pins: dict[str, tuple[int, str]] = {}
+    source_owners: dict[tuple[str, str, str, str], str] = {}
+    all_visible = {}
+    rows_by_period = {}
+    for period in _PERIODS:
+        projection = projections[period]
+        contributors = {x["event_id"] for x in projection["lineage"]}
+        if not seen_events.isdisjoint(contributors):
+            _fail("growth_repeated_event_across_periods")
+        seen_events.update(contributors)
+        pins, records = _pinned_source_rows(period_inputs[period], projection, snapshot)
+        rows_by_period[period] = records
+        for event_id, record in records.items():
+            pin = pins[event_id]
+            if asof_pins.setdefault(event_id, pin) != pin:
+                _fail("growth_shared_source_revision_conflict")
+            # An exact historical original may appear as refund context in
+            # both inputs. A different local event ID is not another source fact.
+            if source_owners.setdefault(_sales_source_identity(record), event_id) != event_id:
+                _fail("growth_repeated_source_across_periods")
+            all_visible.setdefault(event_id, record)
+    # Separate windows cannot spend the same refundable balance or reverse the
+    # same target twice. Keep each projection's own dates, watermark and money.
+    with localcontext() as context:
+        # Two bounded 100k-row projections of numbers of at most 40 characters.
+        context.prec = 80
+        _validate_sales_chain(all_visible)
+    return rows_by_period
+
+
 def evaluate_growth_pilot(
     plan: dict, *, pre_events: list[dict], post_events: list[dict],
     intervention_receipts: list[dict], guardrail_observations: list[dict],
     confound_observations: list[dict], source_attestations: dict,
-    authorized: bool,
+    authorized: bool, report_contract_version: str = PILOT_CONTRACT_VERSION,
 ) -> dict:
     """Two-period, matched-group descriptive DID; causality is NEVER asserted.
 
+    V1 stays the default for exact historical replay. Explicit report V2 marks
+    unobserved cohort-periods unknown without changing the preregistered plan.
     An externally confirmed 'authorized' flag is NOT a credential; this method
     is offline and cannot open a real pilot or report verified revenue.
     """
     if authorized is not True:
         _fail("growth_scope_denied")
+    if report_contract_version not in (PILOT_CONTRACT_VERSION, REPORT_CONTRACT_VERSION_V2):
+        _fail("growth_report_contract_version_unsupported")
+    coverage_report = report_contract_version == REPORT_CONTRACT_VERSION_V2
     design = _check_plan(plan)
     pre_start, pre_end = _period(design, "pre_window")
     post_start, post_end = _period(design, "post_window")
@@ -408,27 +466,17 @@ def evaluate_growth_pilot(
     gross = {bucket: Decimal(0) for bucket in _BUCKETS}
     refund = {bucket: Decimal(0) for bucket in _BUCKETS}
     sample_ids = {bucket: set() for bucket in _BUCKETS}
+    observed_buckets: set[str] = set()
     lineage = {}
-    seen_events: set[str] = set()
-    for period, raw in (("pre", pre_events), ("post", post_events)):
+    rows_by_period = _reconciled_source_rows(
+        {"pre": pre_events, "post": post_events}, projections, validated_sources["pre"]["snapshot_at"],
+    )
+    for period in _PERIODS:
         projection = projections[period]
-        source_versions = {
-            x["event_id"]: x["source_version"]
-            for x in projection["provenance"]["source_versions"]
-        }
-        # ANA-004 itself deduplicates by stable event_id and verifies same
-        # source reference, version clock, refund/reversal chain and watermark.
-        events = {x["event_id"]: x for x in projection["lineage"]}
-        for event_id, meta in events.items():
-            if event_id in seen_events:
-                _fail("growth_repeated_event_across_periods")
-            seen_events.add(event_id)
-            candidates = [x for x in raw
-                          if x.get("event_id") == event_id
-                          and x.get("source_version") == source_versions[event_id]]
-            if len(candidates) == 0:
-                _fail("growth_event_unmatched")
-            record = candidates[0]
+        records = rows_by_period[period]
+        for meta in projection["lineage"]:
+            event_id = meta["event_id"]
+            record = records[event_id]
             grain = tuple(record.get(x) for x in ("product_id", "spec_id", "unit"))
             owners = [cohort for cohort in _COHORTS if grain in groups[cohort]]
             if len(owners) != 1 or record.get("currency") != currency:
@@ -443,6 +491,8 @@ def evaluate_growth_pilot(
                 if len(owners) != 1 or entry["currency"] != currency:
                     _fail("growth_grain_or_currency_unmatched")
                 bucket = owners[0] + "_" + period
+                # A projected refund-only or offsetting fact is still an observation.
+                observed_buckets.add(bucket)
                 amount[bucket] += Decimal(entry["net"])
                 gross[bucket] += Decimal(entry["gross"])
                 refund[bucket] += (
@@ -482,18 +532,26 @@ def evaluate_growth_pilot(
         if len(sample_ids[bucket]) < sample_floor:
             reasons.append("insufficient_sample_" + bucket)
 
-    delta_t = amount["treatment_post"] - amount["treatment_pre"]
-    delta_c = amount["control_post"] - amount["control_pre"]
-    did = delta_t - delta_c
-    if all(projections[p]["facts"] is not None for p in _PERIODS):
-        if did < _decimal(design["min_descriptive_did"]):
-            reasons.append("descriptive_uplift_below_preregistered_floor")
-
     source_complete = all(projections[p]["facts"] is not None for p in _PERIODS)
+
+    def _delta(cohort: str) -> Decimal | None:
+        pre, post = cohort + "_pre", cohort + "_post"
+        if coverage_report and not {pre, post} <= observed_buckets:
+            return None
+        return amount[post] - amount[pre]
+
+    delta_t, delta_c = _delta("treatment"), _delta("control")
+    did = delta_t - delta_c if delta_t is not None and delta_c is not None else None
+    if not source_complete:
+        delta_t = delta_c = did = None
+    elif did is not None and did < _decimal(design["min_descriptive_did"]):
+        reasons.append("descriptive_uplift_below_preregistered_floor")
+
     def _sales_stats(period: str, cohort: str) -> dict:
         key = cohort + "_" + period
-        return {"net_sales": (_money(amount[key]) if
-                              projections[period]["facts"] is not None else None),
+        observed = projections[period]["facts"] is not None and (
+            not coverage_report or key in observed_buckets)
+        return {"net_sales": _money(amount[key]) if observed else None,
                 "settled_sale_count": len(sample_ids[key])}
     report = {
         "contract_version": PILOT_CONTRACT_VERSION, "plan_digest": plan["plan_digest"],
@@ -506,9 +564,9 @@ def evaluate_growth_pilot(
             "pre": _sales_stats("pre", cohort),
             "post": _sales_stats("post", cohort),
         } for cohort in _COHORTS},
-        "descriptive_treatment_change": _money(delta_t) if source_complete else None,
-        "descriptive_control_change": _money(delta_c) if source_complete else None,
-        "descriptive_difference_in_differences": _money(did) if source_complete else None,
+        "descriptive_treatment_change": _money(delta_t) if delta_t is not None else None,
+        "descriptive_control_change": _money(delta_c) if delta_c is not None else None,
+        "descriptive_difference_in_differences": _money(did) if did is not None else None,
         "uncertainty": {
             "description": "descriptive only; no randomization proof, parallel "
                            "trends proof, variance or causal confidence interval",
@@ -538,5 +596,7 @@ def evaluate_growth_pilot(
         "publishable_as_real_business_result": False,
         "next_action": "manual_reconcile_or_new_preregistered_hypothesis",
     }
+    if coverage_report:
+        report["report_contract_version"] = REPORT_CONTRACT_VERSION_V2
     report["recalculation_digest"] = _hash(report)
     return report

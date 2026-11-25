@@ -8,7 +8,6 @@ from backend.app.db.session import get_session
 from backend.app.modules.office_review import ofc_009_service as service
 from backend.app.modules.office_review.ofc_009_schemas import (
     BatchReviewDecide,
-    BatchReviewOut,
     ReviewEnvelope,
     ReviewItemClaim,
     ReviewItemCreate,
@@ -30,16 +29,14 @@ def _ok(data: Any, message: str = "ok") -> ReviewEnvelope:
     )
 
 
-@router.post("/items", response_model=ReviewEnvelope)
+@router.post("/items", response_model=ReviewEnvelope, status_code=409,
+             response_description="Source not integrated; historical review records are read-only")
 def create_item(
     payload: ReviewItemCreate,
     actor: AuthenticatedSubject = Depends(require_authenticated_subject),
     db: Session = Depends(get_session),
 ) -> ReviewEnvelope:
-    item = service.create_review_item(db, actor, payload)
-    db.commit()
-    out = ReviewItemOut.model_validate(item, from_attributes=True)
-    return _ok(out.model_dump(), "review item created")
+    service.create_review_item(db, actor, payload)
 
 
 @router.get("/items", response_model=ReviewEnvelope)
@@ -67,7 +64,8 @@ def get_item(
     return _ok(out.model_dump(), "review item retrieved")
 
 
-@router.post("/items/{item_id}/claim", response_model=ReviewEnvelope)
+@router.post("/items/{item_id}/claim", response_model=ReviewEnvelope, status_code=409,
+             response_description="Source not integrated; historical review records are read-only")
 def claim_item(
     item_id: str,
     duration_seconds: int = Query(default=300, ge=30, le=1800),
@@ -75,26 +73,22 @@ def claim_item(
     db: Session = Depends(get_session),
 ) -> ReviewEnvelope:
     payload = ReviewItemClaim(item_id=item_id, lock_duration_seconds=duration_seconds)
-    item = service.claim_review_item(db, actor, payload)
-    db.commit()
-    out = ReviewItemOut.model_validate(item, from_attributes=True)
-    return _ok(out.model_dump(), "review item claimed")
+    service.claim_review_item(db, actor, payload)
 
 
-@router.post("/items/{item_id}/release", response_model=ReviewEnvelope)
+@router.post("/items/{item_id}/release", response_model=ReviewEnvelope, status_code=409,
+             response_description="Source not integrated; historical review records are read-only")
 def release_item(
     item_id: str,
     lock_token: str | None = Query(default=None),
     actor: AuthenticatedSubject = Depends(require_authenticated_subject),
     db: Session = Depends(get_session),
 ) -> ReviewEnvelope:
-    item = service.release_review_item(db, actor, item_id, lock_token=lock_token)
-    db.commit()
-    out = ReviewItemOut.model_validate(item, from_attributes=True)
-    return _ok(out.model_dump(), "review item released")
+    service.release_review_item(db, actor, item_id, lock_token=lock_token)
 
 
-@router.post("/items/{item_id}/decide", response_model=ReviewEnvelope)
+@router.post("/items/{item_id}/decide", response_model=ReviewEnvelope, status_code=409,
+             response_description="Source not integrated; historical review records are read-only")
 def decide_item(
     item_id: str,
     payload: ReviewItemDecide,
@@ -110,28 +104,17 @@ def decide_item(
             reason=payload.reason,
             modifications=payload.modifications,
         )
-    item, decision = service.decide_review_item(db, actor, payload)
-    db.commit()
-    return _ok(
-        {
-            "item_id": item.id,
-            "decision": decision.decision,
-            "receipt_digest": decision.receipt_digest,
-            "decided_at": decision.decided_at.isoformat(),
-        },
-        "review decision applied",
-    )
+    service.decide_review_item(db, actor, payload)
 
 
-@router.post("/batch-decide", response_model=ReviewEnvelope)
+@router.post("/batch-decide", response_model=ReviewEnvelope, status_code=409,
+             response_description="Source not integrated; historical review records are read-only")
 def batch_decide(
     payload: BatchReviewDecide,
     actor: AuthenticatedSubject = Depends(require_authenticated_subject),
     db: Session = Depends(get_session),
 ) -> ReviewEnvelope:
-    result = service.batch_decide_review_items(db, actor, payload)
-    db.commit()
-    return _ok(result.model_dump(), "batch decisions processed")
+    service.batch_decide_review_items(db, actor, payload)
 
 
 @router.get("/export", response_model=ReviewEnvelope)

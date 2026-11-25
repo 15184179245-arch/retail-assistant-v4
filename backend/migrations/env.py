@@ -1,5 +1,5 @@
 from alembic import context
-from alembic.script import ScriptDirectory
+from backend.migrations.retained_sales_history import RetainedSalesHistory, retained_sales_steps, reject_offline_reentry
 from backend.migrations.postgresql_compat import configure_migration_dialect
 from backend.migrations.sqlite_reflection import preserve_inline_fk_actions
 from backend.migrations.pi_result_forward import checked_migration_connection
@@ -65,6 +65,12 @@ def include_object(obj, name, type_, reflected, compare_to):
 
 
 def run_migrations_offline() -> None:
+    try:
+        start = context.get_starting_revision_argument()
+    except Exception:
+        # Commands without a start:end range compile the full ancestry.
+        start = None
+    reject_offline_reentry(context.script, context.get_revision_argument(), start)
     context.configure(url=config.get_main_option("sqlalchemy.url"), target_metadata=target_metadata, literal_binds=True, dialect_opts={"paramstyle": "named"}, compare_type=True, include_object=include_object)
     configure_migration_dialect(context.get_context().dialect)
     with context.begin_transaction():
@@ -73,16 +79,14 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     connectable = engine_from_config(config.get_section(config.config_ini_section, {}), prefix="sqlalchemy.", poolclass=pool.NullPool)
-    scripts = ScriptDirectory.from_config(config)
-    parents = {}
-    for revision in scripts.walk_revisions():
-        down = revision.down_revision
-        parents[revision.revision] = () if down is None else down if isinstance(down, tuple) else (down,)
-    # Raw-only preflight: current/check remain read-only and do not acquire a
-    # writer lock. Physical FK-ON BEGIN belongs only to actual0079 upgrade.
-    with checked_migration_connection(connectable, parents) as connection:
+    scripts = context.script
+    history = RetainedSalesHistory(scripts)
+    parents = history.parents
+    # Immutable source/resource proof precedes connection/DDL; current stays read-only.
+    # Equivalent Sales steps and0079 own their physical writer boundary.
+    with checked_migration_connection(connectable, parents, retained_history=history) as connection:
         configure_migration_dialect(connection.dialect)
-        with preserve_inline_fk_actions(connection):
+        with retained_sales_steps(scripts, connection, history), preserve_inline_fk_actions(connection):
             context.configure(connection=connection, target_metadata=target_metadata, compare_type=True, include_object=include_object)
             with context.begin_transaction():
                 context.run_migrations()

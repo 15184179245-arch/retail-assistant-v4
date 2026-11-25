@@ -101,7 +101,7 @@ function checkedRun(value: unknown, runId: string, runtime = false): TrialRun {
         const c = row(value);
         const observedAt = c.observed_at === null ? null : text(c.observed_at, 100);
         if (observedAt !== null && !Number.isFinite(Date.parse(observedAt))) throw new Error("protocol");
-        return { kind: member(c.kind, ["knowledge", "catalog", "memory", "guanjia_observation"]), objectId: text(c.object_id, 200),
+        return { kind: member(c.kind, ["knowledge", "catalog", "memory", "guanjia_observation", "product_image_result", "history_image_result"]), objectId: text(c.object_id, 200),
           versionRef: text(c.version_ref, 500), version: text(c.version, 200), label: text(c.label, 2000),
           sourceRef: c.source_ref === null ? null : text(c.source_ref, 2000), observedAt };
       });
@@ -117,7 +117,8 @@ function checkedRuntime(value: unknown, runId: string): TrialRuntime {
   const stream = data.contract_version === 3;
   const profileMatches = stream
     ? !memory && launch.tool_profile === "pi-readonly-v1" && launch.wire_protocol === "v4.pi-readonly/3"
-      && ["host-pi-readonly-node24-linux-online-stream-v1", "host-pi-readonly-node24-darwin-online-stream-v1"].includes(String(launch.launch_profile))
+      && ["host-pi-readonly-node24-linux-online-stream-v1", "host-pi-readonly-node24-darwin-online-stream-v1",
+        "host-pi-readonly-node24-linux-online-stream-result-v1", "host-pi-readonly-node24-darwin-online-stream-result-v1"].includes(String(launch.launch_profile))
     : data.contract_version === 2 && launch.wire_protocol === `v4.pi-${family}/2`
       && launch.tool_profile === (memory ? "pi-memory-v1" : "pi-readonly-v1")
       && [`host-pi-${family}-node24-linux-online-v1`, `host-pi-${family}-node24-darwin-online-v1`].includes(String(launch.launch_profile));

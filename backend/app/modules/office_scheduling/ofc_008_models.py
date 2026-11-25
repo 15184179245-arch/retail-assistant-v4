@@ -351,19 +351,6 @@ def immutable_guard_statements(table_name: str, dialect: str,
     return []
 
 
-def immutable_guard_drop_statements(table_name: str, dialect: str) -> list[str]:
-    """Reverse of ``immutable_guard_statements`` for the 0045 downgrade."""
-    if dialect == "sqlite":
-        return [f"DROP TRIGGER IF EXISTS trg_{table_name}_{action}_deny"
-                for action in ("update", "delete")]
-    if dialect == "postgresql":
-        return [
-            f"DROP TRIGGER IF EXISTS trg_{table_name}_deny ON {table_name}",
-            f"DROP FUNCTION IF EXISTS deny_{table_name}_mutation()",
-        ]
-    return []
-
-
 def _table_name(target) -> str:
     if hasattr(target, "__tablename__"):
         return target.__tablename__
@@ -373,11 +360,7 @@ def _table_name(target) -> str:
 
 
 def install_immutable_guards(target, connection, **_kw) -> None:
-    """Install real DML guards (SQLAlchemy ``after_create`` listener).
-
-    ``target`` may be a Table, a table name, or a schedule class, so the 0045
-    migration can pass ``"office_schedule_grants"`` without importing the ORM.
-    """
+    """Install real DML guards (SQLAlchemy ``after_create`` listener)."""
     table_name = _table_name(target)
     if table_name == _GRANT_TABLE:
         message = GRANT_IMMUTABLE_MESSAGE
@@ -387,13 +370,6 @@ def install_immutable_guards(target, connection, **_kw) -> None:
         raise ValueError(f"unknown schedule append-only table: {table_name}")
     for statement in immutable_guard_statements(table_name,
                                                 connection.dialect.name, message):
-        connection.exec_driver_sql(statement)
-
-
-def drop_immutable_guards(target, connection, **_kw) -> None:
-    """Remove the guards; used by the 0045 downgrade before dropping tables."""
-    for statement in immutable_guard_drop_statements(_table_name(target),
-                                                     connection.dialect.name):
         connection.exec_driver_sql(statement)
 
 

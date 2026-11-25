@@ -6,6 +6,7 @@ import com.retail.smartops.core.auth.Session
 import com.retail.smartops.core.auth.SessionRepository
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 class CacheUnavailable(message: String) : IllegalStateException(message)
 
@@ -89,25 +90,30 @@ object CacheRules {
         nowMs < sessionExpiryMs && nowMs < cachedExpiryMs
 }
 
+interface OfflineCatalogLookup : AutoCloseable {
+    fun lookup(text: String, limit: Int = 20): CacheView?
+}
+
 /**
- * Binding is immutable per repository and revoked on login switch / logout.
- * All DB operations must run on an IO executor (Room disallows main-thread IO).
- * No network fetch or auto-import of SyntheticCatalog/LocalDraftStore occurs.
+ * Binding is immutable for one session generation, including an identical re-login.
+ * The caller owns this handle and its database and must close it on IO when retired.
  */
 class CatalogCacheRepository(
     context: Context,
     private val sessions: SessionRepository,
     private val clock: () -> Long = System::currentTimeMillis,
     database: AppDatabase? = null,
-) : AutoCloseable {
-    private val owner = sessions.currentSession() ?: throw CacheUnavailable("login_required")
+    private val ownerGeneration: Int = sessions.status.value.generation,
+) : OfflineCatalogLookup {
+    private val owner = synchronized(sessions) {
+        sessions.currentSession()?.takeIf { sessions.status.value.generation == ownerGeneration }
+    } ?: throw CacheUnavailable("cache_scope_unavailable")
     private val identity = CacheIdentity.from(owner)
     private val database = database ?: AppDatabase.open(context, identity)
-    @Volatile private var closed = false
-    private val unregister = sessions.onScopeInvalidated { close() }
+    private val closed = AtomicBoolean()
 
     private fun ensureCurrent(actual: Session, scope: RequestScope) {
-        if (closed || !scope.isActive() || actual != owner ||
+        if (closed.get() || scope.generation != ownerGeneration || !scope.isActive() || actual != owner ||
             CacheIdentity.from(actual) != identity || clock() >= actual.expiresAtEpochMillis
         ) throw CacheUnavailable("cache_scope_unavailable")
     }
@@ -217,7 +223,7 @@ class CatalogCacheRepository(
         if (state.stagingVersion == null) null else state.stagedCount to state.nextCursor
     }
 
-    fun lookup(text: String, limit: Int = 20): CacheView? = guarded { dao ->
+    override fun lookup(text: String, limit: Int): CacheView? = guarded { dao ->
         require(limit in 1..100)
         val term = CacheRules.normalizeSearch(text)
         val state = dao.state() ?: return@guarded null
@@ -227,16 +233,14 @@ class CatalogCacheRepository(
         if (!CacheRules.canRead(clock(), owner.expiresAtEpochMillis, state.activeExpiresAtMs))
             throw CacheUnavailable("cache_expired_or_session_revoked")
         CacheView(version, state.activeObservedAtMs, state.activeExpiresAtMs,
-            dao.search(version, term, limit).map {
+            dao.search(version, term, limit, entered = text.trim()).map {
                 CachedCatalogProduct(it.productId, it.code, it.barcode, it.name,
                     it.sourceVersion)
             })
     }
 
-    @Synchronized override fun close() {
-        if (closed) return
-        closed = true
-        unregister()
-        database.close()
+    override fun close() {
+        // No session callback or monitor may be held across Room.close().
+        if (closed.compareAndSet(false, true)) database.close()
     }
 }

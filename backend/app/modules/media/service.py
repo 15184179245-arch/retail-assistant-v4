@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from pathlib import Path
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -89,6 +88,11 @@ def upload(session: Session, actor: AuthenticatedSubject, *, filename: str,
         sha256=sha256, storage_key=key, created_by=actor.subject_id,
         created_at=current,
     )
+    # Legacy SQLite otherwise commits a first SAVEPOINT when it is released,
+    # before the caller can commit or roll back metadata and audit together.
+    connection = session.connection()
+    if connection.dialect.name == "sqlite" and not connection.connection.driver_connection.in_transaction:
+        connection.exec_driver_sql("BEGIN")
     try:
         with session.begin_nested():
             session.add(asset)
@@ -139,9 +143,12 @@ def get_asset(session: Session, actor: AuthenticatedSubject, asset_id: str,
     return asset, _asset_out(asset)
 
 
-def content_path(asset: MediaAsset) -> Path:
-    root = local_storage.media_root()
-    path = (root / asset.storage_key).resolve()
-    if root not in path.parents or not path.is_file():
-        raise MediaError("media_content_missing")
-    return path
+def content_bytes(asset: MediaAsset) -> bytes:
+    try:
+        return local_storage.read_verified(
+            organization_id=asset.organization_id, store_id=asset.store_id,
+            key=asset.storage_key, sha256=asset.sha256, byte_size=asset.byte_size,
+            content_type=asset.content_type,
+        )
+    except MediaStorageError:
+        raise MediaError("media_content_missing") from None

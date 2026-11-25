@@ -1,6 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { ApiError } from "../../lib/api/client";
-import { authorizedRequest, getScopeVersion } from "../../lib/auth/session";
+import { authorizedRequest, getScopeVersion, subscribe } from "../../lib/auth/session";
+import { getCapabilityEpoch, hasCapability, subscribeCapabilities, useCapabilities } from "../../lib/auth/capabilities";
+import { businessPermission } from "../../lib/auth/businessPermissions";
+import { StocktakeEvidenceViewer } from "../stocktake/StocktakeEvidenceViewer";
 import type { Session } from "../../lib/auth/session";
 
 type Confidence =
@@ -102,8 +105,15 @@ export function AnalyticsPage({
   const [items, setItems] = useState<AnalyticsSnapshotItem[]>(initialItems ?? []);
   const [loading, setLoading] = useState(initialItems === undefined);
   const [message, setMessage] = useState<string | null>(null);
+  const scope = useSyncExternalStore(subscribe, getScopeVersion, getScopeVersion);
+  const epoch = useSyncExternalStore(subscribeCapabilities, getCapabilityEpoch, getCapabilityEpoch);
+  const capabilities = useCapabilities();
+  const mayReadEvidence = capabilities.hasCapability("analytics.read") &&
+    capabilities.hasCapability(businessPermission.stocktake.read);
+  const [evidence, setEvidence] = useState<{ snapshotId: string; key: string; scope: number; epoch: number } | null>(null);
 
   const reload = () => {
+    setEvidence(null);
     const version = getScopeVersion();
     setLoading(true);
     setMessage(null);
@@ -180,20 +190,31 @@ export function AnalyticsPage({
                 <li key={w}>{warningLabels[w] ?? "存在未核验来源"}</li>)}</ul>
             </div>
           ) : null}
-          <details>
+          <details onToggle={event => {
+            if (!event.currentTarget.open) setEvidence(previous => previous?.snapshotId === item.id ? null : previous);
+          }}>
             <summary>来源、口径和版本（可复核）</summary>
             <p>指标：{item.metric_id} / {item.metric_version}</p>
             <p>公式：{item.formula_version}（{item.formula_digest}）</p>
             <p>来源摘要：{item.source_digest}</p>
             <p>结果摘要：{item.result_digest}</p>
             <p>盘点会话：{item.session_id}（第 {item.source_session_version} 版）</p>
-            <ul>{item.sources.map((ref) => (
-              <li key={ref.id}>
+            {!mayReadEvidence && <p>当前没有原始盘点证据的读取权限。</p>}
+            <ul>{item.sources.map((ref) => {
+              const key = JSON.stringify([item.id, item.version, item.session_id, ref.id, ref.event_seq]);
+              const opened = mayReadEvidence && evidence?.scope === scope && evidence.epoch === epoch && evidence.key === key;
+              return <li key={key}>
                 观察事件 {ref.id}（序号 {ref.event_seq}）
                 {" · "}{ref.conversion_status}
-                {" · "}<a href={ref.source_url}>查看原始盘点证据（需独立授权）</a>
-              </li>
-            ))}</ul>
+                {" · "}<button type="button" aria-expanded={opened} disabled={!mayReadEvidence} onClick={() => {
+                  if (getScopeVersion() !== scope || getCapabilityEpoch() !== epoch ||
+                      !hasCapability("analytics.read") || !hasCapability(businessPermission.stocktake.read)) return;
+                  setEvidence(opened ? null : { snapshotId: item.id, key, scope, epoch });
+                }}>{opened ? "收起原始盘点证据" : "在此页查看原始盘点证据（需盘点读取权限）"}</button>
+                {opened && <StocktakeEvidenceViewer key={key} scope={scope} epoch={epoch}
+                  sessionId={item.session_id} observationId={ref.id} sequence={ref.event_seq} />}
+              </li>;
+            })}</ul>
           </details>
           <p style={{ fontSize: 12, color: "#67766e" }}>
             本页不会发送任何正式库存、采购或价格写操作。

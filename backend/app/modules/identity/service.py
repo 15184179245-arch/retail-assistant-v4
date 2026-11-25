@@ -110,8 +110,7 @@ def resolve_effective_capabilities(
         if permission_allowed(scope_grants, actor.subject_id, now=current):
             effective_caps.append(permission)
             decisions = effective_permission_grants(scope_grants, actor.subject_id, now=current)
-            for d in decisions:
-                deciding_signatures.append(f"{d.id}:{d.granted}")
+            deciding_signatures.extend(sorted(f"{d.id}:{d.granted}" for d in decisions))
 
     payload = f"{actor.subject_id}@{actor.organization_id}/{actor.store_id}:" + ",".join(effective_caps) + ":" + ";".join(deciding_signatures)
     cap_version = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

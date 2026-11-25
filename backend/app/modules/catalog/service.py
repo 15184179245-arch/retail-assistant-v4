@@ -13,6 +13,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from backend.app.modules.integrations.guanjia.catalog_mapper import source_active, source_barcode
 from backend.app.modules.catalog import repository
 from backend.app.modules.catalog.models import (CatalogConflict, CatalogExtension,
                                                 CatalogProduct, CatalogSnapshot)
@@ -71,8 +72,9 @@ def map_source_payload(payload: dict[str, Any]) -> dict[str, Any]:
     external_code = _as_text(payload.get("code"))
     if not external_code.strip():
         raise ValueError("code is required")
+    source_active(payload)
     standard = (payload.get("baseProductStandardList") or [{}])[0] or {}
-    barcode, flags = classify_barcode(payload.get("barCode"))
+    barcode, flags = classify_barcode(source_barcode(payload, standard))
     return {
         "external_code": external_code,
         "barCode": barcode,
@@ -120,6 +122,17 @@ def _detect_conflicts(session: Session, *, product: CatalogProduct,
     return conflicts
 
 
+def observation_digest(mapped: dict[str, Any], *, source_version: str,
+                       source_updated_at: datetime | None) -> str:
+    """Shared observation identity for preview and append; no DB effects."""
+    observation = {
+        "payload": mapped,
+        "source_version": source_version,
+        "source_updated_at": source_updated_at.isoformat() if source_updated_at else None,
+    }
+    return hashlib.sha256(_canonical(observation).encode("utf-8")).hexdigest()
+
+
 def record_snapshot(session: Session, *, organization_id: str, store_id: str,
                     source_system: str, source_version: str,
                     source_updated_at: datetime | None, payload: dict[str, Any],
@@ -129,12 +142,9 @@ def record_snapshot(session: Session, *, organization_id: str, store_id: str,
     # The digest covers the source observation (payload + version/time), so an
     # A -> B -> A return is a new observation even when the payload bytes match
     # an older snapshot.
-    observation = {
-        "payload": mapped,
-        "source_version": source_version,
-        "source_updated_at": source_updated_at.isoformat() if source_updated_at else None,
-    }
-    sha = hashlib.sha256(_canonical(observation).encode("utf-8")).hexdigest()
+    sha = observation_digest(mapped, source_version=source_version,
+                             source_updated_at=source_updated_at)
+    active = source_active(payload)
     product = repository.find_by_external(session, organization_id, store_id,
                                          source_system, mapped["external_code"])
     if product is None:
@@ -142,10 +152,14 @@ def record_snapshot(session: Session, *, organization_id: str, store_id: str,
             id=str(uuid4()), organization_id=organization_id, store_id=store_id,
             source_system=source_system, external_code=mapped["external_code"],
             source_version=source_version, source_updated_at=source_updated_at,
-            active=True, version=1, created_at=timestamp, updated_at=timestamp,
+            active=active if active is not None else True, version=1,
+            created_at=timestamp, updated_at=timestamp,
         )
         session.add(product)
         session.flush()
+    active_changed = active is not None and product.active != active
+    if active is not None:
+        product.active = active
     raw_barcode = mapped.get("barCode")
     product.barcode_sha256 = (hashlib.sha256(raw_barcode.encode()).hexdigest()
                               if isinstance(raw_barcode, str) else None)
@@ -153,6 +167,10 @@ def record_snapshot(session: Session, *, organization_id: str, store_id: str,
     existing = repository.snapshot_by_sha(session, product.id, sha)
     if existing is not None:
         if product.current_snapshot_id == existing.id:
+            if active_changed:
+                product.version += 1
+                product.updated_at = timestamp
+                session.flush()
             return product, existing, []  # exact replay of the current observation
         # Historical observation returned: restore the current projection and
         # re-run conflict checks against the previous current snapshot.
@@ -212,7 +230,7 @@ def add_extension(session: Session, *, organization_id: str, store_id: str,
 
 def list_products(session: Session, *, organization_id: str, store_id: str,
                   limit: int = 50) -> list[tuple[CatalogProduct, CatalogSnapshot | None]]:
-    return [(product, repository.latest_snapshot(session, product))
+    return [(product, repository.read_latest_snapshot(session, product))
             for product in repository.list_products(session, organization_id, store_id, limit)]
 
 
@@ -221,7 +239,7 @@ def get_product(session: Session, *, organization_id: str, store_id: str,
     product = repository.find_product(session, organization_id, store_id, product_id)
     if product is None:
         raise HTTPException(404, "catalog_product_not_found")
-    return product, repository.latest_snapshot(session, product)
+    return product, repository.read_latest_snapshot(session, product)
 
 
 def list_conflicts(session: Session, *, organization_id: str, store_id: str,

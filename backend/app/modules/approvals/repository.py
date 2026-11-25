@@ -47,13 +47,6 @@ def compare_and_set_approval_state(
     return result.rowcount == 1
 
 
-def list_for_scope(session: Session, organization_id: str, store_id: str) -> list[ApprovalRequest]:
-    return list(session.scalars(select(ApprovalRequest).where(
-        ApprovalRequest.organization_id == organization_id,
-        ApprovalRequest.store_id == store_id,
-    ).order_by(ApprovalRequest.requested_at.desc())))
-
-
 def list_page_for_scope(
     session: Session,
     organization_id: str,

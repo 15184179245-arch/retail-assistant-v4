@@ -148,11 +148,6 @@ fun FieldWorkbenchShell(
                     ),
                 )
             },
-            onHumanFieldEdit = { _, field, value -> controller.applyHumanFieldEdit(field, value) },
-            onUnlockField = { _, field -> controller.unlockField(field) },
-            onAcceptSuggestion = { _, field, opId -> controller.acceptSuggestion(field, opId) },
-            onIgnoreSuggestion = { _, field, opId -> controller.ignoreSuggestion(field, opId) },
-            onUndoOp = { _, opId -> controller.undoOperation(opId) },
             onOpenActionConfirm = { actionBlock -> controller.openCommandConfirm(actionBlock) },
             onSelectProduct = { props ->
                 val code = (props["external_code"] as? String)

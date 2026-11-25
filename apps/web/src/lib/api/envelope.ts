@@ -75,5 +75,16 @@ export function parseEnvelope<T = unknown>(payload: unknown): ApiEnvelope<T> {
     });
   }
 
+  for (const field of ["error", "hint"] as const) {
+    if (record[field] !== null && typeof record[field] !== "string") {
+      throw new ApiError(`服务端响应字段 '${field}' 必须为字符串或 null。`, {
+        status: 0,
+        code: "INVALID_ENVELOPE",
+        userMessage: "服务端返回格式异常，提示信息类型不正确。",
+        hint: "请核对后端返回格式。",
+      });
+    }
+  }
+
   return record as unknown as ApiEnvelope<T>;
 }

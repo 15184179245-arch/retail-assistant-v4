@@ -45,6 +45,10 @@ class OutboxMessage:
     store_id: str
     event_type: str
     payload: dict
+    # Frozen original claim identity, never reconstructed from a later DB row.
+    # Defaults only preserve handler-only synthetic message construction.
+    lease_attempt: int | None = None
+    lease_until: datetime | None = None
 
 
 class Handler(Protocol):
@@ -59,6 +63,8 @@ def _message(row: OutboxEvent) -> OutboxMessage:
         store_id=row.store_id,
         event_type=row.event_type,
         payload=row.payload,
+        lease_attempt=row.attempts,
+        lease_until=row.lease_until,
     )
 
 
@@ -126,6 +132,8 @@ def run_once(
                 session,
                 event_id=message.id,
                 worker_id=worker_id,
+                expected_attempt=message.lease_attempt,
+                expected_lease_until=message.lease_until,
                 external_receipt=receipt,
                 now=now,
             )
@@ -134,6 +142,8 @@ def run_once(
                 session,
                 event_id=message.id,
                 worker_id=worker_id,
+                expected_attempt=message.lease_attempt,
+                expected_lease_until=message.lease_until,
                 error=error_code,
                 max_attempts=max_attempts,
                 now=now,

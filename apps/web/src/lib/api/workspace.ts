@@ -123,6 +123,7 @@ async function workspaceRequest<T>(
     body?: unknown;
     headers?: Record<string, string>;
     signal?: AbortSignal;
+    cache?: RequestCache;
     timeoutMs?: number;
     idempotencyKey?: string;
   } = {},
@@ -140,6 +141,7 @@ async function workspaceRequest<T>(
     method: options.method,
     body: options.body,
     signal: options.signal,
+    cache: options.cache,
     timeoutMs: options.timeoutMs ?? 8000,
     idempotencyKey: options.idempotencyKey,
     headers: {
@@ -169,13 +171,14 @@ function normalizeMutationResult(
 export async function listArtifacts(params: {
   threadId?: string;
   q?: string;
+  signal?: AbortSignal;
 } = {}): Promise<WorkspaceArtifactDto[]> {
   const sp = new URLSearchParams();
   if (params.threadId) sp.set("thread_id", params.threadId);
   const qs = sp.toString();
   const res = await workspaceRequest<
     WorkspaceArtifactDto[] | { items: WorkspaceArtifactDto[] }
-  >(`/api/v1/workspace/artifacts${qs ? `?${qs}` : ""}`);
+  >(`/api/v1/workspace/artifacts${qs ? `?${qs}` : ""}`, { cache: "no-store", signal: params.signal });
   const items = Array.isArray(res) ? res : (res?.items ?? []);
   if (!params.q) {
     return items;
@@ -221,9 +224,9 @@ export async function createArtifact(input: {
   return normalizeMutationResult(res);
 }
 
-export async function getArtifactDetail(artifactId: string): Promise<ArtifactDetailResult> {
+export async function getArtifactDetail(artifactId: string, signal?: AbortSignal): Promise<ArtifactDetailResult> {
   const res = await workspaceRequest<ArtifactDetailResult | WorkspaceArtifactDto>(
-    `/api/v1/workspace/artifacts/${encodeURIComponent(artifactId)}`,
+    `/api/v1/workspace/artifacts/${encodeURIComponent(artifactId)}`, { signal, cache: "no-store" },
   );
   if ("artifact" in res) {
     return {
@@ -387,11 +390,19 @@ export async function getThreadWorkspace(threadId: string): Promise<ThreadWorksp
   );
 }
 
+export type WorkspaceNavigationRef = Pick<OpenObjectRefDto, "kind" | "id" | "path" | "artifact_id">;
+
+// Navigation needs identity, not display text. Construct the request from
+// allowed fields even if a structurally compatible runtime object has extras.
+function navigationWireRef({ kind, id, path, artifact_id }: WorkspaceNavigationRef): WorkspaceNavigationRef {
+  return { kind, id, path, artifact_id };
+}
+
 export async function syncThreadWorkspace(
   threadId: string,
   input: {
-    open_objects: OpenObjectRefDto[];
-    active_object_ref: OpenObjectRefDto | null;
+    open_objects: WorkspaceNavigationRef[];
+    active_object_ref: WorkspaceNavigationRef | null;
     base_version?: number;
   },
 ): Promise<ThreadWorkspaceDto> {
@@ -401,8 +412,8 @@ export async function syncThreadWorkspace(
       method: "PUT",
       body: {
         base_version: input.base_version ?? null,
-        open_objects: input.open_objects,
-        active_object_ref: input.active_object_ref,
+        open_objects: input.open_objects.map(navigationWireRef),
+        active_object_ref: input.active_object_ref ? navigationWireRef(input.active_object_ref) : null,
         device: getClientDeviceId(),
       },
     },
@@ -507,7 +518,7 @@ export interface CommandSearchResult {
   degraded: boolean;
 }
 
-export async function searchCommandObjects(query: string): Promise<CommandSearchResult> {
+export async function searchCommandObjects(query: string, signal?: AbortSignal): Promise<CommandSearchResult> {
   const isCurrent = captureSessionScope();
   const trimmed = query.trim();
   const qParam = trimmed ? `?q=${encodeURIComponent(trimmed)}&limit=20` : "?limit=20";
@@ -532,12 +543,13 @@ export async function searchCommandObjects(query: string): Promise<CommandSearch
             source_system?: string;
             captured_at?: string;
           }>;
-        }>(`/api/v1/search${qParam}`, { timeoutMs: 4000 })
+        }>(`/api/v1/search${qParam}`, { timeoutMs: 4000, cache: "no-store", signal })
       : Promise.resolve({ exact: [], candidates: [] }),
-    listArtifacts({ q: trimmed || undefined }),
+    listArtifacts({ q: trimmed || undefined, signal }),
   ]);
 
   if (!isCurrent()) throw new ApiError("身份已改变，旧搜索结果已丢弃。", { status: 0, code: "STALE_SCOPE", userMessage: "请在当前身份下重新搜索。" });
+  signal?.throwIfAborted();
   const seenIds = new Set<string>();
   const products: CatalogSearchItemDto[] = [];
   if (productsRes.status === "fulfilled") {
@@ -723,6 +735,8 @@ export function subscribeWorkspaceEvents(options: WorkspaceStreamOptions): () =>
         }
       }
     } catch {
+      // A subsequent failed refresh is not the previous successful EOF.
+      endedCleanly = false;
       // Fall through to backoff reconnect unless closed or scope switched
     } finally {
       release();

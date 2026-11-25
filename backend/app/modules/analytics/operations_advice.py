@@ -346,8 +346,9 @@ def make_manual_action_receipt(
     _required(reason, "reason", maximum=2000)
     due = _when(review_due_at, "review_due_at")
     stamped = _when(recorded_at, "recorded_at")
-    # Compare explicit clock times only, never infer who owns business due date.
-    if datetime.fromisoformat(due) < datetime.fromisoformat(stamped):
+    # Set the review deadline at the initial decision. Later receipts keep
+    # that deadline but may truthfully record that the action occurred late.
+    if state["version"] == 0 and datetime.fromisoformat(due) < datetime.fromisoformat(stamped):
         _fail("advice_due_before_decision")
     if type(expected_version) is not int or expected_version < 0:
         _fail("advice_expected_version_invalid")

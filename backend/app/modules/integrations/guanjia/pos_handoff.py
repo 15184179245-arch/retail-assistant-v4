@@ -281,7 +281,7 @@ def _prepare_delivery(factory, actor, handoff_id):
     with _owned_session(factory) as session:
         draft, handoff, attempt = _read_pair(session, actor, handoff_id)
         initial = _binding(draft, handoff, attempt)
-        if handoff.delivery_ref or handoff.handoff_state in ("confirmed", "failed"):
+        if handoff.delivery_ref or sales_service._receipt_terminal(draft, handoff):
             return initial, "known"
         if handoff.external_ref:
             raise PosError("pos_legacy_delivery_requires_manual")
@@ -294,7 +294,7 @@ def _prepare_delivery(factory, actor, handoff_id):
         attempt = _attempt(session, handoff)
         # The first read located the object only. Another authorized local
         # receipt can have made it unknown before this command got its fence.
-        if handoff.handoff_state in ("confirmed", "failed"):
+        if sales_service._receipt_terminal(draft, handoff):
             return _binding(draft, handoff, attempt), "known"
         if handoff.external_ref:
             raise PosError("pos_legacy_delivery_requires_manual")
@@ -403,13 +403,22 @@ def reconcile_receipts(session, actor, handoff_id, gateway, *, now=None):
     return reconcile_receipts_owned(_factory_from_session(session), actor, handoff_id, gateway)
 
 
-def _mark_unknown(draft, handoff, current):
-    if handoff.handoff_state != "receipt_unknown" or draft.sync_state != "conflict":
+def _note_receipt_conflict(session, actor, draft, handoff, current, action, key, details=None):
+    terminal = sales_service._receipt_terminal(draft, handoff)
+    if terminal:
+        # Report a disputed settlement without altering its reference, timestamp
+        # or state. The same evidence may also have been seen before settlement.
+        key = f"terminal:{key}"
+        changed = draft.sync_state != "conflict"
+    else:
+        changed = handoff.handoff_state != "receipt_unknown" or draft.sync_state != "conflict"
+        if changed:
+            handoff.handoff_state, handoff.updated_at = "receipt_unknown", current
+    if changed:
         draft.version += 1
-        draft.updated_at = current
-        handoff.updated_at = current
-    handoff.handoff_state = "receipt_unknown"
-    draft.sync_state = "conflict"
+        draft.sync_state, draft.updated_at = "conflict", current
+    _audit(session, actor, action, handoff, key, current, details)
+    return handoff
 
 
 def _apply_receipt_candidates(session, actor, draft, handoff, receipts, current):
@@ -429,33 +438,28 @@ def _apply_receipt_candidates(session, actor, draft, handoff, receipts, current)
         for item in unique.values())
     audit_digest = hashlib.sha256("|".join(classification).encode()).hexdigest()
     if conflicts:
-        _mark_unknown(draft, handoff, current)
-        _audit(session, actor, "sales.pos_receipt_partial_or_mismatch", handoff,
-               f"mismatch:{audit_digest}", current,
-               {"candidate_count": len(unique), "classified": classification})
-        return handoff
+        return _note_receipt_conflict(session, actor, draft, handoff, current,
+            "sales.pos_receipt_partial_or_mismatch", f"mismatch:{audit_digest}",
+            {"candidate_count": len(unique), "classified": classification})
     if not matching:
         return handoff
     if len(matching) > 1:
-        _mark_unknown(draft, handoff, current)
-        _audit(session, actor, "sales.pos_receipt_ambiguous", handoff,
-               f"ambiguous:{audit_digest}", current,
-               {"candidate_count": len(unique), "classified": classification})
-        return handoff
+        return _note_receipt_conflict(session, actor, draft, handoff, current,
+            "sales.pos_receipt_ambiguous", f"ambiguous:{audit_digest}",
+            {"candidate_count": len(unique), "classified": classification})
     receipt = matching[0]
     try:
-        sales_service.record_receipt(
+        recorded = sales_service.record_receipt(
             session, actor, handoff.id,
             ReceiptCreate(external_ref=receipt.external_ref, paid=receipt.paid),
             idempotency_key=f"pos:{receipt.digest}", receipt_source="pos", now=current,
         )
     except sales_service.SalesError as error:
         if error.code in ("sales_idempotency_conflict", "sales_receipt_conflict"):
-            _mark_unknown(draft, handoff, current)
-            _audit(session, actor, "sales.pos_receipt_conflict", handoff,
-                   f"conflict:{receipt.digest}", current)
-            return handoff
+            return _note_receipt_conflict(session, actor, draft, handoff, current,
+                "sales.pos_receipt_conflict", f"conflict:{receipt.digest}")
         raise
+    # Exact replays keep the original audit meaning even if current state differs.
     _audit(session, actor, "sales.pos_receipt_matched", handoff,
-           f"matched:{receipt.digest}", current)
+           f"matched:{receipt.digest}", current, {"state": recorded.handoff_state})
     return handoff

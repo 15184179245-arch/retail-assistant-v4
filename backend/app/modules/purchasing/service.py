@@ -20,7 +20,7 @@ from backend.app.modules.purchasing.models import (PurchaseCommand, PurchaseEvid
                                                   PurchaseIntent, PurchaseIntentLine)
 from backend.app.modules.purchasing.schemas import (PurchaseEvidenceOut, PurchaseIntentCreate,
                                                    PurchaseIntentOut, PurchaseLineConfirm,
-                                                   PurchaseLineOut)
+                                                   PurchaseLineOut, canonical_quantity)
 
 READ, WRITE = "purchasing.read", "purchasing.write"
 
@@ -140,6 +140,7 @@ def confirm_line(session: Session, actor: AuthenticatedSubject, intent_id: str, 
                  now: datetime | None = None) -> dict:
     current = _now(now)
     _require(session, actor, WRITE, current)
+    # Keep the submitted Decimal representation in the idempotency proof.
     command_payload = {"intent_id": intent_id, "line_id": line_id,
                        **payload.model_dump(mode="json")}
 
@@ -172,7 +173,7 @@ def confirm_line(session: Session, actor: AuthenticatedSubject, intent_id: str, 
             ).execution_options(synchronize_session=False)).rowcount
         if changed != 1:
             raise PurchaseError("purchase_version_conflict")
-        quantity = format(payload.quantity, "f")
+        quantity = canonical_quantity(payload.quantity)
         line.product_id = product.id
         line.product_version = product.version
         line.quantity = quantity

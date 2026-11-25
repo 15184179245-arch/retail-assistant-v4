@@ -44,6 +44,11 @@ IDEMPOTENCY_HEADER = "Idempotency-Key"
 
 ENVELOPE_FIELDS = ("success", "data", "code", "error", "user_message", "hint")
 SIGNATURE_ALGORITHM = "HMAC-SHA256"
+SIGNED_RESPONSE_COMMON_FIELDS = (
+    "contract_id", "adapter_id", "protocol_version", "mode",
+    "organization_id", "store_id",
+)
+_ACKNOWLEDGED_TRUE = True
 CANONICAL_JSON = {
     "ensure_ascii": False,
     "sort_keys": True,
@@ -334,9 +339,9 @@ class SandboxDispatchAck(WireCommon):
     @field_validator("acknowledged", mode="before")
     @classmethod
     def acknowledged_must_be_true(cls, value):
-        if value is not True:
+        if value is not _ACKNOWLEDGED_TRUE:
             raise ValueError("acknowledgement must be true")
-        return True
+        return _ACKNOWLEDGED_TRUE
 
 
 class SandboxReadbackLine(StrictDTO):
@@ -535,6 +540,46 @@ class LoopbackSandboxConfig(StrictDTO):
         return value
 
 
+def _signed_response_schema(model: type[WireCommon]) -> dict[str, Any]:
+    schema = model.model_json_schema()
+    required = schema["required"]
+    required.extend(field for field in SIGNED_RESPONSE_COMMON_FIELDS if field not in required)
+    if model is SandboxDispatchAck:
+        schema["properties"]["acknowledged"]["const"] = _ACKNOWLEDGED_TRUE
+    return schema
+
+
+def build_contract_schema() -> dict[str, Any]:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "ERP-003 synthetic ERP sandbox wire contract v1",
+        "description": (
+            "Generated from backend/app/modules/erp_commands/erp_003_wire.py. "
+            "Synthetic loopback-only protocol; it is not a Guanjiapo official API."
+        ),
+        "contract_id": CONTRACT_ID,
+        "adapter_id": ADAPTER_ID,
+        "mode": MODE,
+        "protocol_version": PROTOCOL_VERSION,
+        "envelope_fields": list(ENVELOPE_FIELDS),
+        "signature_algorithm": {
+            "name": SIGNATURE_ALGORITHM,
+            "nonce_header": NONCE_HEADER,
+            "secret_header": KEY_HEADER,
+            "signed_bytes": (
+                "UTF-8 canonical JSON of response data with the signature key "
+                "removed (sorted keys, compact separators, no NaN)"
+            ),
+            "signature_format": "lowercase hex, 64 characters",
+            "comparison": "constant-time",
+        },
+        "capabilities": _signed_response_schema(SandboxCapabilities),
+        "dispatch_request": SandboxDispatchRequest.model_json_schema(),
+        "dispatch_ack": _signed_response_schema(SandboxDispatchAck),
+        "readback_receipt": _signed_response_schema(SandboxReadbackReceipt),
+    }
+
+
 __all__ = [
     "CONTRACT_ID",
     "ADAPTER_ID",
@@ -547,6 +592,7 @@ __all__ = [
     "IDEMPOTENCY_HEADER",
     "ENVELOPE_FIELDS",
     "SIGNATURE_ALGORITHM",
+    "SIGNED_RESPONSE_COMMON_FIELDS",
     "CANONICAL_JSON",
     "MAX_REQUEST_BYTES",
     "MAX_RESPONSE_BYTES",
@@ -564,5 +610,6 @@ __all__ = [
     "SandboxReadbackReceipt",
     "line_input_digest",
     "queue_input_digest",
+    "build_contract_schema",
     "LoopbackSandboxConfig",
 ]

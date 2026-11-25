@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { ApiError } from "../lib/api/client";
 import { L1CoeditField, type PendingAiSuggestion } from "../blocks";
 import { Button } from "../components/Button";
 import { StatusBadge } from "../components/StatusBadge";
@@ -8,6 +9,7 @@ import {
   type EvidenceCardItem,
 } from "../components/templates";
 import {
+  type ArtifactDetailResult,
   type ArtifactMutationResult,
   acceptArtifactSuggestion,
   getArtifactDetail,
@@ -18,15 +20,16 @@ import {
   unlockArtifactFields,
 } from "../lib/api/workspace";
 import { captureSessionScope, getScopeVersion, type Session } from "../lib/auth/session";
+import { getCapabilityEpoch, getCapabilityStatus, hasCapability, subscribeCapabilities, useCapabilities } from "../lib/auth/capabilities";
+import { canWriteArtifact } from "../lib/auth/businessPermissions";
 import { acknowledgeDraftInput, createArtifactContextFence, createArtifactMutationQueue } from "./artifactMutationQueue";
 import type { PendingSuggestionDto, WorkspaceArtifactDto } from "../lib/api/generated";
 import {
-  appendArtifactOp,
-  clearAiModifiedField,
+  evictArtifactFacts,
+  updateArtifactDraftInputs,
   getWorkspaceState,
   pushToast,
   setArtifactOps,
-  setPartialUndoNotice,
   setTabDirty,
   upsertArtifact,
   useWorkspaceState,
@@ -37,7 +40,7 @@ export interface ArtifactCoeditWorkspaceProps {
   artifactId: string;
   tabId: string;
   session: Session;
-  onRequestL2Submit: (artifact: WorkspaceArtifactDto) => void;
+  onOpenSubmitBoundary: () => void;
   onSyncArtifactToThread?: (artifact: WorkspaceArtifactDto) => void;
 }
 
@@ -120,18 +123,32 @@ export function ArtifactCoeditWorkspace({
   artifactId,
   tabId,
   session,
-  onRequestL2Submit,
+  onOpenSubmitBoundary,
 }: ArtifactCoeditWorkspaceProps) {
   const ws = useWorkspaceState();
-  const artifact = ws.artifactsById[artifactId];
-  const ops = ws.opsByArtifactId[artifactId] ?? [];
-  const aiFields = ws.aiModifiedFields[artifactId] ?? {};
-  const partialUndo = ws.partialUndoByArtifactId[artifactId];
-  const [draftInputs, setDraftInputs] = useState<Record<string, string>>({});
+  const { hasCapability: hasGrant, status: capabilityStatus } = useCapabilities();
+  const scope = getScopeVersion();
+  const epoch = useSyncExternalStore(subscribeCapabilities, getCapabilityEpoch, getCapabilityEpoch);
+  const contextKey = JSON.stringify([scope, epoch, ws.activeThreadId, artifactId, tabId]);
+  type Proof = { key: string; detail: ArtifactDetailResult };
+  const [readProof, setReadProof] = useState<Proof | null>(null);
+  const readProofRef = useRef<Proof | null>(null);
+  const [readIssue, setReadIssue] = useState<{ key: string; message: string } | null>(null);
+  const readJob = useRef<AbortController | null>(null);
+  const mounted = useRef(false);
+  const versionFloor = useRef<{ key: string; version: number } | null>(null);
+  const [writeDenied, setWriteDenied] = useState(false);
+  const writeDeniedRef = useRef(false);
+  const [undoNotice, setUndoNotice] = useState<{key: string; skippedFields: string[]; message: string} | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-
-  const contextKey = JSON.stringify([getScopeVersion(), ws.activeThreadId, artifactId, tabId]);
+  const artifact = capabilityStatus === "ready" && readProof?.key === contextKey ? readProof.detail.artifact : undefined;
+  const canEdit = !!artifact && !writeDenied && artifact.status !== "submitted" && canWriteArtifact(artifact.kind, hasGrant);
+  const ops = artifact && readProof ? readProof.detail.ops : [];
+  const partialUndo = artifact && undoNotice?.key === contextKey ? undoNotice : null;
+  const draftInputs = ws.draftInputsByThread[ws.activeThreadId]?.[tabId] ?? {};
+  const setDraftInputs = (update: (previous: Record<string, string>) => Record<string, string>) =>
+    updateArtifactDraftInputs(ws.activeThreadId, tabId, update);
   const contextFence = useRef(createArtifactContextFence());
   const fieldRevisions = useRef<Record<string, number>>({});
   contextFence.current.enter(contextKey);
@@ -139,52 +156,109 @@ export function ArtifactCoeditWorkspace({
     const scopeCurrent = captureSessionScope();
     const generationCurrent = contextFence.current.capture(contextKey);
     const threadId = ws.activeThreadId;
-    return () => scopeCurrent() && generationCurrent()
+    return () => scopeCurrent() && generationCurrent() && getCapabilityStatus() === "ready"
+      && getCapabilityEpoch() === epoch
       && getWorkspaceState().activeThreadId === threadId
       && getWorkspaceState().activeTabId === tabId;
   };
-  useEffect(() => {
-    contextFence.current.activate();
-    return () => { contextFence.current.invalidate(); };
-  }, [contextKey]);
+  const currentProof = () => readProofRef.current?.key === contextKey ? readProofRef.current.detail.artifact : undefined;
+  const allowsMutation = () => {
+    const proof = currentProof();
+    return !!proof && getCapabilityStatus() === "ready" && getCapabilityEpoch() === epoch
+      && !writeDeniedRef.current && proof.status !== "submitted" && canWriteArtifact(proof.kind, hasCapability);
+  };
+  const replaceProof = (next: Proof | null) => {
+    readProofRef.current = next;
+    setReadProof(next);
+  };
 
   const enqueueCurrentArtifactOp = (task: (isCurrent: () => boolean) => Promise<void>) => {
     // Capture before queueing. A later task may not borrow another object/context.
+    if (!allowsMutation()) return;
     const contextCurrent = captureEditingContext();
     return enqueueArtifactOp(artifactId, async (scopeCurrent) => {
       const isCurrent = () => scopeCurrent() && contextCurrent();
-      if (!isCurrent()) return;
+      if (!isCurrent() || !allowsMutation()) return;
       await task(isCurrent);
     });
   };
 
-  useEffect(() => {
+  async function readArtifact(notify = false, acknowledgeAtLeast = 0): Promise<boolean> {
+    if (!mounted.current || capabilityStatus !== "ready") return false;
+    contextFence.current.activate();
     const contextCurrent = captureEditingContext();
-    let cancelled = false;
-    const isCurrent = () => !cancelled && contextCurrent();
-    void getArtifactDetail(artifactId)
-      .then((detail) => {
-        if (!isCurrent()) return;
-        upsertArtifact(detail.artifact);
-        setArtifactOps(artifactId, detail.ops);
-      })
-      .catch(() => { if (isCurrent()) setStatusError("尚未核实服务端当前草稿。下方缓存不代表最新状态，请先核查。"); });
-    return () => { cancelled = true; };
-  }, [contextKey]);
+    if (!contextCurrent()) return false;
+    readJob.current?.abort();
+    const request = new AbortController();
+    readJob.current = request;
+    const isCurrent = () => readJob.current === request && !request.signal.aborted && contextCurrent();
+    const previous = versionFloor.current?.key === contextKey ? versionFloor.current.version : 0;
+    const minimumVersion = Math.max(previous, acknowledgeAtLeast);
+    versionFloor.current = { key: contextKey, version: minimumVersion };
+    replaceProof(null);
+    setReadIssue(null);
+    try {
+      const detail = await getArtifactDetail(artifactId, request.signal);
+      if (!isCurrent()) return false;
+      const facts = detail.artifact;
+      if (facts.id !== artifactId || facts.organization_id !== session.organizationId || facts.store_id !== session.storeId
+          || facts.owner_subject_id !== session.subjectId || !Number.isSafeInteger(facts.version)
+          || typeof facts.title !== "string" || !Array.isArray(facts.locked_fields)
+          || facts.version < Math.max(1, minimumVersion) || !Array.isArray(detail.ops)
+          || detail.ops.some(op => op.artifact_id !== artifactId)) {
+        throw Error("读取回执没有匹配当前草稿和版本");
+      }
+      const ordered = { artifact: facts, ops: [...detail.ops].sort((a, b) => b.version_after - a.version_after) };
+      versionFloor.current = { key: contextKey, version: facts.version };
+      replaceProof({ key: contextKey, detail: ordered });
+      setStatusError(writeDeniedRef.current ? "写入未获授权。草稿已核实，当前只读；未保存输入不会自动发送。" : null);
+      upsertArtifact(facts, { verifiedRead: { scope, epoch } });
+      setArtifactOps(artifactId, ordered.ops);
+      if (notify) pushToast("已重新查询服务端真实状态。", "info");
+      return true;
+    } catch (error) {
+      if (!isCurrent()) return false;
+      if (error instanceof ApiError && [403, 404].includes(error.status)) {
+        setBusy(false);
+        contextFence.current.invalidate();
+        evictArtifactFacts(artifactId);
+      }
+      setReadIssue({ key: contextKey, message: "未能核实当前身份下的草稿。旧正文、证据及历史未显示；未保存的输入不会自动发送。" });
+      return false;
+    } finally {
+      if (readJob.current === request) readJob.current = null;
+    }
+  }
+
+  function recheckAfterWriteDenial(error: unknown): boolean {
+    if (!(error instanceof ApiError) || ![403, 404].includes(error.status)) return false;
+    writeDeniedRef.current = true;
+    setWriteDenied(true);
+    setBusy(false);
+    // A write refusal neither grants a read nor proves denial. Only a fresh
+    // GET can publish facts in this scope, and it never replays an edit.
+    void readArtifact();
+    return true;
+  }
 
   useEffect(() => {
-    setDraftInputs({});
+    mounted.current = true;
+    writeDeniedRef.current = false;
+    setWriteDenied(false);
+    setUndoNotice(null);
     fieldRevisions.current = {};
+    setBusy(false);
+    contextFence.current.activate();
+    void readArtifact();
+    return () => { mounted.current = false; readJob.current?.abort(); contextFence.current.invalidate(); };
   }, [contextKey]);
-
-  useEffect(() => {
-    if (captureEditingContext()()) setTabDirty(tabId, Object.keys(draftInputs).length > 0);
-  }, [draftInputs, tabId, contextKey]);
 
   if (!artifact) {
+    const reason = readIssue?.key === contextKey ? readIssue.message : null;
     return (
       <div className={styles.tabMainCard} data-artifact-loading={artifactId}>
-        <p role={statusError ? "alert" : "status"}>{statusError ?? `正在加载工作成果 ${artifactId}...`}</p>
+        <p role={reason ? "alert" : "status"}>{reason ?? "正在核实当前身份下的工作成果。"}</p>
+        {capabilityStatus === "ready" && <Button onClick={() => void readArtifact()}>重新核查权限与草稿</Button>}
       </div>
     );
   }
@@ -202,7 +276,7 @@ export function ArtifactCoeditWorkspace({
 
     await enqueueCurrentArtifactOp(async (isCurrent) => {
       try {
-        const current = getWorkspaceState().artifactsById[artifactId] ?? artifact;
+        const current = currentProof() ?? artifact;
         const patchRes = await patchArtifact(artifactId, {
           base_version: current.version,
           patch: { [fieldKey]: parsedVal },
@@ -213,9 +287,6 @@ export function ArtifactCoeditWorkspace({
         assertFieldReceipt(patchRes, { artifactId, artifactThreadId: current.thread_id, baseVersion: current.version,
           field: fieldKey, value: parsedVal, session, kind: "patch" });
         let latest = patchRes.artifact;
-        upsertArtifact(latest);
-        clearAiModifiedField(artifactId, fieldKey);
-        appendArtifactOp(artifactId, patchRes.op);
         if (!latest.locked_fields.includes(fieldKey)) {
           const lockRes = await lockArtifactFields(artifactId, {
             base_version: latest.version,
@@ -225,13 +296,12 @@ export function ArtifactCoeditWorkspace({
           assertFieldReceipt(lockRes, { artifactId, artifactThreadId: latest.thread_id, baseVersion: latest.version,
             field: fieldKey, value: parsedVal, session, kind: "lock" });
           latest = lockRes.artifact;
-          appendArtifactOp(artifactId, lockRes.op);
         }
-        upsertArtifact(latest);
+        if (!await readArtifact(false, latest.version)) return;
         setDraftInputs((prev) => isCurrent() && fieldRevisions.current[fieldKey] === fieldRevision
           ? acknowledgeDraftInput(prev, fieldKey, rawVal) : prev);
       } catch (err) {
-        if (!isCurrent()) return;
+        if (!isCurrent() || recheckAfterWriteDenial(err)) return;
         setTabDirty(tabId, true);
         setStatusError(
           err instanceof Error
@@ -243,7 +313,7 @@ export function ArtifactCoeditWorkspace({
   };
 
   const handleFieldInput = (fieldKey: string, nextValue: string) => {
-    if (!captureEditingContext()()) return;
+    if (!captureEditingContext()() || !allowsMutation()) return;
     const revision = (fieldRevisions.current[fieldKey] ?? 0) + 1;
     fieldRevisions.current[fieldKey] = revision;
     setDraftInputs((prev) => ({ ...prev, [fieldKey]: nextValue }));
@@ -254,16 +324,15 @@ export function ArtifactCoeditWorkspace({
   const handleLock = async (fieldKey: string) => {
     await enqueueCurrentArtifactOp(async (isCurrent) => {
       try {
-        const current = getWorkspaceState().artifactsById[artifactId] ?? artifact;
+        const current = currentProof() ?? artifact;
         const res = await lockArtifactFields(artifactId, {
           base_version: current.version,
           fields: [fieldKey],
         });
         if (!isCurrent()) return;
-        upsertArtifact(res.artifact);
-        appendArtifactOp(artifactId, res.op);
-      } catch {
-        if (!isCurrent()) return;
+        await readArtifact(false, res.artifact.version);
+      } catch (error) {
+        if (!isCurrent() || recheckAfterWriteDenial(error)) return;
         setStatusError("服务端结果未确认，未冒充操作成功。请先核查最新草稿。");
       }
     });
@@ -272,16 +341,15 @@ export function ArtifactCoeditWorkspace({
   const handleUnlock = async (fieldKey: string) => {
     await enqueueCurrentArtifactOp(async (isCurrent) => {
       try {
-        const current = getWorkspaceState().artifactsById[artifactId] ?? artifact;
+        const current = currentProof() ?? artifact;
         const res = await unlockArtifactFields(artifactId, {
           base_version: current.version,
           fields: [fieldKey],
         });
         if (!isCurrent()) return;
-        upsertArtifact(res.artifact);
-        appendArtifactOp(artifactId, res.op);
-      } catch {
-        if (!isCurrent()) return;
+        await readArtifact(false, res.artifact.version);
+      } catch (error) {
+        if (!isCurrent() || recheckAfterWriteDenial(error)) return;
         setStatusError("服务端结果未确认，未冒充操作成功。请先核查最新草稿。");
       }
     });
@@ -296,16 +364,15 @@ export function ArtifactCoeditWorkspace({
     void suggestedValue;
     await enqueueCurrentArtifactOp(async (isCurrent) => {
       try {
-        const current = getWorkspaceState().artifactsById[artifactId] ?? artifact;
+        const current = currentProof() ?? artifact;
         const res = await acceptArtifactSuggestion(artifactId, opId, {
           base_version: current.version,
           field: fieldKey,
         });
         if (!isCurrent()) return;
-        upsertArtifact(res.artifact);
-        appendArtifactOp(artifactId, res.op);
-      } catch {
-        if (!isCurrent()) return;
+        await readArtifact(false, res.artifact.version);
+      } catch (error) {
+        if (!isCurrent() || recheckAfterWriteDenial(error)) return;
         setStatusError("服务端结果未确认，未冒充操作成功。请先核查最新草稿。");
       }
     });
@@ -315,48 +382,39 @@ export function ArtifactCoeditWorkspace({
     if (!opId) { setStatusError("缺少服务端建议记录，未忽略。"); return; }
     await enqueueCurrentArtifactOp(async (isCurrent) => {
       try {
-        const current = getWorkspaceState().artifactsById[artifactId] ?? artifact;
+        const current = currentProof() ?? artifact;
         const res = await ignoreArtifactSuggestion(artifactId, opId, {
           base_version: current.version,
           field: fieldKey,
         });
         if (!isCurrent()) return;
-        upsertArtifact(res.artifact);
-        appendArtifactOp(artifactId, res.op);
-      } catch {
-        if (!isCurrent()) return;
+        await readArtifact(false, res.artifact.version);
+      } catch (error) {
+        if (!isCurrent() || recheckAfterWriteDenial(error)) return;
         setStatusError("服务端结果未确认，未冒充操作成功。请先核查最新草稿。");
       }
     });
   };
 
   const handleUndoOp = async (opId: string) => {
+    if (!allowsMutation()) return;
     setBusy(true);
     setStatusError(null);
     await enqueueCurrentArtifactOp(async (isCurrent) => {
       try {
-        const current = getWorkspaceState().artifactsById[artifactId] ?? artifact;
+        const current = currentProof() ?? artifact;
         const res = await undoArtifact(artifactId, {
           base_version: current.version,
           target_op_id: opId,
         });
         if (!isCurrent()) return;
-        upsertArtifact(res.artifact);
-        appendArtifactOp(artifactId, res.op);
-        const reverted = new Set(res.op.applied_fields ?? []);
-        for (const f of reverted) {
-          clearAiModifiedField(artifactId, String(f));
-        }
-        if (res.skipped_fields.length > 0) {
-          setPartialUndoNotice(artifactId, {
-            skippedFields: res.skipped_fields,
-            message: `${res.skipped_fields.length} 个字段已被人工修改，未撤销`,
-          });
-        } else {
-          setPartialUndoNotice(artifactId, null);
-        }
-      } catch {
-        if (!isCurrent()) return;
+        await readArtifact(false, res.artifact.version);
+        if (!isCurrent() || !currentProof()) return;
+        const skippedFields = res.skipped_fields.filter(field => Object.hasOwn(currentProof()!.payload, field));
+        setUndoNotice(skippedFields.length ? { key: contextKey, skippedFields,
+          message: `${skippedFields.length} 个字段已被人工修改，未撤销` } : null);
+      } catch (error) {
+        if (!isCurrent() || recheckAfterWriteDenial(error)) return;
         setStatusError("撤销结果未确认。未在本地伪造回滚，请先核查服务端草稿。");
       } finally {
         if (isCurrent()) setBusy(false);
@@ -364,18 +422,7 @@ export function ArtifactCoeditWorkspace({
     });
   };
 
-  const handleRejectAiField = async (fieldKey: string, opId?: string) => {
-    const diff = aiFields[fieldKey];
-    if (opId) {
-      await handleUndoOp(opId);
-      return;
-    }
-    if (diff) setStatusError("缺少服务端操作记录，未执行字段回滚。");
-
-  };
-
   const latestAgentOp = ops.find((op) => op.actor_type === "agent" && op.op_type === "patch");
-  const latestAiDiff = Object.values(aiFields)[0];
 
   const evidenceItems: EvidenceCardItem[] = artifact.source_refs.map(
     (ref: Record<string, unknown>, idx: number) => ({
@@ -401,7 +448,7 @@ export function ArtifactCoeditWorkspace({
     actorName: op.actor_type === "agent" ? "AI 助手 (L1)" : op.actor_subject_id,
     summary: `${op.op_type} · 修改字段：${Object.keys(op.patch).join("、") || "元信息"}`,
     timestamp: op.created_at,
-    undoable: op.actor_type === "agent" && op.op_type === "patch",
+    undoable: canEdit && op.actor_type === "agent" && op.op_type === "patch",
     onUndo: () => void handleUndoOp(op.id),
   }));
 
@@ -455,14 +502,10 @@ export function ArtifactCoeditWorkspace({
         evidenceItems={evidenceItems}
         auditTrail={auditTrail}
         onUndoLatest={
-          latestAiDiff
-            ? () => void handleUndoOp(latestAiDiff.opId)
-            : latestAgentOp
-              ? () => void handleUndoOp(latestAgentOp.id)
-              : undefined
+          canEdit && latestAgentOp ? () => void handleUndoOp(latestAgentOp.id) : undefined
         }
         undoConflictNotice={partialUndo?.message ?? null}
-        onDismissConflictNotice={() => setPartialUndoNotice(artifactId, null)}
+        onDismissConflictNotice={() => setUndoNotice(null)}
         actions={
           <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center" }}>
             <StatusBadge
@@ -479,20 +522,7 @@ export function ArtifactCoeditWorkspace({
               <Button
                 size="sm"
                 variant="secondary"
-                onClick={() => {
-                  const isCurrent = captureEditingContext();
-                  void getArtifactDetail(artifactId)
-                    .then((detail) => {
-                      if (!isCurrent()) return;
-                      upsertArtifact(detail.artifact);
-                      setArtifactOps(artifactId, detail.ops);
-                      pushToast("已重新查询服务端真实状态。", "info");
-                    })
-                    .catch(() => {
-                      if (!isCurrent()) return;
-                      pushToast("暂无法连上服务端核查状态。", "warning");
-                    });
-                }}
+                onClick={() => void readArtifact(true)}
               >
                 先查实际状态
               </Button>
@@ -501,7 +531,7 @@ export function ArtifactCoeditWorkspace({
               size="sm"
               variant="primary"
               disabled={busy || artifact.status === "submitted"}
-              onClick={() => onRequestL2Submit(artifact)}
+              onClick={onOpenSubmitBoundary}
               data-open-l2-submit="true"
             >
               {artifact.status === "submitted" ? "工作区草稿已保存" : "查看正式提交边界"}
@@ -514,6 +544,8 @@ export function ArtifactCoeditWorkspace({
             {statusError}
           </p>
         ) : null}
+
+        {!canEdit && <p>草稿当前为只读；查看、核对或记录本地输入不代表有权写入。</p>}
 
         {artifact.kind === "quote_draft" ? (
           <div
@@ -543,12 +575,11 @@ export function ArtifactCoeditWorkspace({
               label: fieldKey,
               type: typeof rawScalar === "number" ? "number" : "text",
             };
-            const currentValue =
-              draftInputs[fieldKey] ??
-              (rawScalar !== undefined && rawScalar !== null
-                ? String(rawScalar)
-                : "");
-            const aiDiff = aiFields[fieldKey];
+            const currentValue = (canEdit ? draftInputs[fieldKey] : undefined) ??
+              (rawScalar === undefined ? "" : String(rawScalar));
+            const latestAuthor = ops.find(op => ["patch", "undo", "accept_suggestion"].includes(op.op_type) &&
+              op.applied_fields.includes(fieldKey) && Object.hasOwn(op.patch, fieldKey));
+            const aiDiff = latestAuthor?.op_type === "patch" && latestAuthor.actor_type === "agent" ? latestAuthor : undefined;
             const suggestionRaw = artifact.pending_suggestions.find(
               (s: PendingSuggestionDto) => s.field === fieldKey,
             );
@@ -571,15 +602,9 @@ export function ArtifactCoeditWorkspace({
                 label={meta.label}
                 type={meta.type}
                 value={currentValue}
-                disabled={artifact.status === "submitted"}
+                readOnly={!canEdit}
                 aiEdited={Boolean(aiDiff)}
-                aiOpId={aiDiff?.opId}
-                aiPreviousValue={
-                  typeof aiDiff?.previousValue === "string" ||
-                  typeof aiDiff?.previousValue === "number"
-                    ? aiDiff.previousValue
-                    : undefined
-                }
+                aiOpId={aiDiff?.id}
                 locked={artifact.locked_fields.includes(fieldKey)}
                 pendingSuggestion={pendingSuggestion}
                 partialUndoConflictCount={
@@ -590,18 +615,17 @@ export function ArtifactCoeditWorkspace({
                     ? partialUndo.skippedFields
                     : []
                 }
-                onDismissPartialUndoNotice={() => setPartialUndoNotice(artifactId, null)}
-                onChange={(nextVal) => handleFieldInput(fieldKey, nextVal)}
-                onLock={(fk) => void handleLock(fk)}
-                onUnlock={(fk) => void handleUnlock(fk)}
-                onAcceptSuggestion={(fk, val) =>
-                  void handleAcceptSuggestion(fk, val, suggestionRaw?.op_id)
+                onDismissPartialUndoNotice={() => setUndoNotice(null)}
+                onChange={canEdit ? (nextVal) => handleFieldInput(fieldKey, nextVal) : undefined}
+                onLock={canEdit ? (fk) => void handleLock(fk) : undefined}
+                onUnlock={canEdit ? (fk) => void handleUnlock(fk) : undefined}
+                onAcceptSuggestion={canEdit ? (fk, val) =>
+                  void handleAcceptSuggestion(fk, val, suggestionRaw?.op_id) : undefined
                 }
-                onIgnoreSuggestion={(fk) =>
-                  void handleIgnoreSuggestion(fk, suggestionRaw?.op_id)
+                onIgnoreSuggestion={canEdit ? (fk) =>
+                  void handleIgnoreSuggestion(fk, suggestionRaw?.op_id) : undefined
                 }
-                onRejectAiField={(fk, opId) => void handleRejectAiField(fk, opId)}
-                onUndoWholeOp={(opId) => void handleUndoOp(opId)}
+                onUndoWholeOp={canEdit ? (opId) => void handleUndoOp(opId) : undefined}
               />
             );
           })}

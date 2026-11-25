@@ -21,7 +21,9 @@ from backend.app.modules.agents.models import AgentRun
 from backend.app.modules.audit.service import record_event
 from backend.app.modules.audit.models import AuditEvent
 from backend.app.modules.auth.service import has_usable_account
-from backend.app.modules.identity.command_guard import lock_employee_authority
+from backend.app.modules.identity.command_guard import (
+    check_command_authority, lock_command_authority, lock_employee_authority,
+)
 from backend.app.modules.identity.service import authorize_scope
 from backend.app.modules.office_intake import ofc_002_service as intake
 from backend.app.modules.office_intake.ofc_002_models import OfficeIntakeReceipt
@@ -98,6 +100,17 @@ def _guard(db, actor, permission):
     now = _clock(db)
     _allow(db, actor, permission, now)
     return now
+
+
+def _guard_write(db, actor, permission):
+    # The workflow command remains employee-only even though the shared
+    # authority lock also supports other kinds of principals.
+    if type(actor) is not AuthenticatedSubject or actor.account_id is None or actor.session_id is None:
+        raise HTTPException(403, "human_session_required")
+    epoch = lock_command_authority(db, actor)
+    now = _clock(db)
+    _allow(db, actor, permission, now)
+    return epoch, now
 
 
 def _scope(model, actor):
@@ -324,6 +337,12 @@ def _view(db, actor, workflow, now, *, command=None, replayed=False):
     return WorkflowReceipt.model_validate(values).model_dump()
 
 
+def _checked_view(db, actor, workflow, now, *, command, permission, epoch, replayed=False):
+    result = _view(db, actor, workflow, now, command=command, replayed=replayed)
+    check_command_authority(db, actor, permission=permission, epoch=epoch, now=_clock(db))
+    return result
+
+
 def read_workflow(db, actor, ident):
     now = _guard(db, actor, "office.workflows.read")
     return _view(db, actor, _workflow(db, actor, ident), now)
@@ -361,11 +380,12 @@ def _record(db, actor, workflow, operation, key, request_digest, input_digest, o
 def create_workflow(db: Session, actor, body: WorkflowCreateInput, key: str):
     body = _typed(WorkflowCreateInput, body)
     key = _key(key)
-    now = _guard(db, actor, "office.workflows.manage")
+    epoch, now = _guard_write(db, actor, "office.workflows.manage")
     request_digest = _command_digest(actor, "create", None, body)
     previous = _replay(db, actor, key, request_digest)
     if previous is not None:
-        return _view(db, actor, _workflow(db, actor, previous.workflow_id), now, command=previous, replayed=True)
+        return _checked_view(db, actor, _workflow(db, actor, previous.workflow_id), now,
+            command=previous, permission="office.workflows.manage", epoch=epoch, replayed=True)
     context = _context(db, actor, body.task_id, body.evidence_id, body.rule_id, body.origin_run_id, now)
     if (context.task_state != "assigned" or context.task_decision_state != "accepted"
             or context.task_assignee_id is None):
@@ -385,7 +405,7 @@ def create_workflow(db: Session, actor, body: WorkflowCreateInput, key: str):
     if db.scalar(select(OfficeWorkflow.id).where(*_scope(OfficeWorkflow, actor), OfficeWorkflow.task_id == body.task_id)) is not None:
         _fail("workflow_task_already_bound")
     now = _clock(db)
-    _allow(db, actor, "office.workflows.manage", now)
+    check_command_authority(db, actor, permission="office.workflows.manage", epoch=epoch, now=now)
     _allow(db, actor, "office.workflows.read", now)
     workflow = OfficeWorkflow(id=str(uuid4()), organization_id=actor.organization_id, store_id=actor.store_id,
         template_key="material_review.v1", template_version=1, execution_mode="manual_task",
@@ -406,7 +426,8 @@ def create_workflow(db: Session, actor, body: WorkflowCreateInput, key: str):
         _digest({"workflow_id": workflow.id, "input_digest": workflow.input_digest}),
         {"task_id": workflow.task_id, "evidence_id": workflow.source_evidence_id,
          "task_context_digest": workflow.task_context_digest}, now)
-    return _view(db, actor, workflow, now, command=receipt)
+    return _checked_view(db, actor, workflow, now, command=receipt,
+        permission="office.workflows.manage", epoch=epoch)
 
 
 def _intake_facts(db, actor, workflow, receipt_id):
@@ -584,13 +605,14 @@ def _seen(workflow, steps, body):
 def control_workflow(db, actor, ident, body: WorkflowControlInput, key):
     body = _typed(WorkflowControlInput, body)
     key = _key(key)
-    now = _guard(db, actor, "office.workflows.manage")
+    epoch, now = _guard_write(db, actor, "office.workflows.manage")
     request_digest = _command_digest(actor, "control", ident, body)
     previous = _replay(db, actor, key, request_digest)
     workflow = _workflow(db, actor, ident)
     _visibility(db, actor, workflow, now)
     if previous is not None:
-        return _view(db, actor, workflow, now, command=previous, replayed=True)
+        return _checked_view(db, actor, workflow, now, command=previous,
+            permission="office.workflows.manage", epoch=epoch, replayed=True)
     steps = _steps(db, actor, workflow)
     value = _seen(workflow, steps, body)
     step = steps[workflow.next_step_no - 1]
@@ -608,14 +630,15 @@ def control_workflow(db, actor, ident, body: WorkflowControlInput, key):
     else:
         _fail("workflow_invalid_transition")
     now = _clock(db)
-    _allow(db, actor, "office.workflows.manage", now)
+    check_command_authority(db, actor, permission="office.workflows.manage", epoch=epoch, now=now)
     _visibility(db, actor, workflow, now)
     workflow.version += 1
     workflow.updated_at = now
     row = _record(db, actor, workflow, operation, key, request_digest, value,
         _digest({"state": workflow.state, "reason_digest": _digest(body.reason)}),
         {"reason_digest": _digest(body.reason)}, now)
-    return _view(db, actor, workflow, now, command=row)
+    return _checked_view(db, actor, workflow, now, command=row,
+        permission="office.workflows.manage", epoch=epoch)
 
 
 def _domain_key(actor, operation, key):
@@ -626,7 +649,7 @@ def _domain_key(actor, operation, key):
 def request_workflow_approval(db, actor, ident, body: WorkflowApprovalInput, key):
     body = _typed(WorkflowApprovalInput, body)
     key = _key(key)
-    now = _guard(db, actor, "office.workflows.manage")
+    epoch, now = _guard_write(db, actor, "office.workflows.manage")
     workflow = _workflow(db, actor, ident)
     _visibility(db, actor, workflow, now)
     steps = _steps(db, actor, workflow)
@@ -638,7 +661,7 @@ def request_workflow_approval(db, actor, ident, body: WorkflowApprovalInput, key
     context = _live_context(db, actor, workflow, now)
     _validate_chain(db, actor, workflow, steps, now, context=context)
     now = _clock(db)
-    _allow(db, actor, "office.workflows.manage", now)
+    check_command_authority(db, actor, permission="office.workflows.manage", epoch=epoch, now=now)
     _allow(db, actor, "approvals.request", now)
     _visibility(db, actor, workflow, now)
     request_key = _domain_key(actor, "approval", key)
@@ -647,6 +670,7 @@ def request_workflow_approval(db, actor, ident, body: WorkflowApprovalInput, key
     row = approvals.request_approval(db, actor, subject_type="office_workflow",
         subject_id=workflow.id + ":" + binding, action_key="office.workflow.execute.v1",
         reason=body.reason, expires_at=body.expires_at, idempotency_key=request_key, now=now)
+    check_command_authority(db, actor, permission="office.workflows.manage", epoch=epoch, now=_clock(db))
     return dict(workflow_id=workflow.id, approval_id=row.id, input_digest=binding,
         subject_type=row.subject_type, subject_id=row.subject_id, action_key=row.action_key,
         state=row.state, expires_at=_utc(row.expires_at), replayed=previous is not None)
@@ -656,13 +680,14 @@ def advance_workflow(db, actor, ident, body: WorkflowAdvanceInput, key):
     """Verify one stage, or explicitly perform exactly one fixed local action."""
     body = _typed(WorkflowAdvanceInput, body)
     key = _key(key)
-    now = _guard(db, actor, "office.workflows.advance")
+    epoch, now = _guard_write(db, actor, "office.workflows.advance")
     request_digest = _command_digest(actor, "advance", ident, body)
     previous = _replay(db, actor, key, request_digest)
     workflow = _workflow(db, actor, ident)
     _visibility(db, actor, workflow, now)
     if previous is not None:
-        return _view(db, actor, workflow, now, command=previous, replayed=True)
+        return _checked_view(db, actor, workflow, now, command=previous,
+            permission="office.workflows.advance", epoch=epoch, replayed=True)
     steps = _steps(db, actor, workflow)
     input_digest = _seen(workflow, steps, body)
     if workflow.state not in ("active", "needs_human"):
@@ -688,6 +713,8 @@ def advance_workflow(db, actor, ident, body: WorkflowAdvanceInput, key):
         facts = _intake_facts(db, actor, workflow, proof.receipt_id)
     elif step.kind == "extraction":
         if perform:
+            now = _clock(db)
+            check_command_authority(db, actor, permission="office.workflows.advance", epoch=epoch, now=now)
             _allow(db, actor, "office.extraction.submit", now)
             result = extraction.extract_evidence(db, actor, evidence_id=workflow.source_evidence_id,
                 request_key=_domain_key(actor, "extract", key))
@@ -706,6 +733,7 @@ def advance_workflow(db, actor, ident, body: WorkflowAdvanceInput, key):
             _fail("workflow_task_state_changed")
         if perform:
             now = _clock(db)
+            check_command_authority(db, actor, permission="office.workflows.advance", epoch=epoch, now=now)
             _allow(db, actor, permission, now)
             if step.kind == "execution":
                 approved = _advance_receipt(db, actor, workflow, 4).references
@@ -724,7 +752,7 @@ def advance_workflow(db, actor, ident, body: WorkflowAdvanceInput, key):
     # live clock immediately before recording; an expired actor cannot finish
     # an action merely because it started while the session was valid.
     now = _clock(db)
-    _allow(db, actor, "office.workflows.advance", now)
+    check_command_authority(db, actor, permission="office.workflows.advance", epoch=epoch, now=now)
     _allow(db, actor, permission, now)
     _visibility(db, actor, workflow, now)
     if perform and step.kind == "extraction":
@@ -756,7 +784,7 @@ def advance_workflow(db, actor, ident, body: WorkflowAdvanceInput, key):
         from backend.app.application import commit_guard
         workflow_id, kind = workflow.id, step.kind
         def final(session, instant):
-            _allow(session, actor, "office.workflows.advance", instant)
+            check_command_authority(session, actor, permission="office.workflows.advance", epoch=epoch, now=instant)
             _allow(session, actor, permission, instant)
             current = session.scalar(select(OfficeWorkflow).where(*_scope(OfficeWorkflow, actor),
                 OfficeWorkflow.id == workflow_id).execution_options(populate_existing=True))
@@ -768,7 +796,8 @@ def advance_workflow(db, actor, ident, body: WorkflowAdvanceInput, key):
                 _approval_facts(session, actor, current, current_steps, approved["approval_id"],
                                 instant, fresh=True, lock=False)
         commit_guard.enlist(db, action="office.workflow.perform:" + kind, check=final)
-    return _view(db, actor, workflow, now, command=receipt)
+    return _checked_view(db, actor, workflow, now, command=receipt,
+        permission="office.workflows.advance", epoch=epoch)
 
 
 def error_status(code):

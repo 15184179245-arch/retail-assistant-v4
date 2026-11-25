@@ -8,15 +8,17 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
 from hashlib import sha256
+from itertools import pairwise
 import json
 import re
 from typing import Any, Mapping, Sequence
 
 FORMULA_VERSION = "ana-004-sales-facts-v1"
 SOURCE_CONTRACT_VERSION = "synthetic-projection-v1"
-_MONEY = Decimal("0.01")
+_SCALE_DIGITS = 6
+_SCALE = 10 ** _SCALE_DIGITS
+_CENT = _SCALE // 100
 _DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,6})?\Z")
 _CURRENCY = re.compile(r"[A-Z]{3}\Z")
 _ALLOWED = {
@@ -25,8 +27,6 @@ _ALLOWED = {
     "reversal": frozenset(("confirmed", "pending", "unknown")),
 }
 _FINAL = {"sale": "settled", "return": "settled", "reversal": "confirmed"}
-_BUCKET = {"sale": "gross", "return": "refunds", "reversal_sale": "reversed_sales",
-           "reversal_return": "reversed_refunds"}
 
 
 class SalesFactError(ValueError):
@@ -51,12 +51,14 @@ def _instant(value: object) -> datetime:
     return t.astimezone(timezone.utc)
 
 
-def _number(value: object, *, positive: bool = True) -> Decimal:
+def _number(value: object, *, positive: bool = True) -> int:
     if (not isinstance(value, str) or len(value) > 40
             or _DECIMAL.fullmatch(value) is None):
         _fail("analytics_decimal_invalid")
-    number = Decimal(value)
-    if not number.is_finite() or (positive and number <= 0) or number < 0:
+    # Exact millionths: summing or comparing accepted values never rounds.
+    whole, _, fraction = value.partition(".")
+    number = int(whole + fraction.ljust(_SCALE_DIGITS, "0"))
+    if positive and number == 0:
         _fail("analytics_decimal_invalid")
     return number
 
@@ -80,12 +82,18 @@ def _digest(value: Any) -> str:
     return sha256(_canonical(value).encode("utf-8")).hexdigest()
 
 
-def _money(value: Decimal) -> str:
-    return format(value.quantize(_MONEY, rounding=ROUND_HALF_UP), ".2f")
+def _money(value: int) -> str:
+    # Round absolute millionths half up to cents once, keeping the original sign.
+    cents = (abs(value) + _CENT // 2) // _CENT
+    whole, fraction = divmod(cents, 100)
+    sign = "-" if value < 0 else ""
+    return f"{sign}{whole}.{fraction:02d}"
 
 
-def _quantity(value: Decimal) -> str:
-    return format(value.normalize(), "f")
+def _quantity(value: int) -> str:
+    whole, fraction = divmod(abs(value), _SCALE)
+    sign = "-" if value < 0 else ""
+    return f"{sign}{whole}.{fraction:0{_SCALE_DIGITS}d}".rstrip("0").rstrip(".")
 
 
 def _ident(row: Mapping[str, Any]) -> tuple[str, str, str, str]:
@@ -97,7 +105,8 @@ def _line(row: Mapping[str, Any]) -> tuple[str, str, str, str, str, str]:
             row["spec_id"], row["unit"], row["currency"])
 
 
-def _check_source(row: object, org: str, store: str, snapshot: datetime) -> dict | None:
+def _check_source(row: object, org: str, store: str,
+                  snapshot: datetime) -> tuple[dict, datetime, str] | None:
     if not isinstance(row, dict):
         _fail("analytics_source_row_invalid")
     if (row.get("organization_id"), row.get("store_id")) != (org, store):
@@ -126,41 +135,42 @@ def _check_source(row: object, org: str, store: str, snapshot: datetime) -> dict
             _required(row, "original_sale_event_id")
         if kind == "reversal":
             _required(row, "target_event_id")
-    # The source adapter must define every raw revision as a JSON-stable record.
-    _canonical(row)
-    return dict(row)
+    # Reuse the canonical SHA as the immutable version pin and public evidence.
+    copy = dict(row)
+    return copy, observed, _digest(copy)
 
 
 def _latest(rows: Sequence[dict], organization_id: str, store_id: str,
-            snapshot: datetime) -> dict[str, dict]:
+            snapshot: datetime) -> tuple[dict[str, dict], dict[str, str]]:
     selected: dict[str, dict] = {}
+    history: dict[str, dict[int, tuple[datetime, str]]] = {}
     for original in rows:
-        row = _check_source(original, organization_id, store_id, snapshot)
-        if row is None:
+        checked = _check_source(original, organization_id, store_id, snapshot)
+        if checked is None:
             continue
-        key = row["event_id"]
-        previous = selected.get(key)
-        if previous is None:
-            selected[key] = row
-            continue
-        if _ident(previous) != _ident(row):
+        row, observed, digest = checked
+        event, version = row["event_id"], row["source_version"]
+        latest = selected.get(event)
+        if latest is not None and _ident(latest) != _ident(row):
             _fail("analytics_event_identity_changed")
-        if row["source_version"] == previous["source_version"]:
-            if _canonical(previous) != _canonical(row):
-                _fail("analytics_same_version_conflict")
-            continue
-        older, newer = sorted((row, previous), key=lambda x: x["source_version"])
-        if _instant(newer["recorded_at"]) < _instant(older["recorded_at"]):
-            _fail("analytics_version_clock_regressed")
-        if newer is row:
-            selected[key] = row
+        versions = history.setdefault(event, {})
+        if versions.setdefault(version, (observed, digest))[1] != digest:
+            _fail("analytics_same_version_conflict")
+        if latest is None or version > latest["source_version"]:
+            selected[event] = row
+    for versions in history.values():
+        if len(versions) > 1:
+            clock = (versions[version][0] for version in sorted(versions))
+            if any(older > newer for older, newer in pairwise(clock)):
+                _fail("analytics_version_clock_regressed")
     refs = {}
     for row in selected.values():
         key = _ident(row)
         if key in refs and refs[key] != row["event_id"]:
             _fail("analytics_duplicate_source_reference")
         refs[key] = row["event_id"]
-    return selected
+    return selected, {event: history[event][row["source_version"]][1]
+                      for event, row in selected.items()}
 
 
 def _validated_facts(events: dict[str, dict]) -> tuple[dict[str, dict], dict[str, dict]]:
@@ -198,9 +208,9 @@ def _validated_facts(events: dict[str, dict]) -> tuple[dict[str, dict], dict[str
         live = [r for r in group if r["event_id"] not in reversed_by]
         if sale_id in reversed_by and live:
             _fail("analytics_sale_reversal_with_active_refund")
-        if (sum((_number(r["quantity"]) for r in live), Decimal(0))
+        if (sum(_number(r["quantity"]) for r in live)
                 > _number(sale["quantity"])
-                or sum((_number(r["amount"]) for r in live), Decimal(0))
+                or sum(_number(r["amount"]) for r in live)
                 > _number(sale["amount"])):
             _fail("analytics_refund_exceeds_settled_sale")
     return complete, reversed_by
@@ -237,7 +247,7 @@ def project_sales_facts(
     if not isinstance(rows, (tuple, list)) or len(rows) > 100_000:
         _fail("analytics_source_batch_invalid")
 
-    events = _latest(rows, org, store, snapshot)
+    events, event_digests = _latest(rows, org, store, snapshot)
     complete, reversed_by = _validated_facts(events)
 
     window_rows = sorted(
@@ -247,7 +257,7 @@ def project_sales_facts(
     )
     excluded = [{
         "event_id": r["event_id"], "reason": "not_settled:" + r["status"],
-        "source_digest": _digest(r),
+        "source_digest": event_digests[r["event_id"]],
     } for r in window_rows if r["event_id"] not in complete]
     uncertainty = any(r["status"] in ("receipt_unknown", "unknown")
                       or r["kind"] in ("return", "reversal")
@@ -266,9 +276,8 @@ def project_sales_facts(
     elif not any(r["event_id"] in complete for r in window_rows):
         coverage_reasons.append("no_settled_fact_in_window")
 
-    buckets = defaultdict(lambda: defaultdict(Decimal))
+    buckets = defaultdict(lambda: defaultdict(int))
     lineage = []
-    contributions = []
     for r in window_rows:
         if r["event_id"] not in complete:
             continue
@@ -293,13 +302,12 @@ def project_sales_facts(
             "source_ref": r["source_ref"], "source_line_ref": r["source_line_ref"],
             "source_version": r["source_version"], "source_recorded_at": r["recorded_at"],
             "business_at": r["occurred_at"], "event_kind": signed_kind,
-            "source_digest": _digest(r), "linked_event_ids": references,
+            "source_digest": event_digests[r["event_id"]], "linked_event_ids": references,
         })
-        contributions.append((r["event_id"], r["source_version"], bucket, key))
     details = []
     for (product, spec, unit, currency), amounts in sorted(buckets.items()):
         def amt(k):
-            return amounts.get(k, Decimal(0))
+            return amounts.get(k, 0)
         gross, refunds = amt("gross"), amt("refunds")
         sale_undo, refund_undo = amt("reversed_sales"), amt("reversed_refunds")
         details.append({
@@ -320,7 +328,7 @@ def project_sales_facts(
     source_lineage = sorted(lineage, key=lambda x: x["event_id"])
     source_versions = sorted(
         [{"event_id": v["event_id"], "source_version": v["source_version"],
-          "source_digest": _digest(v)} for v in events.values()],
+          "source_digest": event_digests[v["event_id"]]} for v in events.values()],
         key=lambda x: x["event_id"],
     )
     formula = {

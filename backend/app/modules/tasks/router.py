@@ -26,10 +26,6 @@ def _envelope(task, message: str = "任务状态已更新。") -> TaskEnvelope:
                         error=None, user_message=message, hint=None)
 
 
-def _reason(payload: TaskReason) -> str:
-    return payload.reason
-
-
 @router.get("", response_model=TaskListEnvelope)
 def list_route(actor: Annotated[AuthenticatedSubject, Depends(require_authenticated_subject)],
                session: Annotated[Session, Depends(get_session)]) -> TaskListEnvelope:

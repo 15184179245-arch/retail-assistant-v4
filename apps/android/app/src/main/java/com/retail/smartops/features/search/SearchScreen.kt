@@ -23,6 +23,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -32,21 +33,97 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import com.retail.smartops.core.scanner.BarcodeScanEntry
 import com.retail.smartops.core.scanner.ScanOutcome
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+
+internal enum class OfflineCacheFreshness { NO_SNAPSHOT, UNKNOWN, CURRENT, EXPIRED }
+
+internal fun offlineCacheFreshness(version: String?, deadlineMs: Long?, nowMs: Long): OfflineCacheFreshness = when {
+    version.isNullOrBlank() -> OfflineCacheFreshness.NO_SNAPSHOT
+    deadlineMs == null || deadlineMs <= 0L -> OfflineCacheFreshness.UNKNOWN
+    nowMs >= deadlineMs -> OfflineCacheFreshness.EXPIRED
+    else -> OfflineCacheFreshness.CURRENT
+}
+
+@Composable
+private fun OfflineCacheBanner(owner: SearchViewModel, version: String?, deadlineMs: Long?) {
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    var freshness by remember(owner, lifecycle, version, deadlineMs) {
+        mutableStateOf(offlineCacheFreshness(version, deadlineMs, System.currentTimeMillis()))
+    }
+    if (!version.isNullOrBlank() && deadlineMs != null && deadlineMs > 0L) {
+        LaunchedEffect(owner, lifecycle, version, deadlineMs) {
+            lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                // Only display state changes here; no lookup, refresh or owner-state mutation.
+                while (true) {
+                    val now = System.currentTimeMillis()
+                    freshness = offlineCacheFreshness(version, deadlineMs, now)
+                    if (freshness != OfflineCacheFreshness.CURRENT) break
+                    // Keep a visible label honest if the wall clock jumps forward.
+                    delay((deadlineMs - now).coerceIn(1L, 60_000L))
+                }
+            }
+        }
+    }
+
+    val (title, detail) = when (freshness) {
+        OfflineCacheFreshness.CURRENT -> "离线模式 · 使用本地快照" to "显示本地商品快照（版本：$version）。"
+        OfflineCacheFreshness.EXPIRED -> "离线模式 · 本地快照已过期" to "版本：$version。商品信息仅供实物核对参考。"
+        OfflineCacheFreshness.UNKNOWN -> "离线模式 · 快照时效未核验" to "版本：$version。暂不能确认快照是否仍有效。"
+        OfflineCacheFreshness.NO_SNAPSHOT -> "离线模式" to "本次未取得可用的本地商品快照。"
+    }
+    val (background, accent) = when (freshness) {
+        OfflineCacheFreshness.CURRENT -> Color(0xFFE8F5E9) to Color(0xFF1B5E20)
+        OfflineCacheFreshness.EXPIRED -> Color(0xFFFFF3E0) to Color(0xFFE65100)
+        else -> MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = background),
+        border = BorderStroke(1.dp, accent),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(title, color = accent, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface)
+        }
+    }
+}
+
+/** Camera text is a query hint, never a product confirmation. */
+internal fun handleCameraScanForSearch(outcome: ScanOutcome, onSingleCode: (String) -> Unit): String? =
+    when (outcome) {
+        is ScanOutcome.Found -> {
+            onSingleCode(outcome.rawValue)
+            null
+        }
+        is ScanOutcome.Multiple -> "检测到多个条码，未查询。请对准单个条码或手动输入。"
+        ScanOutcome.PermissionDenied -> "相机权限未开启，可手动输入条码查询。"
+        ScanOutcome.Failed -> "相机扫码未能完成，可手动输入条码查询。"
+        ScanOutcome.NoCode -> "未识别到条码，可手动输入。"
+        ScanOutcome.Cancelled -> null
+    }
 
 @Composable
 fun SearchScreen(
     viewModel: SearchViewModel,
     modifier: Modifier = Modifier,
-    onUseConfirmedItem: (() -> Boolean)? = null,
+    onUseConfirmedItem: ((Long) -> Boolean)? = null,
 ) {
-    val state by viewModel.state.collectAsState()
+    val state = viewModel.state.collectAsState().value
     val scope = rememberCoroutineScope()
-    var selectionError by remember { mutableStateOf<String?>(null) }
+    var selectionError by remember(state.revision) { mutableStateOf<String?>(null) }
+    var scanNotice by remember(viewModel) { mutableStateOf<String?>(null) }
 
     Column(
         modifier = modifier
@@ -77,14 +154,18 @@ fun SearchScreen(
         ) {
             OutlinedTextField(
                 value = state.query,
-                onValueChange = { viewModel.onQueryChange(it) },
+                onValueChange = {
+                    scanNotice = null
+                    viewModel.onQueryChange(it)
+                },
                 modifier = Modifier.weight(1f),
                 label = { Text("商品编码 / 条码 / 名称") },
                 singleLine = true,
             )
             Button(
                 onClick = {
-                    scope.launch { viewModel.search() }
+                    scanNotice = null
+                    scope.launch { viewModel.search(expectedRevision = state.revision) }
                 },
                 enabled = !state.isLoading && state.query.isNotBlank(),
             ) {
@@ -94,20 +175,18 @@ fun SearchScreen(
 
         // Camera Barcode Scanner Entry
         BarcodeScanEntry { outcome ->
-            when (outcome) {
-                is ScanOutcome.Found -> {
-                    viewModel.onQueryChange(outcome.rawValue)
-                    scope.launch { viewModel.search(outcome.rawValue) }
-                }
-                is ScanOutcome.Multiple -> {
-                    if (outcome.rawValues.isNotEmpty()) {
-                        val first = outcome.rawValues.first()
-                        viewModel.onQueryChange(first)
-                        scope.launch { viewModel.search(first) }
-                    }
-                }
-                else -> { /* ignore other outcomes */ }
+            scanNotice = handleCameraScanForSearch(outcome) { raw ->
+                val revision = viewModel.onQueryChange(raw)
+                scope.launch { viewModel.search(raw, expectedRevision = revision) }
             }
+        }
+        scanNotice?.let { notice ->
+            Text(
+                text = notice,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            )
         }
 
         // Loading Indicator
@@ -118,6 +197,17 @@ fun SearchScreen(
             ) {
                 CircularProgressIndicator()
             }
+        }
+
+        if (state.resultsReady && (state.hasIncompleteResults || state.hasUnverifiableRows)) {
+            Text(
+                text = buildString {
+                    if (state.hasUnverifiableRows) append("部分商品资料无法核验，未展示。")
+                    if (state.hasIncompleteResults) append("本次搜索可能未返回全部匹配商品。请缩小查询范围后再试。")
+                },
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            )
         }
 
         // Ambiguity Alert Banner (CRITICAL: R-002, R-006)
@@ -144,35 +234,7 @@ fun SearchScreen(
             }
         }
 
-        // Offline / Stale Cache Banner
-        if (state.isOffline) {
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = if (state.isStaleCache) Color(0xFFFFF3E0) else Color(0xFFE8F5E9)
-                ),
-                border = BorderStroke(
-                    1.dp,
-                    if (state.isStaleCache) Color(0xFFEF6C00) else Color(0xFF2E7D32)
-                ),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Text(
-                        text = if (state.isStaleCache) "📡 离线模式 · 本地缓存已过期" else "📡 离线模式 · 使用本地快照",
-                        color = if (state.isStaleCache) Color(0xFFE65100) else Color(0xFF1B5E20),
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.titleSmall,
-                    )
-                    Spacer(modifier = Modifier.height(2.dp))
-                    Text(
-                        text = "当前网络不可用，正在使用本地 Room 缓存（快照版本：${state.cacheSnapshotVersion ?: "未知"}）。" +
-                                if (state.isStaleCache) " 请注意：本地缓存已超过有效期，仅供实物参考！" else "",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurface,
-                    )
-                }
-            }
-        }
+        if (state.isOffline) OfflineCacheBanner(viewModel, state.cacheSnapshotVersion, state.cacheExpiresAtMs)
 
         // Error message banner
         if (state.error != null) {
@@ -212,7 +274,7 @@ fun SearchScreen(
                             fontWeight = FontWeight.Bold,
                             color = Color(0xFF004D40),
                         )
-                        OutlinedButton(onClick = { viewModel.clearConfirmedItem() }) {
+                        OutlinedButton(onClick = { viewModel.clearConfirmedItem(state.revision) }) {
                             Text("重新选择")
                         }
                     }
@@ -233,7 +295,7 @@ fun SearchScreen(
                     onUseConfirmedItem?.let { useConfirmedItem ->
                         Button(
                             onClick = {
-                                selectionError = if (useConfirmedItem()) null
+                                selectionError = if (useConfirmedItem(state.revision)) null
                                 else "选择或销售入口已变化，请重新确认商品和账号权限"
                             },
                             enabled = !state.isLoading,
@@ -256,8 +318,8 @@ fun SearchScreen(
             state.exactMatches.forEach { item ->
                 ProductItemCard(
                     item = item,
-                    isConfirmed = (state.confirmedItem?.productId == item.productId),
-                    onConfirm = { viewModel.confirmItem(item) },
+                    isConfirmed = (state.confirmedItem == item),
+                    onConfirm = { viewModel.confirmItem(item, state.revision) },
                 )
             }
         }
@@ -272,14 +334,14 @@ fun SearchScreen(
             state.candidateMatches.forEach { item ->
                 ProductItemCard(
                     item = item,
-                    isConfirmed = (state.confirmedItem?.productId == item.productId),
-                    onConfirm = { viewModel.confirmItem(item) },
+                    isConfirmed = (state.confirmedItem == item),
+                    onConfirm = { viewModel.confirmItem(item, state.revision) },
                 )
             }
         }
 
         // Empty state
-        if (!state.isLoading && state.query.isNotBlank() && state.exactMatches.isEmpty() && state.candidateMatches.isEmpty() && state.error == null) {
+        if (state.resultsReady && state.exactMatches.isEmpty() && state.candidateMatches.isEmpty()) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
@@ -289,7 +351,11 @@ fun SearchScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text(
-                        text = if (state.message.isNotBlank()) state.message else "未找到与 \"${state.query}\" 匹配的商品",
+                        text = when {
+                            state.hasIncompleteResults -> "本次返回的结果中没有匹配商品。"
+                            state.message.isNotBlank() -> state.message
+                            else -> "未找到与 \"${state.query}\" 匹配的商品"
+                        },
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Spacer(modifier = Modifier.height(4.dp))

@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
+from backend.app.core.iso_datetime import parse_bounded_iso_offset
 
 Identifier = Annotated[StrictStr, Field(min_length=1, max_length=120)]
 Operation = Literal['live_prices', 'live_stock']
@@ -19,12 +20,15 @@ Status = Literal['usable', 'stale', 'missing_value', 'missing_metadata', 'source
 
 
 def aware_instant(value: str) -> datetime:
+    error = 'timezone-aware source instant required'
+    if not isinstance(value, str):
+        raise ValueError(error)
     try:
-        instant = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        instant = parse_bounded_iso_offset(value, invalid_offset=error)
     except (ValueError, TypeError, AttributeError):
-        raise ValueError('timezone-aware source instant required') from None
-    if instant.tzinfo is None or instant.utcoffset() is None:
-        raise ValueError('timezone-aware source instant required')
+        raise ValueError(error) from None
+    if not isinstance(instant, datetime) or instant.tzinfo is None or instant.utcoffset() is None:
+        raise ValueError(error)
     return instant
 
 

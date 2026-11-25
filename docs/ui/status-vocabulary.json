@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "schema_version": 1,
   "updated_on": "2026-10-30",
+  "source": "docs/ui/design-system.md",
   "description": "零售门店智能经营系统双端跨端状态词表，Web端StatusBadge与Android端StatusBadge/Tokens同源读取比对。",
   "rules": {
     "success_tone_restriction": "仅 verified 状态允许使用成功色（--success / #26725e）；unverified、suggestion 等绝不得使用成功色或完成对勾 ✓；settled 仅在具有已核验证据时呈现特定状态，默认不使用成功色。",

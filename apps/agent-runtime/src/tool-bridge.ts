@@ -1,6 +1,6 @@
 /** SDK tools are descriptions and a Host gateway, never local handlers. */
 import {createHash} from 'node:crypto';
-import {PROFILE, MEMORY_PROFILE, DISCOVERY_PROFILE, SOURCE_PROFILE, exact, get, nameVersion, nativeId, identifier, digest, object, shape, ProtocolError,RESULT_ABI,canonicalEnvelope} from './protocol.js';
+import {WORKBENCH_PROFILE, PROFILE, MEMORY_PROFILE, DISCOVERY_PROFILE, SOURCE_PROFILE, exact, get, nameVersion, nativeId, identifier, digest, object, shape, ProtocolError,RESULT_ABI,canonicalEnvelope} from './protocol.js';
 import type {Json, JsonObject, Start, Tool,Identity} from './protocol.js';
 
 export interface HostChannel {
@@ -62,14 +62,14 @@ export class ToolGateway {
   readonly discovery: boolean;
   private active: string[];
   constructor(start: Start, private readonly channel: HostChannel) {
-    if (start.tool_profile !== PROFILE && start.tool_profile !== MEMORY_PROFILE && start.tool_profile !== DISCOVERY_PROFILE && start.tool_profile !== SOURCE_PROFILE) throw new ProtocolError('tool_profile');
+    if (start.tool_profile !== WORKBENCH_PROFILE && start.tool_profile !== PROFILE && start.tool_profile !== MEMORY_PROFILE && start.tool_profile !== DISCOVERY_PROFILE && start.tool_profile !== SOURCE_PROFILE) throw new ProtocolError('tool_profile');
     digest(start.toolset_version, true); this.pin = start.toolset_version;
     this.tools = structuredClone(start.tools);
-    this.discovery = start.tool_profile === DISCOVERY_PROFILE || start.tool_profile === SOURCE_PROFILE;
+    this.discovery = start.tool_profile === WORKBENCH_PROFILE || start.tool_profile === DISCOVERY_PROFILE || start.tool_profile === SOURCE_PROFILE;
     this.active = this.discovery ? ['tool_search'] : this.names();
     const names = new Set<string>();
     for (const tool of this.tools) {
-      nameVersion(tool.name, tool.version, start.tool_profile === MEMORY_PROFILE, this.discovery, start.tool_profile === SOURCE_PROFILE);
+      nameVersion(tool.name, tool.version, start.tool_profile === MEMORY_PROFILE, this.discovery, start.tool_profile === SOURCE_PROFILE, start.tool_profile === WORKBENCH_PROFILE);
       if (names.has(tool.name) || !object(tool.parameters)) throw new ProtocolError('tool_profile');
       names.add(tool.name);
     }

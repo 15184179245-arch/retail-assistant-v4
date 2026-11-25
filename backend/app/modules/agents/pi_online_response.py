@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 from decimal import Decimal, DecimalException
+from typing import NamedTuple
 
 MODEL = 'deepseek-v4.1-flash'
 MAX_BYTES = 128 * 1024
@@ -245,8 +246,29 @@ def _standard_accounting_observation(value):
             'usage_presence':presence,'usage_basis':None,'accounting_complete':True,
             'billing_complete':False}
 
+class _BoundUsage(NamedTuple):
+    """Immutable proof of one independently parsed body; no execution authority."""
+
+    response_digest: str
+    usage: tuple[tuple[str, int], ...]
+    usage_presence: tuple[tuple[str, bool], ...]
+    usage_basis: tuple[tuple[str, int | str], ...] | None
+
+
 def observe_response_usage(raw):
     """Accounting independently survives invalid decisive content; never authorizes it."""
+    return _observe_response_usage(raw)[1]
+
+
+def _bound_response_usage(raw) -> _BoundUsage:
+    digest, observed = _observe_response_usage(raw)
+    basis = observed['usage_basis']
+    return _BoundUsage(digest, tuple(observed['usage'].items()),
+                       tuple(observed['usage_presence'].items()),
+                       None if basis is None else tuple(basis.items()))
+
+
+def _observe_response_usage(raw):
     try:
         data = raw.encode('utf-8') if type(raw) is str else raw
         if type(data) is not bytes or not 1 <= len(data) <= MAX_BYTES:
@@ -281,7 +303,7 @@ def observe_response_usage(raw):
                 else:
                     found = _standard_accounting_observation(value)
         if not done or found is None or not found['accounting_complete']: _fail()
-        return found
+        return digest, found
     except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError, KeyError, DecimalException):
         raise PiOnlineResponseError('pi_provider_usage_unknown') from None
 

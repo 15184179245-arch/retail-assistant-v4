@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api/client";
 import { authorizedRequest, getScopeVersion } from "../../lib/auth/session";
 import type { Session } from "../../lib/auth/session";
+import { hasCapability, useCapabilities } from "../../lib/auth/capabilities";
+import { businessPermission } from "../../lib/auth/businessPermissions";
 
 interface Notice {
   id: string;
@@ -26,6 +28,7 @@ function errorText(error: unknown): string {
 }
 
 export function NotificationInbox({ session }: { session: Session }) {
+  const canAcknowledge = useCapabilities().hasCapability(businessPermission.notifications.write);
   const [items, setItems] = useState<Notice[]>([]);
   const [error, setError] = useState("");
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -48,7 +51,7 @@ export function NotificationInbox({ session }: { session: Session }) {
   }, [session]);
 
   async function markRead(notice: Notice) {
-    if (busyId || notice.read_at) return;
+    if (!hasCapability(businessPermission.notifications.write) || busyId || notice.read_at) return;
     const version = getScopeVersion();
     setBusyId(notice.id);
     setError("");
@@ -87,7 +90,7 @@ export function NotificationInbox({ session }: { session: Session }) {
         <strong>{labels[notice.kind] ?? "任务提醒"}</strong>
         <p>任务编号：{notice.task_id} · {new Date(notice.created_at).toLocaleString()}</p>
         <small>规则：{notice.rule_version} · {notice.read_at ? "已读" : "未读"}</small>
-        {!notice.read_at ? <div>
+        {canAcknowledge && !notice.read_at ? <div>
           <button type="button" className="login-button" disabled={busyId !== null}
             onClick={() => void markRead(notice)}>
             {busyId === notice.id ? "保存中…" : "标记已读（不执行任务）"}

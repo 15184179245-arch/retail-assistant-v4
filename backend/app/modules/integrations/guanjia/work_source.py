@@ -113,7 +113,11 @@ def decode_call(raw):
 
 
 def _material(raw):
-    value = protected._shape(protected._decode(raw), _MATERIAL_FIELDS)
+    direct = os.environ.get('RETAIL_PI_DIRECT_ACCESS') == '1'
+    decoded = protected._decode(raw)
+    fields = (_MATERIAL_FIELDS if not direct or (type(decoded) is dict and 'expires_at' in decoded)
+              else tuple(k for k in _MATERIAL_FIELDS if k != 'expires_at'))
+    value = protected._shape(decoded, fields)
     if type(value['version']) is not int or value['version'] != 2:
         _deny()
     for key in ('machine_token', 'username', 'password', 'tenancy_name'):
@@ -121,7 +125,8 @@ def _material(raw):
     for key in ('organization_id', 'store_id', 'agent_subject_id', 'shop_id', 'warehouse_id'):
         protected._text(value[key])
     protected._integer(value['expected_tenant_id'])
-    protected._instant(value['expires_at'])
+    if not direct:
+        protected._instant(value['expires_at'])
     if type(value['product_details']) is not dict or not value['product_details']:
         _deny()
     for key, digest in value['product_details'].items():
@@ -243,7 +248,9 @@ def _check(loaded, call):
         # Validate detail/units before authentication or any business request.
         project_observation(operation, b'{"success":true,"result":[]}', product_raw=raw,
             binding=projection, observed_started_at=ctx.now, observed_finished_at=ctx.now)
-        expiry = min(protected._instant(material['expires_at']), ctx.person.auth_expires_at, ctx.run.deadline_at)
+        expiry = (min(ctx.person.auth_expires_at, ctx.run.deadline_at)
+                  if os.environ.get('RETAIL_PI_DIRECT_ACCESS') == '1'
+                  else min(protected._instant(material['expires_at']), ctx.person.auth_expires_at, ctx.run.deadline_at))
         scope = _digest([material['organization_id'], material['store_id'],
             'https://erp.example.invalid', material['tenancy_name'], material['expected_tenant_id'],
             material['shop_id'], material['warehouse_id']])

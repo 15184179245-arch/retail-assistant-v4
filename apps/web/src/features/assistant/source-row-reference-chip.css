@@ -1,0 +1,52 @@
+.assistant-source-reference {
+  box-sizing: border-box;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  padding: 6px 8px;
+  border: 1px solid #b6cec2;
+  border-radius: .55rem;
+  background: #f5f9f6;
+  color: #173735;
+  font-size: .875rem;
+  overflow-wrap: anywhere;
+}
+
+.assistant-source-reference-text {
+  flex: 1 1 10rem;
+  min-inline-size: 0;
+}
+
+.assistant-source-reference-text > p {
+  margin: .15em 0 0;
+  color: #425956;
+  line-height: 1.35;
+}
+
+.assistant-source-reference > button {
+  box-sizing: border-box;
+  flex: 0 1 auto;
+  min-block-size: 44px;
+  min-inline-size: 44px;
+  max-inline-size: 100%;
+  padding: 4px 8px;
+  border: 1px solid #819e90;
+  border-radius: .4rem;
+  background: #fff;
+  color: #235f53;
+  font: inherit;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.assistant-source-reference > button:focus-visible {
+  outline: 2px solid #196852;
+  outline-offset: 2px;
+}
+
+.assistant-source-reference > button:disabled {
+  opacity: .65;
+}

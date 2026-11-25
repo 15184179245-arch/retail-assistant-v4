@@ -1,0 +1,57 @@
+.ar-customer-card .ar-table-scroll td,
+.ar-customer-card .ar-table-scroll th {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.ar-customer-card .ar-customer-label {
+  display: none;
+}
+
+@media (max-width: 600px) {
+  .ar-customer-card .ar-table-scroll {
+    position: relative;
+  }
+
+  .ar-customer-card .ar-table-scroll table,
+  .ar-customer-card .ar-table-scroll caption,
+  .ar-customer-card tbody,
+  .ar-customer-card tbody tr {
+    display: block;
+  }
+
+  /* Keep the column headers in the accessibility tree, not in the stacked layout. */
+  .ar-customer-card thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .ar-customer-card .ar-table-scroll caption {
+    margin: 0;
+    padding: .4rem .75rem .65rem;
+  }
+
+  .ar-customer-card tbody tr {
+    padding: .35rem .75rem;
+    border-top: 1px solid #e1e9e6;
+  }
+
+  .ar-customer-card .ar-table-scroll td {
+    display: grid;
+    /* Stack the value under its label if two readable tracks no longer fit. */
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 7rem), 1fr));
+    gap: .5rem;
+    padding: .28rem 0;
+    border: 0;
+  }
+
+  .ar-customer-card .ar-customer-label {
+    display: block;
+    font-weight: 600;
+  }
+}

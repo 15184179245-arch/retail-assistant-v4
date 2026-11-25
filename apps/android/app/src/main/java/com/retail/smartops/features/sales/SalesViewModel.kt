@@ -1,17 +1,40 @@
 package com.retail.smartops.features.sales
 
 import com.retail.smartops.core.auth.SessionRepository
+import com.retail.smartops.core.auth.RequestScope
+import com.retail.smartops.core.auth.Session
 import com.retail.smartops.core.database.CacheIdentity
 import com.retail.smartops.core.network.HttpApiClient
 import com.retail.smartops.features.search.SearchMatchItem
 import java.util.UUID
-import java.util.Locale
+import java.math.BigDecimal
+import java.math.RoundingMode
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.update
+
+private const val LOCKED_SUBMISSION_MESSAGE = "原意图已固定，不能改内容或换键重派；请先核对原结果"
+
+private val DRAFT_AMOUNT_MAX = BigDecimal("1000000000")
+
+private fun validDecimal(value: BigDecimal, scale: Int, allowZero: Boolean): Boolean =
+    value.signum() >= (if (allowZero) 0 else 1) && value <= DRAFT_AMOUNT_MAX &&
+        value.stripTrailingZeros().scale() <= scale
+
+private val ZERO_MONEY = BigDecimal.ZERO.setScale(2)
+internal fun formatDraftMoney(value: BigDecimal): String = value.toPlainString()
+
+internal fun formatDraftQuantity(value: Double): String = BigDecimal.valueOf(value)
+    .stripTrailingZeros().toPlainString()
 
 data class SalesLineItem(
     val lineKey: String = UUID.randomUUID().toString(),
@@ -23,20 +46,41 @@ data class SalesLineItem(
     val quoteId: String? = null,
     val packagingUnit: String = "件",
     val note: String? = null,
+    val unitSource: DraftUnitSource? = null,
 ) {
-    val lineSubtotal: Double
-        get() = quantity * unitPrice * (1.0 - discountBps / 10000.0)
+    internal val exactSubtotal: BigDecimal
+        get() = BigDecimal.valueOf(unitPrice).multiply(BigDecimal.valueOf(10000L - discountBps, 4))
+            .setScale(2, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(quantity))
+            .setScale(2, RoundingMode.HALF_UP)
+
+    internal val unitPriceText: String get() =
+        formatDraftMoney(BigDecimal.valueOf(unitPrice).setScale(2, RoundingMode.UNNECESSARY))
 
     fun toFormalDraftLine(): FormalDraftLine =
         FormalDraftLine(
             lineKey = lineKey,
             productId = productId,
             productName = productName,
-            quantity = "%.4f".format(Locale.ROOT, quantity).trimEnd('0').trimEnd('.'),
-            unitPrice = "%.2f".format(Locale.ROOT, unitPrice),
+            quantity = formatDraftQuantity(quantity),
+            unitPrice = unitPriceText,
             discountBps = discountBps,
             quoteId = quoteId,
+            salesUnit = packagingUnit.takeIf { unitSource != null },
+            unitSource = unitSource,
         )
+
+    companion object {
+        fun restore(line: FormalDraftLine): SalesLineItem {
+            val quantity = line.quantity.toBigDecimal()
+            val price = line.unitPrice.toBigDecimal()
+            require(validDecimal(quantity, 6, false) && validDecimal(price, 2, true) &&
+                line.discountBps in 0..10000) { "invalid_owned_draft_numbers" }
+            return SalesLineItem(
+                line.lineKey, line.productId, line.productName, quantity.toDouble(), price.toDouble(),
+                line.discountBps, line.quoteId, line.salesUnit ?: "单位待核", unitSource = line.unitSource,
+            )
+        }
+    }
 }
 
 data class SalesHandoffInfo(
@@ -48,6 +92,16 @@ data class SalesHandoffInfo(
     val requestedAtMs: Long,
 )
 
+enum class DraftSaveStatus { EMPTY, SAVING, SAVED, FAILED, READ_ONLY }
+data class SavedSalesDraft(val id: String, val updatedAtMs: Long, val syncState: String)
+
+sealed interface SalesDraftArchive {
+    data object Idle : SalesDraftArchive
+    data object Loading : SalesDraftArchive
+    data class Loaded(val drafts: List<SavedSalesDraft>) : SalesDraftArchive
+    data object Failed : SalesDraftArchive
+}
+
 data class SalesUiState(
     val draftId: String = UUID.randomUUID().toString(),
     val lines: List<SalesLineItem> = emptyList(),
@@ -56,7 +110,7 @@ data class SalesUiState(
     val syncState: String = "local_only", // "local_only", "synced", "pending_sync", "corrupt"
     val currency: String = "CNY",
     val totalQuantity: Double = 0.0,
-    val totalAmount: Double = 0.0,
+    val totalAmount: BigDecimal = ZERO_MONEY,
     val handoff: SalesHandoffInfo? = null,
     val ambiguityWarning: String? = null,
     val error: String? = null,
@@ -73,10 +127,67 @@ data class SalesUiState(
     val quantityInput: String = "",
     val priceInput: String = "",
     val manualUnitInput: String = "",
-)
+    val saveStatus: DraftSaveStatus = DraftSaveStatus.EMPTY,
+    val archive: SalesDraftArchive = SalesDraftArchive.Idle,
+    val isOpeningDraft: Boolean = false,
+) {
+    internal val catalogSalesUnit: String?
+        get() = pendingProduct?.unit?.trim()?.takeIf(SalesDraftCodec::validSalesUnit)
+}
 
 private val salesIoExecutor: Executor = Executors.newSingleThreadExecutor { runnable ->
     Thread(runnable, "sales-io").apply { isDaemon = true }
+}
+
+/** Reserve before work dispatch; retire without waiting for Room or the session monitor. */
+private class SalesStoreLifetime(
+    private val worker: Executor,
+    private val retirementDispatcher: CoroutineDispatcher,
+    private val afterDrain: () -> Unit,
+) {
+    private val lock = Any()
+    @Volatile var isRetired = false
+        private set
+    private var pending = 0
+
+    fun enqueue(work: () -> Unit): Boolean {
+        synchronized(lock) {
+            if (isRetired) return false
+            pending++
+        }
+        val claimed = AtomicBoolean()
+        return try {
+            worker.execute {
+                if (!claimed.compareAndSet(false, true)) return@execute
+                try { work() } finally { done() }
+            }
+            true
+        } catch (rejected: RejectedExecutionException) {
+            // A direct executor can relay a running task's exception, not a dispatch rejection.
+            if (!claimed.compareAndSet(false, true)) throw rejected
+            done()
+            false
+        }
+    }
+
+    fun retire() {
+        val drained = synchronized(lock) {
+            if (isRetired) return
+            isRetired = true
+            pending == 0
+        }
+        if (drained) finishOffCaller()
+    }
+
+    private fun done() {
+        val drained = synchronized(lock) { --pending == 0 && isRetired }
+        if (drained) finishOffCaller()
+    }
+
+    private fun finishOffCaller() {
+        // The shared coroutine I/O dispatcher does not depend on a work executor accepting new jobs.
+        retirementDispatcher.dispatch(EmptyCoroutineContext, Runnable { afterDrain() })
+    }
 }
 
 class SalesViewModel(
@@ -84,30 +195,173 @@ class SalesViewModel(
     private val sessionRepository: SessionRepository,
     private val apiClient: HttpApiClient? = null,
     private val clock: () -> Long = System::currentTimeMillis,
-    private val ioExecutor: Executor = salesIoExecutor,
+    ioExecutor: Executor = salesIoExecutor,
+    private val closeOwnedDatabase: (() -> Unit)? = null,
+    retirementDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
     private val _state = MutableStateFlow(SalesUiState())
     val state: StateFlow<SalesUiState> = _state.asStateFlow()
 
-    init {
-        sessionRepository.onScopeInvalidated {
-            clearOnAccountSwitch()
+    private val ownerGeneration = sessionRepository.status.value.generation
+    // Archive reads use the same monitor as their owner, independently of local saves and handoff.
+    private var archiveRequest: RequestScope? = null
+    private val localIo = SalesStoreLifetime(ioExecutor, retirementDispatcher, ::finishRetirement)
+    private val unsubscribeScope = sessionRepository.onScopeInvalidated(::clearOnAccountSwitch)
+
+    private fun captureOwnedRequest(): Pair<Session, RequestScope>? {
+        if (localIo.isRetired) return null
+        val captured = sessionRepository.captureRequest() ?: return null
+        if (captured.second.generation == ownerGeneration) return captured
+        sessionRepository.finishRequest(captured.second)
+        return null
+    }
+
+    private fun enqueueLocal(request: RequestScope, onFailure: () -> Unit, work: () -> Unit) {
+        val accepted = localIo.enqueue {
+            try { work() } catch (_: Exception) { onFailure() } finally {
+                sessionRepository.finishRequest(request)
+            }
+        }
+        if (!accepted) {
+            try { onFailure() } finally { sessionRepository.finishRequest(request) }
         }
     }
 
-    fun clearOnAccountSwitch() {
+    fun close() = localIo.retire()
+
+    private fun finishRetirement() {
+        try {
+            synchronized(sessionRepository) {
+                unsubscribeScope()
+                retireArchiveRead()
+                _state.update { it.copy(archive = SalesDraftArchive.Idle) }
+            }
+        } finally {
+            // Only the database owned by this retired Sales graph, never the Search cache.
+            closeOwnedDatabase?.invoke()
+        }
+    }
+
+    private fun retireArchiveRead() {
+        val request = archiveRequest
+        archiveRequest = null
+        if (request != null) sessionRepository.finishRequest(request)
+    }
+
+    fun clearOnAccountSwitch() = synchronized(sessionRepository) {
+        retireArchiveRead()
         _state.value = SalesUiState(
             draftId = UUID.randomUUID().toString(),
             message = "已切换账号，已清空工作台草稿",
         )
     }
 
-    fun newDraft() {
-        val newId = UUID.randomUUID().toString()
-        _state.value = SalesUiState(
-            draftId = newId,
-            message = "已创建新销售草稿",
-        )
+    fun newDraft() = openDraft(null)
+
+    fun reopenDraft(draftId: String) = openDraft(draftId)
+
+    fun refreshSavedDrafts() {
+        val (repo, session, request) = synchronized(sessionRepository) {
+            if (localIo.isRetired || archiveRequest != null) return
+            val (session, request) = captureOwnedRequest() ?: return
+            val repo = salesDraftRepository
+            if (repo == null) {
+                _state.update { it.copy(archive = SalesDraftArchive.Failed) }
+                sessionRepository.finishRequest(request)
+                return
+            }
+            archiveRequest = request
+            _state.update { it.copy(archive = SalesDraftArchive.Loading) }
+            Triple(repo, session, request)
+        }
+
+        fun finish(result: SalesDraftArchive?) = synchronized(sessionRepository) {
+            sessionRepository.whileCurrent(session) {
+                if (archiveRequest === request) {
+                    archiveRequest = null
+                    if (result != null && request.isActive()) _state.update {
+                        it.copy(archive = if (localIo.isRetired) SalesDraftArchive.Idle else result)
+                    }
+                }
+            }
+        }
+
+        enqueueLocal(request, { finish(SalesDraftArchive.Failed) }) {
+            // Expiry can occur while this task is queued, before the next lifecycle tick.
+            val mayRead = synchronized(sessionRepository) {
+                !localIo.isRetired && sessionRepository.currentSession() == session &&
+                    archiveRequest === request && request.isActive()
+            }
+            finish(if (!mayRead) null else SalesDraftArchive.Loaded(
+                repo.listDrafts(CacheIdentity.from(session)).map {
+                    SavedSalesDraft(it.draftId, it.updatedAtMs, it.syncState)
+                },
+            ))
+        }
+    }
+
+    private fun openDraft(targetId: String?) {
+        val current = _state.value
+        if (current.isOpeningDraft || current.isLoading || targetId == current.draftId) return
+        val repo = salesDraftRepository
+        val (session, request) = captureOwnedRequest() ?: return
+        _state.update { it.copy(isOpeningDraft = true) }
+        fun showFailure() = sessionRepository.whileCurrent(session) {
+            if (request.isActive()) _state.update { state ->
+                if (state.draftId != current.draftId) state else state.copy(
+                    isOpeningDraft = false, error = "无法安全打开该草稿，当前内容未丢弃。",
+                )
+            }
+        }
+        enqueueLocal(request, { showFailure() }) {
+            if (!request.isActive() || sessionRepository.currentSession() != session) return@enqueueLocal
+            // All production save/switch jobs use the same serial queue; do not
+            // discard the current editor or invent a key when its save failed.
+            val now = _state.value
+            if (now.draftId != current.draftId || now.saveStatus in setOf(DraftSaveStatus.FAILED, DraftSaveStatus.SAVING)) {
+                if (now.draftId == current.draftId) sessionRepository.whileCurrent(session) {
+                    if (request.isActive()) _state.update { it.copy(isOpeningDraft = false,
+                        error = "当前草稿还没保存成功，仍保留本页，请先重试保存。") }
+                }
+                return@enqueueLocal
+            }
+            val next = if (targetId == null) {
+                SalesUiState(message = "已创建新销售草稿")
+            } else {
+                val loaded = repo?.readOwnedDraft(CacheIdentity.from(session), targetId)
+                    ?: error("draft_not_found")
+                val (draft, intents) = loaded
+                val decoded = SalesDraftCodec.decodeLines(draft.linesJson)
+                val lines = runCatching {
+                    (decoded as? DecodeLinesResult.Success)?.lines?.map(SalesLineItem::restore)
+                }.getOrNull()
+                val flows = intents.filter { it.action == "prepare_handoff_v4" }
+                val originalFlow = flows.singleOrNull()
+                val readOnly = flows.isNotEmpty() || draft.status == "paid" ||
+                    draft.syncState == "corrupt" || lines == null || intents.any { it.attempts != 0 }
+                val totals = calculateTotals(lines.orEmpty())
+                SalesUiState(
+                    draftId = draft.draftId, lines = lines.orEmpty(), currency = draft.currency,
+                    stage = draft.stage, status = draft.status, syncState = draft.syncState,
+                    totalQuantity = totals.first, totalAmount = totals.second,
+                    serverDraftId = draft.serverDraftId, preparationIntentKey = originalFlow?.idempotencyKey,
+                    preparationDisposition = if (lines.isNullOrEmpty()) null else SalesIntentDisposition.UNIT_PROOF_REQUIRED,
+                    handoffGate = if (lines.isNullOrEmpty()) null else SALES_UNIT_HOLD_CODE,
+                    submissionLocked = readOnly,
+                    saveStatus = if (readOnly) DraftSaveStatus.READ_ONLY else DraftSaveStatus.SAVED,
+                    message = if (readOnly) "原草稿需核对，已只读打开，不会重新提交。" else "已恢复本机草稿。",
+                )
+            }
+            sessionRepository.whileCurrent(session) {
+                if (request.isActive()) _state.update {
+                    if (it.draftId == current.draftId) next.copy(archive = it.archive) else it
+                }
+            }
+        }
+    }
+
+    fun retryLocalSave() {
+        if (_state.value.saveStatus == DraftSaveStatus.FAILED) persistLocalDraft()
     }
 
     fun selectConfirmedProduct(item: SearchMatchItem) {
@@ -133,7 +387,7 @@ class SalesViewModel(
 
     fun updatePendingUnit(value: String) {
         _state.update {
-            if (it.pendingProduct == null || !it.pendingProduct.unit.isNullOrBlank()) it
+            if (it.pendingProduct == null || it.catalogSalesUnit != null) it
             else it.copy(manualUnitInput = value, error = null)
         }
     }
@@ -148,22 +402,24 @@ class SalesViewModel(
         val current = _state.value
         val product = current.pendingProduct
             ?: return rejectProductInput("请先在找货页人工确认商品")
-        val quantity = current.quantityInput.trim().toDoubleOrNull()
-        if (quantity == null || !quantity.isFinite() || quantity <= 0.0) {
-            return rejectProductInput("请输入大于 0 的有效数量")
+        val quantity = current.quantityInput.trim().toBigDecimalOrNull()
+        if (quantity == null || !validDecimal(quantity, 6, false)) {
+            return rejectProductInput("请输入大于 0、最多六位小数的有效数量")
         }
-        val price = current.priceInput.trim().toDoubleOrNull()
-        if (price == null || !price.isFinite() || price < 0.0) {
-            return rejectProductInput("请输入不小于 0 的有效单价；空白不代表零价")
+        val price = current.priceInput.trim().toBigDecimalOrNull()
+        if (price == null || !validDecimal(price, 2, true)) {
+            return rejectProductInput("请填写有效单价，最多两位小数；空白不代表零价")
         }
-        val unit = product.unit?.takeIf { it.isNotBlank() } ?: current.manualUnitInput.trim()
-        if (unit.isBlank()) return rejectProductInput("来源未提供单位，请人工填写并确认销售单位")
+        val catalogUnit = current.catalogSalesUnit
+        val unit = catalogUnit ?: current.manualUnitInput.trim()
+        if (!SalesDraftCodec.validSalesUnit(unit)) return rejectProductInput("请人工填写并确认有效的销售单位")
         val added = addItem(
             productId = product.productId,
             productName = product.name,
-            quantity = quantity,
-            unitPrice = price,
+            quantity = quantity.toDouble(),
+            unitPrice = price.toDouble(),
             packagingUnit = unit,
+            unitSource = if (catalogUnit == null) DraftUnitSource.OPERATOR else DraftUnitSource.CATALOG,
             isAmbiguous = false, // Only the explicit confirmed-selection UI calls this flow.
         )
         if (added) clearPendingProduct()
@@ -189,7 +445,9 @@ class SalesViewModel(
         packagingUnit: String = "件",
         note: String? = null,
         isAmbiguous: Boolean = false,
+        unitSource: DraftUnitSource = DraftUnitSource.OPERATOR,
     ): Boolean {
+        if (localIo.isRetired || _state.value.isOpeningDraft || sessionRepository.status.value.generation != ownerGeneration) return false
         if (_state.value.submissionLocked) return rejectLockedSubmission()
         if (isAmbiguous) {
             _state.update {
@@ -201,7 +459,7 @@ class SalesViewModel(
             return false
         }
 
-        if (quantity <= 0.0) {
+        if (!quantity.isFinite() || !validDecimal(BigDecimal.valueOf(quantity), 6, false)) {
             _state.update {
                 it.copy(
                     error = "销售数量必须大于 0",
@@ -211,7 +469,9 @@ class SalesViewModel(
             return false
         }
 
-        if (unitPrice < 0.0) {
+        if (!unitPrice.isFinite() || !validDecimal(BigDecimal.valueOf(unitPrice), 2, true) ||
+            !SalesDraftCodec.validSalesUnit(packagingUnit) || discountBps !in 0..10000
+        ) {
             _state.update {
                 it.copy(
                     error = "商品单价不能为负数",
@@ -221,15 +481,24 @@ class SalesViewModel(
             return false
         }
 
+        val selectedDraftId = _state.value.draftId
+        fun matches(line: SalesLineItem): Boolean =
+            line.productId == productId && line.unitPrice == unitPrice && line.quoteId == quoteId &&
+                line.packagingUnit == packagingUnit && line.unitSource == unitSource &&
+                line.discountBps == discountBps && line.note == note
+        val existing = _state.value.lines.firstOrNull(::matches)
+        if (existing != null &&
+            !validDecimal(BigDecimal.valueOf(existing.quantity) + BigDecimal.valueOf(quantity), 6, false)
+        ) return rejectProductInput("合并数量超出允许范围")
         _state.update { current ->
-            val existingIndex = current.lines.indexOfFirst {
-                it.productId == productId && it.unitPrice == unitPrice && it.quoteId == quoteId &&
-                    it.packagingUnit == packagingUnit
-            }
+            if (current.draftId != selectedDraftId) return@update current
+            val existingIndex = current.lines.indexOfFirst(::matches)
             val updatedLines = current.lines.toMutableList()
             if (existingIndex >= 0) {
                 val old = updatedLines[existingIndex]
-                updatedLines[existingIndex] = old.copy(quantity = old.quantity + quantity)
+                val merged = BigDecimal.valueOf(old.quantity).add(BigDecimal.valueOf(quantity))
+                if (!validDecimal(merged, 6, false)) return@update current.copy(error = "合并数量超出允许范围")
+                updatedLines[existingIndex] = old.copy(quantity = merged.toDouble())
             } else {
                 updatedLines.add(
                     SalesLineItem(
@@ -241,6 +510,7 @@ class SalesViewModel(
                         quoteId = quoteId,
                         packagingUnit = packagingUnit,
                         note = note,
+                        unitSource = unitSource,
                     )
                 )
             }
@@ -255,14 +525,21 @@ class SalesViewModel(
                 message = "已添加商品: $productName",
             )
         }
+        if (_state.value.draftId != selectedDraftId) return false
         persistLocalDraft()
         return true
     }
 
+    fun adjustLineQuantity(lineKey: String, step: Long) {
+        val line = _state.value.lines.firstOrNull { it.lineKey == lineKey } ?: return
+        updateLineQuantity(lineKey, (BigDecimal.valueOf(line.quantity) + BigDecimal.valueOf(step)).toDouble())
+    }
+
     fun updateLineQuantity(lineKey: String, newQuantity: Double) {
+        if (localIo.isRetired || _state.value.isOpeningDraft || sessionRepository.status.value.generation != ownerGeneration) return
         if (_state.value.submissionLocked) { rejectLockedSubmission(); return }
-        if (newQuantity <= 0.0) {
-            removeLine(lineKey)
+        if (!newQuantity.isFinite() || !validDecimal(BigDecimal.valueOf(newQuantity), 6, false)) {
+            rejectProductInput("数量须大于 0；删除请使用该行的删除按钮。")
             return
         }
         _state.update { current ->
@@ -282,8 +559,9 @@ class SalesViewModel(
     }
 
     fun updateLinePrice(lineKey: String, newPrice: Double) {
+        if (localIo.isRetired || _state.value.isOpeningDraft || sessionRepository.status.value.generation != ownerGeneration) return
         if (_state.value.submissionLocked) { rejectLockedSubmission(); return }
-        if (newPrice < 0.0) {
+        if (!newPrice.isFinite() || !validDecimal(BigDecimal.valueOf(newPrice), 2, true)) {
             _state.update { it.copy(error = "商品单价不能为负数") }
             return
         }
@@ -304,8 +582,10 @@ class SalesViewModel(
     }
 
     fun removeLine(lineKey: String) {
-        if (_state.value.submissionLocked) { rejectLockedSubmission(); return }
-        _state.update { current ->
+        if (localIo.isRetired || sessionRepository.status.value.generation != ownerGeneration) return
+        val previous = _state.getAndUpdate { current ->
+            if (current.isOpeningDraft || current.lines.none { it.lineKey == lineKey }) return@getAndUpdate current
+            if (current.submissionLocked) return@getAndUpdate current.copy(error = LOCKED_SUBMISSION_MESSAGE)
             val updatedLines = current.lines.filterNot { it.lineKey == lineKey }
             val (totalQty, totalAmt) = calculateTotals(updatedLines)
             current.copy(
@@ -317,7 +597,10 @@ class SalesViewModel(
                 message = "已移除商品行",
             )
         }
-        persistLocalDraft()
+        // Use the actual preimage of this update, not an earlier read or a retried lambda's flag.
+        if (!previous.isOpeningDraft && !previous.submissionLocked && previous.lines.any { it.lineKey == lineKey }) {
+            persistLocalDraft()
+        }
     }
 
     /**
@@ -325,6 +608,7 @@ class SalesViewModel(
      * Empty drafts or drafts with non-positive values cannot be marked ready.
      */
     fun markReady(): Boolean {
+        if (localIo.isRetired || _state.value.isOpeningDraft || sessionRepository.status.value.generation != ownerGeneration) return false
         if (_state.value.submissionLocked) return rejectLockedSubmission()
         val current = _state.value
         if (current.lines.isEmpty()) {
@@ -341,92 +625,50 @@ class SalesViewModel(
             it.copy(
                 stage = "ready",
                 error = null,
-                message = "已完成人工确认；提交时先核对后台商品行，交接还需已核价格来源",
+                message = "已完成本机人工确认。销售单位尚未由后台核验，未发起交接。",
             )
         }
         persistLocalDraft()
         return true
     }
 
-    /**
-     * Prepare the owned draft and confirmed lines on IO; price/ready/handoff remain HOLD.
-     * The return value never claims a successful handoff in this limited slice.
-     */
+    /** Read the original reason for HOLD; this candidate cannot issue formal sales requests. */
     fun submitHandoff(notes: String? = null): Boolean {
         val current = _state.value
-        if (current.isLoading) return false
+        if (current.isLoading || current.isOpeningDraft) return false
         if (!notes.isNullOrBlank()) {
             _state.update { it.copy(error = "交接接口不支持 notes 字段，未发送请求", message = null,
                 preparationDisposition = SalesIntentDisposition.CONTRACT_REJECTED) }
             return false
         }
-        if (current.stage != "ready" || current.lines.isEmpty() || current.status != "pending") {
-            _state.update { it.copy(error = "必须先人工确认有效商品行，且草稿尚未结算", message = null,
-                preparationDisposition = SalesIntentDisposition.CONTRACT_REJECTED) }
+        if (current.saveStatus !in setOf(DraftSaveStatus.SAVED, DraftSaveStatus.READ_ONLY)) {
+            _state.update { it.copy(error = "请先保存本机草稿，未发送任何请求。") }
             return false
         }
-        val repo = salesDraftRepository
-        if (repo == null) {
-            _state.update { it.copy(error = "本地意图存储不可用，未发送请求", message = null,
-                preparationDisposition = SalesIntentDisposition.CONTRACT_REJECTED) }
-            return false
-        }
-        val captured = sessionRepository.captureRequest()
-        if (captured == null) {
-            _state.update { it.copy(error = "请先登录，未发送交接", message = null,
-                preparationDisposition = SalesIntentDisposition.PERMISSION_DENIED) }
-            return false
-        }
-        val (session, request) = captured
-        val capabilities = sessionRepository.getCapabilities()
-        val capabilityVersion = sessionRepository.getCapabilityVersion()
-        val scope = CacheIdentity(session.organizationId, session.storeId, session.subjectId)
-        _state.update { it.copy(isLoading = true, submissionLocked = true, error = null,
-            message = "正在核对后台草稿与商品行，尚未发送交接") }
-        fun guarded(block: () -> Unit): Boolean {
-            var active = false
-            sessionRepository.whileCurrent(session) {
-                if (request.isActive() && _state.value.draftId == current.draftId &&
-                    sessionRepository.getCapabilities() == capabilities &&
-                    sessionRepository.getCapabilityVersion() == capabilityVersion) { block(); active = true }
+        val repo = salesDraftRepository ?: return false
+        val (session, request) = captureOwnedRequest() ?: return false
+        val scope = CacheIdentity.from(session)
+        _state.update { it.copy(isLoading = true, error = null, message = null) }
+        fun showFailure() = sessionRepository.whileCurrent(session) {
+            if (request.isActive()) _state.update { state ->
+                if (state.draftId != current.draftId) state else state.copy(isLoading = false,
+                    error = "本机原件需核对；未读取原结果，未发送任何请求。")
             }
-            return active
         }
-        ioExecutor.execute {
-            var enteredPreparation = false
-            try {
-                var queued: com.retail.smartops.core.database.SalesSyncIntentEntity? = null
-                if (!guarded { queued = repo.queuePreparation(scope, current.draftId) }) return@execute
-                val client = apiClient
-                val result = if (client == null) repo.inspectPreparationOffline(scope, current.draftId) else {
-                    enteredPreparation = true
-                    repo.prepareForHandoff(scope, current.draftId, client, sessionRepository)
+        enqueueLocal(request, { showFailure() }) {
+            sessionRepository.whileCurrent(session) {
+                if (!request.isActive() || _state.value.draftId != current.draftId) return@whileCurrent
+                val result = if (apiClient == null) repo.inspectPreparationOffline(scope, current.draftId)
+                    else repo.prepareForHandoff(scope, current.draftId, apiClient, sessionRepository)
+                _state.update { state ->
+                    if (state.draftId != current.draftId) state else state.copy(
+                        isLoading = false, preparationDisposition = result.disposition,
+                        preparationIntentKey = result.intentKey ?: state.preparationIntentKey,
+                        handoffGate = result.code, error = result.message, message = null,
+                    )
                 }
-                guarded {
-                    _state.update { state -> state.copy(isLoading = false,
-                        serverDraftId = result.serverDraftId ?: state.serverDraftId,
-                        preparationIntentKey = result.intentKey ?: queued!!.idempotencyKey,
-                        preparationDisposition = result.disposition,
-                        isOffline = result.disposition == SalesIntentDisposition.OFFLINE_NOT_SENT,
-                        handoffGate = if (result.disposition == SalesIntentDisposition.ACCEPTED) "price_source_hold" else result.code,
-                        syncState = if (result.disposition == SalesIntentDisposition.ACCEPTED) "synced" else state.syncState,
-                        error = if (result.disposition in setOf(SalesIntentDisposition.ACCEPTED,
-                            SalesIntentDisposition.OFFLINE_NOT_SENT)) null else result.message,
-                        message = result.message,
-                    ) } // No manufactured handoff object, receipt or payment state.
-                }
-            } catch (error: Exception) {
-                guarded {
-                    _state.update { it.copy(isLoading = false, isOffline = false,
-                        preparationDisposition = if (enteredPreparation || error.message == "legacy_server_identity_unknown" ||
-                            error !is IllegalArgumentException) SalesIntentDisposition.RESULT_UNKNOWN
-                            else SalesIntentDisposition.CONTRACT_REJECTED,
-                        error = "本地草稿或原意图需核对，未声明交接成功", message = null,
-                        handoffGate = error.message ?: "local_intent_hold") }
-                }
-            } finally { sessionRepository.finishRequest(request) }
+            }
         }
-        // This frozen slice prepares lines only. A price-source HOLD is never a successful handoff.
         return false
     }
 
@@ -465,50 +707,42 @@ class SalesViewModel(
     }
 
     private fun rejectLockedSubmission(): Boolean {
-        _state.update { it.copy(error = "原意图已固定，不能改内容或换键重派；请先核对原结果") }
+        _state.update { it.copy(error = LOCKED_SUBMISSION_MESSAGE) }
         return false
     }
 
-    private fun calculateTotals(lines: List<SalesLineItem>): Pair<Double, Double> {
-        var qty = 0.0
-        var amt = 0.0
-        for (line in lines) {
-            qty += line.quantity
-            amt += line.lineSubtotal
-        }
-        return qty to amt
-    }
+    private fun calculateTotals(lines: List<SalesLineItem>): Pair<Double, BigDecimal> =
+        lines.fold(BigDecimal.ZERO) { qty, line -> qty + BigDecimal.valueOf(line.quantity) }.toDouble() to
+            lines.fold(ZERO_MONEY) { sum, line -> sum + line.exactSubtotal }
 
     private fun persistLocalDraft() {
-        val repo = salesDraftRepository ?: return
-        val session = sessionRepository.currentSession() ?: return
+        val repo = salesDraftRepository
+        val captured = captureOwnedRequest()
+        if (repo == null || captured == null) {
+            captured?.let { sessionRepository.finishRequest(it.second) }
+            _state.update { it.copy(saveStatus = DraftSaveStatus.FAILED, error = "本机草稿尚未保存。") }
+            return
+        }
+        val (session, request) = captured
         val current = _state.value
-        val scope = CacheIdentity(
-            organizationId = session.organizationId,
-            storeId = session.storeId,
-            subjectId = session.subjectId,
-        )
-        ioExecutor.execute {
-            try {
-                sessionRepository.whileCurrent(session) {
-                    if (_state.value.draftId != current.draftId) return@whileCurrent
-                    val lines = current.lines.map { it.toFormalDraftLine() }
-                    if (repo.getDraft(current.draftId) == null) {
-                        repo.createLocalDraft(current.draftId, scope, lines, current.currency, current.stage)
-                    } else {
-                        repo.saveDraft(
-                            draftId = current.draftId, scope = scope, lines = lines,
-                            currency = current.currency, stage = current.stage,
-                            status = current.status, syncState = current.syncState,
-                        )
-                    }
-                }
-            } catch (_: Exception) {
-                sessionRepository.whileCurrent(session) {
-                    _state.update { if (it.draftId != current.draftId) it else it.copy(
-                        error = "本地草稿保存失败，未提交；请保留当前内容", message = null,
-                    ) }
-                }
+        val scope = CacheIdentity.from(session)
+        _state.update { it.copy(saveStatus = DraftSaveStatus.SAVING) }
+        fun updateSaved(outcome: DraftSaveStatus) {
+            _state.update { live ->
+                if (live.draftId != current.draftId || live.lines != current.lines || live.stage != current.stage) live
+                else live.copy(saveStatus = outcome,
+                    error = if (outcome == DraftSaveStatus.FAILED) "本地草稿保存失败，未提交；请保留当前内容" else null)
+            }
+        }
+        fun showFailure() = sessionRepository.whileCurrent(session) {
+            if (request.isActive()) updateSaved(DraftSaveStatus.FAILED)
+        }
+        enqueueLocal(request, { showFailure() }) {
+            sessionRepository.whileCurrent(session) {
+                if (!request.isActive()) return@whileCurrent
+                repo.persistLocalSnapshot(current.draftId, scope,
+                    current.lines.map(SalesLineItem::toFormalDraftLine), current.currency, current.stage)
+                updateSaved(DraftSaveStatus.SAVED)
             }
         }
     }

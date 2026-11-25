@@ -1,5 +1,6 @@
 """Immutable same-Task followups; only explicit Host policy creates a new grant."""
 from uuid import uuid4
+from backend.app.modules.assistant.input_capacity import compose_turn_input, check_input_capacity
 from fastapi import HTTPException
 from sqlalchemy import select
 from backend.app.application import commit_guard
@@ -38,6 +39,11 @@ def admission(work, view):
         request_id=work.request_id,text=view['text'],title=view['title'],at=work.created_at.isoformat(),snapshot=None)
 
 
+def _source_root_pin(work, view):
+    return (work.task_id, work.organization_id, work.store_id, work.owner_id,
+            work.snapshot_sha256, work.request_digest, work.ticket_id, view["text"])
+
+
 def source_view(db,actor,row,*,require_active=False):
     """Validate frozen sources without recursively inspecting any Run/grant."""
     work=db.scalar(select(AssistantWork).where(*service._scope(actor),AssistantWork.task_id==row.root_work_id))
@@ -50,6 +56,17 @@ def source_view(db,actor,row,*,require_active=False):
     # Intake validation may occur just before this new row is flushed.
     if not chain or chain[-1].id!=row.id:chain.append(row)
     prefix=[];parent_id=work.task_id;parent_run=db.get(AssistantDispatch,work.task_id).run_id
+    from backend.app.modules.assistant.inbox_execution import verify_origin
+    # Only this proof may reuse an earlier prefix. The inbox path still
+    # reloads the owner-scoped root and parent, then compares their exact pins.
+    root_pin = _source_root_pin(work, view)
+    verified = {}
+
+    def verify_prior_parent(current_root, current_view, parent):
+        if (_source_root_pin(current_root, current_view) != root_pin
+                or parent.id not in verified or verified[parent.id] != _seal(parent)):
+            raise HTTPException(409, 'assistant_turn_binding_conflict')
+
     try:
         for sequence,part in enumerate(chain,2):
             event=dict(kind='followup',turn_id=part.id,run_id=part.run_id,request_id=part.request_id,
@@ -69,8 +86,8 @@ def source_view(db,actor,row,*,require_active=False):
                     or ticket['assignments'][-1]['id']!=part.assignment_id
                     or [t['text'] for t in part.snapshot['triggers']]!=[view['text']]+[e['text'] for e in expected if e['kind']=='followup']):
                 raise ValueError()
-            from backend.app.modules.assistant.inbox_execution import verify_origin
-            verify_origin(db, part)
+            verify_origin(db, part, verify_parent=verify_prior_parent)
+            verified[part.id] = _seal(part)
             prefix=part.history;parent_id=part.id;parent_run=part.run_id
         if chain[-1].id!=row.id or len(chain)!=row.sequence-1:raise ValueError()
     except (ValueError,KeyError,IndexError,TypeError,AttributeError):
@@ -124,6 +141,7 @@ def _build_turn(db, actor, work, view, latest, fact, *, text, request_id, core, 
     now=commit_guard._db_clock(db);turn_id,run_id=str(uuid4()),str(uuid4())
     history=(latest.history if latest is not None else [])+[dict(kind='result',run_id=fact['run_id'],state=fact['state'],at=fact['at']),
         dict(kind='followup',turn_id=turn_id,run_id=run_id,request_id=request_id,text=text,at=now.isoformat())]
+    check_input_capacity(compose_turn_input(work.task_id, view['text'], history))
     try:result=core.fold(admission=admission(work,view),root_run_id=history[0]['run_id'],history=history)
     except CoreError:raise HTTPException(503,'assistant_followup_unavailable') from None
     if result['ticket_id']!=work.ticket_id or result['state']!='pending' or result['sequence']!=sequence:
@@ -137,7 +155,7 @@ def _build_turn(db, actor, work, view, latest, fact, *, text, request_id, core, 
     return row
 
 
-def append_followup(db,actor,*,root_work_id,previous_turn_id,text,request_id,core,authority_policy=None):
+def append_followup(db,actor,*,root_work_id,previous_turn_id,text,request_id,core,authority_policy=None,prepare_new=None):
     """Caller owns commit; received-only legacy rows are never backfilled."""
     service._check_request(text,request_id)
     service._check_request('root',root_work_id);service._check_request('previous',previous_turn_id)
@@ -161,6 +179,8 @@ def append_followup(db,actor,*,root_work_id,previous_turn_id,text,request_id,cor
             raise HTTPException(409,'assistant_followup_request_conflict')
         if db.scalar(select(AssistantWork).where(*service._scope(actor),AssistantWork.request_id==request_id)):
             raise HTTPException(409,'assistant_followup_request_conflict')
+        if prepare_new is not None:
+            authority_policy=prepare_new()
         latest=db.scalar(select(AssistantTurn).where(*_scope(actor),AssistantTurn.root_work_id==root_work_id)
             .order_by(AssistantTurn.sequence.desc()).limit(1))
         expected=latest.id if latest is not None else root_work_id
@@ -201,6 +221,8 @@ def read_turn(db,actor,turn_id):
 def _full_view(db,actor,row,replayed=False):
     from backend.app.modules.assistant.turn_execution import execution_view
     value=_view(row,replayed)
+    from backend.app.modules.assistant.workspace_binding import root_context, context_view
+    value['workspace_context']=context_view(root_context(db,row,kind='turn'))
     if db.get(AssistantTurnDispatch,row.id) is not None:value.update(execution_view(db,actor,row))
     return value
 

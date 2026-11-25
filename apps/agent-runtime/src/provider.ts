@@ -1,4 +1,6 @@
-/** Per-physical-attempt Host gate. This module contains no network transport. */
+/** Per-physical-attempt Host gate. This module contains no network transport.
+ * AGT-045 Foundation integration: formalized provider gate bindings.
+ */
 import {get, exact, integer, identifier, digest, ProtocolError, shape} from './protocol.js';
 import type {JsonObject} from './protocol.js';
 import {installArgumentRejection} from './tool-bridge.js';
@@ -73,6 +75,7 @@ import {createHash} from 'node:crypto';
 import {PROVIDER_PATH, PROVIDER_BYTES, object, streamSummary} from './protocol.js';
 export interface OnlineHostChannel extends HostChannel {
   readonly streaming?:boolean;
+  reportInputCapacity?():Promise<void>;
   openProvider?(args:JsonObject,signal?:AbortSignal):Promise<{response:Response;terminal:Promise<JsonObject>}>;
   finishProvider?():void;
   request(op: 'model_begin' | 'model_complete' | 'tool_request' | 'provider_call', args: JsonObject): Promise<JsonObject>;
@@ -117,7 +120,13 @@ export class OnlinePhysicalCallGate {
               || (init.redirect !== undefined && init.redirect !== 'error')) throw new ProtocolError('provider_request');
           const bytes = Buffer.from(init.body, 'utf8');
           shape(init.body);
-          if (!bytes.length || bytes.length > PROVIDER_BYTES) throw new ProtocolError('provider_bytes');
+          if (bytes.length > PROVIDER_BYTES) {
+            // Serialized by the SDK, including system/tools/history. Report via
+            // the existing finite error frame BEFORE acquiring any Host permit.
+            await this.channel.reportInputCapacity?.();
+            throw new ProtocolError('provider_bytes');
+          }
+          if (!bytes.length) throw new ProtocolError('provider_bytes');
           const body: unknown = JSON.parse(init.body);
           if (!object(body) || body['model'] !== ONLINE_MODEL || body['stream'] !== true) throw new ProtocolError('physical_model_binding');
           const headers = new Headers(init.headers);

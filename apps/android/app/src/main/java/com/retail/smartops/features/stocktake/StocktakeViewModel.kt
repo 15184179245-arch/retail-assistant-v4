@@ -242,10 +242,11 @@ class StocktakeViewModel(
     private var lastScannedTimestampMs: Long = 0L
     private val DEBOUNCE_WINDOW_MS = 1500L
 
+    private val unsubscribeScope = sessionRepository.onScopeInvalidated(::clearOnLogout)
+
+    fun close() { unsubscribeScope() }
+
     init {
-        sessionRepository.onScopeInvalidated {
-            clearOnLogout()
-        }
         restoreFromBreakpoint()
     }
 

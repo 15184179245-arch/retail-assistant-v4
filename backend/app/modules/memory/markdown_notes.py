@@ -49,7 +49,7 @@ def _parse(markdown):
         raise invalid
     metadata = {}
     try:
-        for line in header.splitlines():
+        for line in header.removesuffix('\n').split('\n'):
             key, sep, value = line.partition(': ')
             if not sep or key not in KEYS or key in metadata:
                 raise invalid

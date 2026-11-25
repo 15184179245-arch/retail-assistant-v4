@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from backend.app.core.security import AuthenticatedSubject
 from backend.app.modules.audit.service import record_event
 from backend.app.modules.knowledge.commands import execute_command
-from backend.app.modules.receiving.models import ReceivingBatch, ReceivingCommand
+from backend.app.modules.receiving.models import ReceivingBatch, ReceivingCommand, ReceivingLine
 from backend.app.modules.receiving.service import (ReceivingError, _batch, _lines,
                                                   _out, _require, _time)
 
@@ -108,11 +108,10 @@ def _authorized(db: Session, actor: AuthenticatedSubject, now: datetime, *, writ
         _require(db, actor, permission, now)
 
 
-def _document_lines(db: Session, actor: AuthenticatedSubject, batch: ReceivingBatch,
-                    requested: object) -> list[dict]:
+def _document_lines(requested: object, actual: list[ReceivingLine],
+                    internal_proofs: set[str]) -> list[dict]:
     if not isinstance(requested, list) or not requested or len(requested) > 200:
         _fail("purchase_document_lines_invalid")
-    actual = _lines(db, actor, batch.id)
     if len(actual) != len(requested):
         _fail("purchase_document_line_count_mismatch")
     expected = {row.line_key: row for row in actual}
@@ -138,7 +137,7 @@ def _document_lines(db: Session, actor: AuthenticatedSubject, batch: ReceivingBa
                 _number(original.observed_quantity, "observed_quantity")):
             _fail("purchase_document_line_mismatch")
         proof = _sha(item["source_line_sha256"], "source_line_sha256")
-        if proof in (original.evidence_sha256, batch.delivery_note_sha256):
+        if proof in internal_proofs:
             _fail("purchase_document_source_not_independent")
         price = item["unit_price"]
         line_total = item["line_total"]
@@ -282,10 +281,14 @@ def verify_purchase_document(
         details = _out(db, actor, batch)
         if details["open_discrepancies"] != 0:
             _fail("purchase_document_unresolved_discrepancy")
-        if proof == batch.delivery_note_sha256 or any(
-                line.evidence_sha256 == proof for line in _lines(db, actor, batch.id)):
+        original_lines = _lines(db, actor, batch.id)
+        # Neither a header nor any external line can borrow a sibling's
+        # internal receiving evidence and present it as an independent source.
+        internal_proofs = {line.evidence_sha256 for line in original_lines}
+        internal_proofs.add(batch.delivery_note_sha256)
+        if proof in internal_proofs:
             _fail("purchase_document_source_not_independent")
-        lines = _document_lines(db, actor, batch, canonical_payload["lines"])
+        lines = _document_lines(canonical_payload["lines"], original_lines, internal_proofs)
         has_amounts = [line["line_total"] is not None for line in lines]
         if any(has_amounts) and not all(has_amounts):
             _fail("purchase_document_partial_total_claim")

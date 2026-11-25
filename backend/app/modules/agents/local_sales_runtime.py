@@ -29,9 +29,12 @@ def _deny():
 
 
 def _day(value):
-    if type(value) is not str or date.fromisoformat(value).isoformat() != value:
+    if type(value) is not str:
         _deny()
-    return date.fromisoformat(value)
+    result = date.fromisoformat(value)
+    if result.isoformat() != value:
+        _deny()
+    return result
 
 
 def _instant(value):

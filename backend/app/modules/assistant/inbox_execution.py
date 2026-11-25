@@ -40,7 +40,7 @@ def _lineage(db, message, turn):
     if turn.previous_turn_id != ids[-1]: inbox.fail('assistant_inbox_parent_changed')
 
 
-def verify_origin(db, turn, *, grant=None):
+def verify_origin(db, turn, *, grant=None, verify_parent=None):
     """Integrity only, including terminal readback. Missing provenance is fatal."""
     receipt = db.scalar(select(AssistantInbox).where(
         AssistantInbox.organization_id == turn.organization_id, AssistantInbox.store_id == turn.store_id,
@@ -56,7 +56,7 @@ def verify_origin(db, turn, *, grant=None):
                (receipt.root_work_id, receipt.account_id, receipt.text, receipt.request_digest)
             or authority._utc(turn.created_at) < authority._utc(receipt.issued_at)):
         inbox.fail()
-    inbox._verify(db, receipt)
+    inbox._verify(db, receipt, verify_parent=verify_parent)
     _lineage(db, receipt, turn)
     # Conversion order is part of the immutable source, not just scheduler intent.
     for prior in db.scalars(select(AssistantInbox).where(AssistantInbox.root_work_id == receipt.root_work_id,
@@ -135,7 +135,11 @@ def convert_next(db, config, *, root_work_id):
     expires = min(authority._utc(receipt.expires_at), authority._utc(policy.expires_at))
     if expires <= now: inbox.fail('assistant_inbox_authority_denied', 403)
     _, _, _, roles = load_scope(db, work.organization_id, work.store_id, work.owner_id)
-    permissions = sorted(set(receipt.permissions).intersection(policy.permissions, CAPABILITIES))
+    policy_permissions = set(policy.permissions)
+    if getattr(config, 'tool_profile', None) == 'pi-workbench-v1':
+        from backend.app.modules.assistant.principal import _WORKSPACE_PERMISSIONS
+        policy_permissions.update(set(receipt.permissions).intersection(_WORKSPACE_PERMISSIONS))
+    permissions = sorted(set(receipt.permissions).intersection(policy_permissions, CAPABILITIES))
     permissions = [key for key in permissions if permission_allowed(grants_for(db,work.organization_id,
         work.store_id,work.owner_id,roles,key),work.owner_id,now=now)]
     if not inbox.REQUIRED <= set(permissions): inbox.fail('assistant_inbox_authority_denied', 403)
@@ -162,6 +166,8 @@ def convert_next(db, config, *, root_work_id):
         request_id=turn.request_id, request_digest=turn.request_digest, snapshot_sha256=turn.snapshot_sha256,
         permissions=permissions, issued_at=turn.created_at, expires_at=expires,
         source_inbox_id=receipt.id, source_inbox_sha256=expected_receipt)
+    from backend.app.modules.assistant.workspace_binding import root_context, context_sha256
+    grant.workspace_binding_sha256 = context_sha256(root_context(db, work))
     grant.binding_sha256 = authority._seal(grant); db.add(grant); db.flush()
     expected_turn, expected_grant = turns._seal(turn), grant.binding_sha256
     def final(session, instant):

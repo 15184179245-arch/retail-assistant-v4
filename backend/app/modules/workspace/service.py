@@ -11,6 +11,9 @@ from typing import Any
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError, OperationalError
+from backend.app.modules.workspace import persistence
+from backend.app.modules.identity.models import PermissionGrant, RoleAssignment
 
 from backend.app.core.security import AuthenticatedSubject
 from backend.app.modules.audit import service as audit_service
@@ -20,6 +23,9 @@ from backend.app.modules.workspace.models import (
     WorkspaceArtifactOp,
     WorkspaceThreadBinding,
     WorkspaceThreadEvent,
+)
+from backend.app.modules.workspace.navigation import (
+    project_navigation_ref, project_navigation_refs, project_navigation_update,
 )
 from backend.app.modules.workspace.schemas import (
     ArtifactCreateRequest,
@@ -164,7 +170,54 @@ def require_kind_permission(
         )
 
 
-def _to_artifact_record(row: WorkspaceArtifact) -> ArtifactRecord:
+
+_COST_KEYS = frozenset(("cost_amount", "cost_price"))
+
+
+def _project_artifact_payload(value, cap_set, stripped=None):
+    """Project a copy for current authority; never edit persisted originals."""
+    if "pricing.cost.read" in cap_set:
+        return copy.deepcopy(value)
+
+    def project(item):
+        if isinstance(item, dict):
+            result = {}
+            for key, child in item.items():
+                if key in _COST_KEYS:
+                    if stripped is not None:
+                        stripped.append(key)
+                else:
+                    result[key] = project(child)
+            return result
+        if isinstance(item, list):
+            return [project(child) for child in item]
+        return copy.deepcopy(item)
+
+    return project(value)
+
+
+
+def _project_suggestions(items, cap_set):
+    projected = []
+    for item in items:
+        value = item.model_dump(mode="json") if isinstance(item, PendingSuggestionRecord) else item
+        if "pricing.cost.read" not in cap_set and value.get("field") in _COST_KEYS:
+            continue
+        projected.append(PendingSuggestionRecord.model_validate(_project_artifact_payload(value, cap_set)))
+    return projected
+
+
+def _output_capabilities(session, actor):
+    # Refresh existing canonical ACL inputs, not a parallel permission resolver.
+    for model in (PermissionGrant, RoleAssignment):
+        list(session.scalars(select(model).where(
+            model.organization_id == actor.organization_id,
+            model.store_id == actor.store_id
+        ).execution_options(populate_existing=True)))
+    return set(resolve_effective_capabilities(session, actor)[0])
+
+
+def _to_artifact_record(row: WorkspaceArtifact, cap_set) -> ArtifactRecord:
     return ArtifactRecord(
         id=row.id,
         organization_id=row.organization_id,
@@ -175,20 +228,17 @@ def _to_artifact_record(row: WorkspaceArtifact) -> ArtifactRecord:
         title=row.title,
         status=row.status,  # type: ignore[arg-type]
         version=row.version,
-        payload=copy.deepcopy(row.payload or {}),
-        source_refs=copy.deepcopy(row.source_refs or []),
+        payload=_project_artifact_payload(row.payload or {}, cap_set),
+        source_refs=_project_artifact_payload(row.source_refs or [], cap_set),
         locked_fields=list(row.locked_fields or []),
-        pending_suggestions=[
-            PendingSuggestionRecord.model_validate(item)
-            for item in (row.pending_suggestions or [])
-        ],
+        pending_suggestions=_project_suggestions(row.pending_suggestions or [], cap_set),
         submitted_receipt_ref=row.submitted_receipt_ref,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
 
 
-def _to_op_record(row: WorkspaceArtifactOp) -> ArtifactOpRecord:
+def _to_op_record(row: WorkspaceArtifactOp, cap_set) -> ArtifactOpRecord:
     return ArtifactOpRecord(
         id=row.id,
         artifact_id=row.artifact_id,
@@ -197,7 +247,7 @@ def _to_op_record(row: WorkspaceArtifactOp) -> ArtifactOpRecord:
         actor_type=row.actor_type,  # type: ignore[arg-type]
         actor_subject_id=row.actor_subject_id,
         op_type=row.op_type,  # type: ignore[arg-type]
-        patch=copy.deepcopy(row.patch or {}),
+        patch=_project_artifact_payload(row.patch or {}, cap_set),
         applied_fields=list(row.applied_fields or []),
         skipped_fields=list(row.skipped_fields or []),
         undo_of_op_id=row.undo_of_op_id,
@@ -362,13 +412,63 @@ def _find_idempotent_op(
     return session.execute(stmt).scalar_one_or_none()
 
 
-def create_artifact(
+
+def _require_draft_version(artifact, base_version, *, message):
+    if artifact.status != "draft":
+        raise WorkspaceError(status_code=409, code="ARTIFACT_NOT_DRAFT",
+            error=f"artifact_status_{artifact.status}", user_message=message)
+    if base_version != artifact.version:
+        raise _version_conflict(base_version, artifact.version)
+
+
+def _version_conflict(base_version, current_version=None):
+    return WorkspaceError(status_code=409, code="VERSION_CONFLICT", error="version_conflict",
+        user_message="对象已被其他操作更新，请刷新最新版本后重试",
+        hint="请先读取最新草稿再合并或提交修改",
+        data={"current_version": current_version, "base_version": base_version})
+
+
+def _persist_mutation(session, row, *, expected_version, values):
+    try:
+        persistence.compare_and_swap(session, row, expected_version=expected_version, values=values)
+    except persistence.WriteConflict as error:
+        raise _version_conflict(expected_version, error.current_version) from error
+    except OperationalError as error:
+        if persistence.is_write_contention(error):
+            raise _version_conflict(expected_version) from error
+        raise
+
+
+def create_artifact(session: Session, actor: AuthenticatedSubject, req: ArtifactCreateRequest,
+                    *, header_idempotency_key: str | None = None) -> ArtifactMutationData:
+    try:
+        persistence.begin_create(session)
+        with session.begin_nested():
+            result = _create_artifact(session, actor, req,
+                header_idempotency_key=header_idempotency_key)
+            assert result is not None
+            return result
+    except IntegrityError:
+        # The SAVEPOINT removed this attempt's artifact/op/event. Read only the
+        # winning original receipt; never repeat business creation after error.
+        result = _create_artifact(session, actor, req,
+            header_idempotency_key=header_idempotency_key, _replay_only=True)
+        if result is None:
+            raise
+        return result
+    except OperationalError as error:
+        if persistence.is_write_contention(error):
+            raise _version_conflict(None) from error
+        raise
+
+def _create_artifact(
     session: Session,
     actor: AuthenticatedSubject,
     req: ArtifactCreateRequest,
     *,
     header_idempotency_key: str | None = None,
-) -> ArtifactMutationData:
+    _replay_only: bool = False,
+) -> ArtifactMutationData | None:
     require_kind_permission(session, actor, req.kind, "write")
     _check_thread_ownership(session, actor, req.thread_id)
     idem_key = req.idempotency_key or header_idempotency_key
@@ -383,6 +483,11 @@ def create_artifact(
             user_message=f"工作区对象数据校验失败：{exc}",
         ) from exc
 
+    create_request = {"thread_id": req.thread_id, "kind": req.kind,
+                      "title": req.title, "payload": normalized_payload}
+    source_refs = copy.deepcopy(req.source_refs)
+    create_fp = _payload_digest({**create_request, "source_refs": source_refs})
+
     if idem_key:
         existing_op = session.execute(
             select(WorkspaceArtifactOp).where(
@@ -395,40 +500,33 @@ def create_artifact(
         ).scalar_one_or_none()
         if existing_op is not None:
             existing_art = _load_owned_artifact(session, actor, existing_op.artifact_id)
-            expected_fp = _payload_digest(
-                {
-                    "thread_id": req.thread_id,
-                    "kind": req.kind,
-                    "title": req.title,
-                    "payload": normalized_payload,
-                }
-            )
             recorded_fp = (existing_op.before_values or {}).get("_create_fingerprint")
-            if recorded_fp and recorded_fp != expected_fp:
+            # Legacy fingerprints omitted the ordered source refs. They still
+            # require the exact original request and immutable persisted refs.
+            if recorded_fp != create_fp and not (
+                recorded_fp == _payload_digest(create_request)
+                and _payload_digest(existing_art.source_refs) == _payload_digest(source_refs)
+            ):
                 raise WorkspaceError(
                     status_code=409,
                     code="IDEMPOTENCY_CONFLICT",
                     error="idempotency_key_payload_mismatch",
                     user_message="幂等键已被不同创建请求占用",
                 )
+            cap_set = _output_capabilities(session, actor)
             return ArtifactMutationData(
-                artifact=_to_artifact_record(existing_art),
-                op=_to_op_record(existing_op),
+                artifact=_to_artifact_record(existing_art, cap_set),
+                op=_to_op_record(existing_op, cap_set),
                 message="已返回幂等创建结果",
                 idempotent_replay=True,
             )
 
+    if _replay_only:
+        return None
+
     now = _utcnow()
     artifact_id = _new_id("art")
     op_id = _new_id("op")
-    create_fp = _payload_digest(
-        {
-            "thread_id": req.thread_id,
-            "kind": req.kind,
-            "title": req.title,
-            "payload": normalized_payload,
-        }
-    )
 
     artifact = WorkspaceArtifact(
         id=artifact_id,
@@ -441,7 +539,7 @@ def create_artifact(
         status="draft",
         version=1,
         payload=copy.deepcopy(normalized_payload),
-        source_refs=copy.deepcopy(req.source_refs),
+        source_refs=source_refs,
         locked_fields=[],
         pending_suggestions=[],
         created_at=now,
@@ -487,9 +585,10 @@ def create_artifact(
         payload={"artifact_id": artifact_id, "kind": req.kind, "version": 1, "title": req.title},
         now=now,
     )
+    cap_set = _output_capabilities(session, actor)
     return ArtifactMutationData(
-        artifact=_to_artifact_record(artifact),
-        op=_to_op_record(op),
+        artifact=_to_artifact_record(artifact, cap_set),
+        op=_to_op_record(op, cap_set),
         message="工作区对象已创建",
     )
 
@@ -512,10 +611,9 @@ def list_artifacts(
         stmt = stmt.where(WorkspaceArtifact.thread_id == thread_id)
     stmt = stmt.order_by(WorkspaceArtifact.updated_at.desc())
     rows = session.execute(stmt).scalars().all()
-    caps, _ = resolve_effective_capabilities(session, actor)
-    cap_set = set(caps)
+    cap_set = _output_capabilities(session, actor)
     visible = [
-        _to_artifact_record(row)
+        _to_artifact_record(row, cap_set)
         for row in rows
         if any(p in cap_set for p in _KIND_PERMISSION_MAP[row.kind]["read"])
     ]
@@ -538,9 +636,10 @@ def get_artifact_detail(
         )
         .order_by(WorkspaceArtifactOp.version_after.asc(), WorkspaceArtifactOp.created_at.asc())
     ).scalars().all()
+    cap_set = _output_capabilities(session, actor)
     return ArtifactDetailData(
-        artifact=_to_artifact_record(artifact),
-        ops=[_to_op_record(op) for op in ops],
+        artifact=_to_artifact_record(artifact, cap_set),
+        ops=[_to_op_record(op, cap_set) for op in ops],
     )
 
 
@@ -577,30 +676,16 @@ def patch_artifact(
                     error="idempotency_key_patch_mismatch",
                     user_message="同一幂等键不能用于不同的修改内容",
                 )
+            cap_set = _output_capabilities(session, actor)
             return ArtifactMutationData(
-                artifact=_to_artifact_record(artifact),
-                op=_to_op_record(existing_op),
+                artifact=_to_artifact_record(artifact, cap_set),
+                op=_to_op_record(existing_op, cap_set),
                 message="已返回幂等修改结果",
                 skipped_fields=list(existing_op.skipped_fields or []),
                 idempotent_replay=True,
             )
 
-    if artifact.status != "draft":
-        raise WorkspaceError(
-            status_code=409,
-            code="ARTIFACT_NOT_DRAFT",
-            error=f"artifact_status_{artifact.status}",
-            user_message="已确认保存或已归档的工作区草稿不可修改",
-        )
-    if req.base_version != artifact.version:
-        raise WorkspaceError(
-            status_code=409,
-            code="VERSION_CONFLICT",
-            error="version_conflict",
-            user_message=f"版本冲突：当前版本为 v{artifact.version}，请求基线为 v{req.base_version}",
-            hint="请刷新最新草稿版本后再合并或提交修改",
-            data={"current_version": artifact.version, "base_version": req.base_version},
-        )
+    _require_draft_version(artifact, req.base_version, message="已确认保存或已归档的工作区草稿不可修改")
     if not req.patch and req.title is None:
         raise WorkspaceError(
             status_code=422,
@@ -693,12 +778,13 @@ def patch_artifact(
                 new_locked.append("title")
                 locked_set.add("title")
 
-    artifact.payload = validated_payload
-    artifact.title = new_title
-    artifact.locked_fields = new_locked
-    artifact.pending_suggestions = new_suggestions
-    artifact.version = version_before + 1
-    artifact.updated_at = now
+    _persist_mutation(session, artifact, expected_version=version_before, values={
+        'payload': validated_payload,
+        'title': new_title,
+        'locked_fields': new_locked,
+        'pending_suggestions': new_suggestions,
+        'updated_at': now,
+    })
 
     recorded_patch = dict(req.patch)
     if req.title is not None:
@@ -755,12 +841,13 @@ def patch_artifact(
         if skipped_fields
         else f"已更新 {len(applied_fields)} 个字段"
     )
+    cap_set = _output_capabilities(session, actor)
     return ArtifactMutationData(
-        artifact=_to_artifact_record(artifact),
-        op=_to_op_record(op),
+        artifact=_to_artifact_record(artifact, cap_set),
+        op=_to_op_record(op, cap_set),
         message=msg,
         skipped_fields=skipped_fields,
-        pending_suggestions_added=added_suggestions,
+        pending_suggestions_added=_project_suggestions(added_suggestions, cap_set),
     )
 
 
@@ -772,29 +859,16 @@ def lock_fields(
 ) -> ArtifactMutationData:
     artifact = _load_owned_artifact(session, actor, artifact_id)
     require_kind_permission(session, actor, artifact.kind, "write")
-    if artifact.status != "draft":
-        raise WorkspaceError(
-            status_code=409,
-            code="ARTIFACT_NOT_DRAFT",
-            error=f"artifact_status_{artifact.status}",
-            user_message="已确认保存或已归档的工作区草稿不可调整字段锁",
-        )
-    if req.base_version != artifact.version:
-        raise WorkspaceError(
-            status_code=409,
-            code="VERSION_CONFLICT",
-            error="version_conflict",
-            user_message=f"版本冲突：当前版本为 v{artifact.version}",
-            data={"current_version": artifact.version, "base_version": req.base_version},
-        )
+    _require_draft_version(artifact, req.base_version, message="已确认保存或已归档的工作区草稿不可调整字段锁")
     now = _utcnow()
     version_before = artifact.version
     locked = list(artifact.locked_fields or [])
     newly_locked = [f for f in req.fields if f not in locked]
     locked.extend(newly_locked)
-    artifact.locked_fields = locked
-    artifact.version = version_before + 1
-    artifact.updated_at = now
+    _persist_mutation(session, artifact, expected_version=version_before, values={
+        'locked_fields': locked,
+        'updated_at': now,
+    })
     op = WorkspaceArtifactOp(
         id=_new_id("op"),
         organization_id=artifact.organization_id,
@@ -823,9 +897,10 @@ def lock_fields(
         payload={"artifact_id": artifact.id, "fields": req.fields, "version": artifact.version},
         now=now,
     )
+    cap_set = _output_capabilities(session, actor)
     return ArtifactMutationData(
-        artifact=_to_artifact_record(artifact),
-        op=_to_op_record(op),
+        artifact=_to_artifact_record(artifact, cap_set),
+        op=_to_op_record(op, cap_set),
         message="已锁定指定字段",
     )
 
@@ -838,27 +913,14 @@ def unlock_fields(
 ) -> ArtifactMutationData:
     artifact = _load_owned_artifact(session, actor, artifact_id)
     require_kind_permission(session, actor, artifact.kind, "write")
-    if artifact.status != "draft":
-        raise WorkspaceError(
-            status_code=409,
-            code="ARTIFACT_NOT_DRAFT",
-            error=f"artifact_status_{artifact.status}",
-            user_message="已确认保存或已归档的工作区草稿不可解锁字段",
-        )
-    if req.base_version != artifact.version:
-        raise WorkspaceError(
-            status_code=409,
-            code="VERSION_CONFLICT",
-            error="version_conflict",
-            user_message=f"版本冲突：当前版本为 v{artifact.version}",
-            data={"current_version": artifact.version, "base_version": req.base_version},
-        )
+    _require_draft_version(artifact, req.base_version, message="已确认保存或已归档的工作区草稿不可解锁字段")
     now = _utcnow()
     targets = set(req.fields or [])
     version_before = artifact.version
-    artifact.locked_fields = [f for f in (artifact.locked_fields or []) if f not in targets]
-    artifact.version = version_before + 1
-    artifact.updated_at = now
+    _persist_mutation(session, artifact, expected_version=version_before, values={
+        'locked_fields': [f for f in (artifact.locked_fields or []) if f not in targets],
+        'updated_at': now,
+    })
     op = WorkspaceArtifactOp(
         id=_new_id("op"),
         organization_id=artifact.organization_id,
@@ -887,9 +949,10 @@ def unlock_fields(
         payload={"artifact_id": artifact.id, "fields": list(req.fields or []), "version": artifact.version},
         now=now,
     )
+    cap_set = _output_capabilities(session, actor)
     return ArtifactMutationData(
-        artifact=_to_artifact_record(artifact),
-        op=_to_op_record(op),
+        artifact=_to_artifact_record(artifact, cap_set),
+        op=_to_op_record(op, cap_set),
         message="已解除字段锁定",
     )
 
@@ -903,21 +966,7 @@ def accept_suggestion(
 ) -> ArtifactMutationData:
     artifact = _load_owned_artifact(session, actor, artifact_id)
     require_kind_permission(session, actor, artifact.kind, "write")
-    if artifact.status != "draft":
-        raise WorkspaceError(
-            status_code=409,
-            code="ARTIFACT_NOT_DRAFT",
-            error=f"artifact_status_{artifact.status}",
-            user_message="已确认保存或已归档的工作区草稿不可采纳建议",
-        )
-    if req.base_version != artifact.version:
-        raise WorkspaceError(
-            status_code=409,
-            code="VERSION_CONFLICT",
-            error="version_conflict",
-            user_message=f"版本冲突：当前版本为 v{artifact.version}",
-            data={"current_version": artifact.version, "base_version": req.base_version},
-        )
+    _require_draft_version(artifact, req.base_version, message="已确认保存或已归档的工作区草稿不可采纳建议")
     suggestions = list(artifact.pending_suggestions or [])
     matched = [
         item
@@ -973,12 +1022,13 @@ def accept_suggestion(
         item for item in suggestions if (item.get("op_id"), item.get("field")) not in matched_keys
     ]
 
-    artifact.payload = validated_payload
-    artifact.title = new_title
-    artifact.locked_fields = new_locked
-    artifact.pending_suggestions = remaining
-    artifact.version = version_before + 1
-    artifact.updated_at = now
+    _persist_mutation(session, artifact, expected_version=version_before, values={
+        'payload': validated_payload,
+        'title': new_title,
+        'locked_fields': new_locked,
+        'pending_suggestions': remaining,
+        'updated_at': now,
+    })
 
     op = WorkspaceArtifactOp(
         id=_new_id("op"),
@@ -1014,9 +1064,10 @@ def accept_suggestion(
         },
         now=now,
     )
+    cap_set = _output_capabilities(session, actor)
     return ArtifactMutationData(
-        artifact=_to_artifact_record(artifact),
-        op=_to_op_record(op),
+        artifact=_to_artifact_record(artifact, cap_set),
+        op=_to_op_record(op, cap_set),
         message="已采纳建议并保持字段人工锁定",
     )
 
@@ -1030,21 +1081,7 @@ def ignore_suggestion(
 ) -> ArtifactMutationData:
     artifact = _load_owned_artifact(session, actor, artifact_id)
     require_kind_permission(session, actor, artifact.kind, "write")
-    if artifact.status != "draft":
-        raise WorkspaceError(
-            status_code=409,
-            code="ARTIFACT_NOT_DRAFT",
-            error=f"artifact_status_{artifact.status}",
-            user_message="已确认保存或已归档的工作区草稿不可忽略建议",
-        )
-    if req.base_version != artifact.version:
-        raise WorkspaceError(
-            status_code=409,
-            code="VERSION_CONFLICT",
-            error="version_conflict",
-            user_message=f"版本冲突：当前版本为 v{artifact.version}",
-            data={"current_version": artifact.version, "base_version": req.base_version},
-        )
+    _require_draft_version(artifact, req.base_version, message="已确认保存或已归档的工作区草稿不可忽略建议")
     suggestions = list(artifact.pending_suggestions or [])
     matched = [
         item
@@ -1067,9 +1104,10 @@ def ignore_suggestion(
     ]
     ignored_fields = [str(item["field"]) for item in matched]
 
-    artifact.pending_suggestions = remaining
-    artifact.version = version_before + 1
-    artifact.updated_at = now
+    _persist_mutation(session, artifact, expected_version=version_before, values={
+        'pending_suggestions': remaining,
+        'updated_at': now,
+    })
 
     op = WorkspaceArtifactOp(
         id=_new_id("op"),
@@ -1105,9 +1143,10 @@ def ignore_suggestion(
         },
         now=now,
     )
+    cap_set = _output_capabilities(session, actor)
     return ArtifactMutationData(
-        artifact=_to_artifact_record(artifact),
-        op=_to_op_record(op),
+        artifact=_to_artifact_record(artifact, cap_set),
+        op=_to_op_record(op, cap_set),
         message="已忽略 AI 建议并保留原人工锁定值",
     )
 
@@ -1143,29 +1182,16 @@ def undo_op(
                 )
             skipped = list(existing_undo.skipped_fields or [])
             msg = f"{len(skipped)} 个字段已被人工修改，未撤销" if skipped else "已返回幂等撤销结果"
+            cap_set = _output_capabilities(session, actor)
             return ArtifactMutationData(
-                artifact=_to_artifact_record(artifact),
-                op=_to_op_record(existing_undo),
+                artifact=_to_artifact_record(artifact, cap_set),
+                op=_to_op_record(existing_undo, cap_set),
                 message=msg,
                 skipped_fields=skipped,
                 idempotent_replay=True,
             )
 
-    if artifact.status != "draft":
-        raise WorkspaceError(
-            status_code=409,
-            code="ARTIFACT_NOT_DRAFT",
-            error=f"artifact_status_{artifact.status}",
-            user_message="已确认保存或已归档的工作区草稿不可撤销",
-        )
-    if req.base_version != artifact.version:
-        raise WorkspaceError(
-            status_code=409,
-            code="VERSION_CONFLICT",
-            error="version_conflict",
-            user_message=f"版本冲突：当前版本为 v{artifact.version}",
-            data={"current_version": artifact.version, "base_version": req.base_version},
-        )
+    _require_draft_version(artifact, req.base_version, message="已确认保存或已归档的工作区草稿不可撤销")
 
     target_op = session.execute(
         select(WorkspaceArtifactOp).where(
@@ -1261,11 +1287,12 @@ def undo_op(
         item for item in (artifact.pending_suggestions or []) if item.get("op_id") != req.target_op_id
     ]
 
-    artifact.payload = validated_payload
-    artifact.title = new_title
-    artifact.pending_suggestions = remaining_suggestions
-    artifact.version = version_before + 1
-    artifact.updated_at = now
+    _persist_mutation(session, artifact, expected_version=version_before, values={
+        'payload': validated_payload,
+        'title': new_title,
+        'pending_suggestions': remaining_suggestions,
+        'updated_at': now,
+    })
 
     op = WorkspaceArtifactOp(
         id=_new_id("op"),
@@ -1309,9 +1336,10 @@ def undo_op(
         if skipped_fields
         else f"已撤销 {len(reverted_fields)} 个字段"
     )
+    cap_set = _output_capabilities(session, actor)
     return ArtifactMutationData(
-        artifact=_to_artifact_record(artifact),
-        op=_to_op_record(op),
+        artifact=_to_artifact_record(artifact, cap_set),
+        op=_to_op_record(op, cap_set),
         message=msg,
         skipped_fields=skipped_fields,
     )
@@ -1352,9 +1380,10 @@ def submit_artifact(
             idempotency_key=idem_key,
         )
         if existing_op is not None and artifact.submit_idempotency_key == idem_key:
+            cap_set = _output_capabilities(session, actor)
             return ArtifactMutationData(
-                artifact=_to_artifact_record(artifact),
-                op=_to_op_record(existing_op),
+                artifact=_to_artifact_record(artifact, cap_set),
+                op=_to_op_record(existing_op, cap_set),
                 message=f"已幂等返回草稿保存凭据：{artifact.submitted_receipt_ref}；正式单据未提交",
                 idempotent_replay=True,
             )
@@ -1365,21 +1394,7 @@ def submit_artifact(
             user_message="该工作区草稿已确认保存，不能用不同幂等键重复保存；正式单据未提交",
         )
 
-    if artifact.status != "draft":
-        raise WorkspaceError(
-            status_code=409,
-            code="ARTIFACT_NOT_DRAFT",
-            error=f"artifact_status_{artifact.status}",
-            user_message="仅草稿状态对象允许提交",
-        )
-    if req.base_version != artifact.version:
-        raise WorkspaceError(
-            status_code=409,
-            code="VERSION_CONFLICT",
-            error="version_conflict",
-            user_message=f"版本冲突：当前版本为 v{artifact.version}",
-            data={"current_version": artifact.version, "base_version": req.base_version},
-        )
+    _require_draft_version(artifact, req.base_version, message="仅草稿状态对象允许提交")
 
     try:
         validated_payload = validate_artifact_payload(
@@ -1420,12 +1435,13 @@ def submit_artifact(
     )
 
     version_before = artifact.version
-    artifact.payload = validated_payload
-    artifact.status = "submitted"
-    artifact.submitted_receipt_ref = receipt_ref
-    artifact.submit_idempotency_key = idem_key
-    artifact.version = version_before + 1
-    artifact.updated_at = now
+    _persist_mutation(session, artifact, expected_version=version_before, values={
+        'payload': validated_payload,
+        'status': "submitted",
+        'submitted_receipt_ref': receipt_ref,
+        'submit_idempotency_key': idem_key,
+        'updated_at': now,
+    })
 
     op = WorkspaceArtifactOp(
         id=_new_id("op"),
@@ -1460,9 +1476,10 @@ def submit_artifact(
         },
         now=now,
     )
+    cap_set = _output_capabilities(session, actor)
     return ArtifactMutationData(
-        artifact=_to_artifact_record(artifact),
-        op=_to_op_record(op),
+        artifact=_to_artifact_record(artifact, cap_set),
+        op=_to_op_record(op, cap_set),
         message=f"已保存核对结果，正式单据未提交。草稿保存凭据：{receipt_ref}",
     )
 
@@ -1479,8 +1496,8 @@ def _to_thread_workspace_record(binding: WorkspaceThreadBinding) -> ThreadWorksp
         organization_id=binding.organization_id,
         store_id=binding.store_id,
         subject_id=binding.subject_id,
-        open_objects=copy.deepcopy(binding.open_objects or []),
-        active_object_ref=copy.deepcopy(binding.active_object_ref),
+        open_objects=project_navigation_refs(binding.open_objects),
+        active_object_ref=project_navigation_ref(binding.active_object_ref),
         last_editor_subject_id=binding.last_editor_subject_id,
         last_editor_device=binding.last_editor_device,
         last_edited_at=binding.last_edited_at,
@@ -1526,6 +1543,8 @@ def upsert_thread_workspace(
     _authorize_store_member(session, actor)
     _check_thread_ownership(session, actor, thread_id)
     now = _utcnow()
+    open_objects = project_navigation_refs(req.open_objects)
+    active_ref = project_navigation_ref(req.active_object_ref)
 
     binding = session.execute(
         select(WorkspaceThreadBinding).where(
@@ -1550,8 +1569,8 @@ def upsert_thread_workspace(
             organization_id=actor.organization_id,
             store_id=actor.store_id,
             subject_id=actor.subject_id,
-            open_objects=copy.deepcopy(req.open_objects),
-            active_object_ref=copy.deepcopy(req.active_object_ref),
+            open_objects=open_objects,
+            active_object_ref=active_ref,
             last_editor_subject_id=actor.subject_id,
             last_editor_device=req.device,
             last_edited_at=now,
@@ -1569,13 +1588,14 @@ def upsert_thread_workspace(
                 user_message=f"线程工作区版本冲突：当前版本为 v{binding.version}",
                 data={"current_version": binding.version, "base_version": req.base_version},
             )
-        binding.open_objects = copy.deepcopy(req.open_objects)
-        binding.active_object_ref = copy.deepcopy(req.active_object_ref)
-        binding.last_editor_subject_id = actor.subject_id
-        binding.last_editor_device = req.device
-        binding.last_edited_at = now
-        binding.version = binding.version + 1
-        binding.updated_at = now
+        _persist_mutation(session, binding, expected_version=binding.version, values={
+            'open_objects': open_objects,
+            'active_object_ref': active_ref,
+            'last_editor_subject_id': actor.subject_id,
+            'last_editor_device': req.device,
+            'last_edited_at': now,
+            'updated_at': now,
+        })
 
     _emit_thread_event(
         session,
@@ -1619,6 +1639,7 @@ def list_thread_events(
         .order_by(WorkspaceThreadEvent.seq.asc())
         .limit(limit)
     ).scalars().all()
+    cap_set = _output_capabilities(session, actor)
     events = [
         ThreadEventRecord(
             seq=row.seq,
@@ -1627,7 +1648,9 @@ def list_thread_events(
             subject_id=row.subject_id,
             artifact_id=row.artifact_id,
             event_type=row.event_type,
-            payload=copy.deepcopy(row.payload or {}),
+            payload=(project_navigation_update(row.payload, thread_id=row.thread_id)
+                     if row.event_type == "thread_workspace_updated"
+                     else _project_artifact_payload(row.payload or {}, cap_set)),
             created_at=row.created_at,
         )
         for row in rows

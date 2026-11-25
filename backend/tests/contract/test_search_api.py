@@ -19,7 +19,7 @@ NOW = datetime(2026, 10, 23, tzinfo=timezone.utc)
 
 
 def _payload():
-    return {"code": "SKU-HTTP-1", "barCode": "6900000000003", "name": "合成甲",
+    return {"code": "SKU-HTTP-1", "barCode": "2000000002002", "name": "合成甲",
             "spec": "规格", "productCategoryIdName": "分类", "brandName": "品牌",
             "baseProductStandardList": [{"standardName": "个", "retailPrice": 3.0,
                                          "buyingPrice": 1.0}]}

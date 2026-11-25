@@ -20,6 +20,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -28,20 +29,25 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.navigation.NavHostController
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
+import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.retail.smartops.BuildConfig
-import com.retail.smartops.LocalDraftStore
 import com.retail.smartops.core.auth.Session
+import com.retail.smartops.core.auth.SessionLogoutCoordinator
 import com.retail.smartops.core.auth.SessionRepository
+import com.retail.smartops.core.auth.SessionStatus
+import com.retail.smartops.core.database.CacheIdentity
 import com.retail.smartops.core.database.CatalogCacheRepository
-import com.retail.smartops.core.network.ConnectionStatus
 import com.retail.smartops.core.network.HttpApiClient
 import com.retail.smartops.core.network.UrlConnectionSseTransport
+import com.retail.smartops.core.network.UrlConnectionTransport
 import com.retail.smartops.core.network.WorkspaceApiClient
 import com.retail.smartops.core.ui.ConnectionBar
 import com.retail.smartops.core.ui.StatusBadge
@@ -50,6 +56,7 @@ import com.retail.smartops.core.ui.theme.RetailSpacing
 import com.retail.smartops.features.agents.AgentChatScreen
 import com.retail.smartops.features.agents.AgentRunRepository
 import com.retail.smartops.features.auth.LoginScreen
+import com.retail.smartops.features.receiving.ReceivingObservationWorkspace
 import com.retail.smartops.features.receiving.ReceivingScreen
 import com.retail.smartops.features.sales.SalesDraftRepository
 import com.retail.smartops.features.sales.SalesScreen
@@ -64,8 +71,8 @@ import com.retail.smartops.features.stocktake.FileStocktakeLocalStore
 import com.retail.smartops.features.stocktake.StocktakeScreen
 import com.retail.smartops.features.stocktake.StocktakeViewModel
 import java.io.File
-import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlinx.coroutines.delay
 
 internal object AppBuildIdentity {
     const val developmentBanner = "Android 开发版 · C2C-140"
@@ -74,219 +81,224 @@ internal object AppBuildIdentity {
 }
 
 @Composable
-fun AppNavGraph(
-    navController: NavHostController,
+internal fun AppNavGraph(
     repository: SessionRepository,
     apiClient: HttpApiClient,
-    draftStore: LocalDraftStore,
+    logoutCoordinator: SessionLogoutCoordinator,
+    receivingObservations: ReceivingObservationWorkspace,
 ) {
-    var session by remember { mutableStateOf(repository.currentSession()) }
+    val status = repository.status.collectAsState().value
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val logoutOutcome by logoutCoordinator.outcome.collectAsState()
+    val logoutNotice = logoutOutcome
+        ?.takeIf { it.remoteUnconfirmed && it.generation == status.generation }
+        ?.let { "暂未确认服务端已撤销该会话。" }
+
+    DisposableEffect(repository, lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_START || event == Lifecycle.Event.ON_RESUME) {
+                repository.currentSession()
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
+    LaunchedEffect(repository, status.generation, status.session) {
+        while (status.session != null) {
+            val remaining = repository.remainingSessionMillis(status.generation)
+            if (remaining <= 0) break
+            // Bound the wait as the wall clock, unlike coroutine delay, can change.
+            delay(remaining.coerceAtMost(60_000))
+        }
+    }
+
+    val logout: () -> Unit = { logoutCoordinator.request(status.generation) }
+
+    // Login has no privileged graph to navigate. Each employee generation gets a
+    // new graph and screen state, even if logout and login happen before one frame.
+    val current = status.session
+    if (current == null) {
+        LoginScreen(repository, status.localClearFailed, logoutNotice, onRetryLogout = logout)
+    } else {
+        key(repository.navigationSessionKey, status.generation) {
+            SignedInGraph(current, status, repository, apiClient, receivingObservations, logout)
+        }
+    }
+}
+
+@Composable
+private fun SignedInGraph(
+    current: Session,
+    status: SessionStatus,
+    repository: SessionRepository,
+    apiClient: HttpApiClient,
+    receivingObservations: ReceivingObservationWorkspace,
+    onLogout: () -> Unit,
+) {
+    val navController = rememberNavController()
+    // Used at action time, not just on the frame where the UI was shown.
+    fun stillCurrent(): Boolean = repository.currentSession() == current &&
+        repository.status.value.generation == status.generation
     var useFieldShell by remember { mutableStateOf(AppBuildIdentity.fieldShellEnabled) }
-    val executor: ExecutorService = remember { Executors.newSingleThreadExecutor() }
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val agentGateway = remember(apiClient, repository) { AgentRunRepository(apiClient, repository) }
-    val workspaceApi = remember(apiClient, repository) {
-        WorkspaceApiClient(
-            api = apiClient,
-            sessions = repository,
-            sseTransport = UrlConnectionSseTransport(BuildConfig.API_BASE_URL),
-            baseUrl = BuildConfig.API_BASE_URL,
+    val workbench = remember(useFieldShell, apiClient, repository) {
+        WorkbenchStartupGate.activate(
+            enabled = useFieldShell,
+            createWorkspace = {
+                WorkspaceApiClient(
+                    api = apiClient,
+                    sessions = repository,
+                    sseTransport = UrlConnectionSseTransport(BuildConfig.API_BASE_URL),
+                    baseUrl = BuildConfig.API_BASE_URL,
+                )
+            },
+            createExecutor = { Executors.newSingleThreadExecutor() },
         )
     }
     var shellState by remember { mutableStateOf(FieldShellState(session = repository.currentSession())) }
-    val shellController = remember(repository, workspaceApi) {
+    val shellController = remember(repository, workbench) {
         FieldShellController(
             sessions = repository,
-            workspaceApi = workspaceApi,
+            workspaceApi = workbench?.workspace,
             onStateChanged = { updated ->
                 mainHandler.post { shellState = updated }
             },
         )
     }
 
-    DisposableEffect(repository, shellController) {
+    DisposableEffect(shellController, workbench) {
         shellState = shellController.state
-        val unsubscribe = repository.onScopeInvalidated {
-            shellController.invalidateScope()
-            mainHandler.post {
-                session = repository.currentSession()
-                shellState = shellController.state
-                navController.navigateToLoginAndClearStack()
-            }
-        }
         onDispose {
-            unsubscribe()
+            workbench?.close()
             shellController.close()
-            executor.shutdown()
         }
     }
 
     val currentBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = currentBackStackEntry?.destination?.route
+    val identity = CacheIdentity.from(current)
 
-    val onLogout: () -> Unit = {
-        shellController.invalidateScope()
-        val token = repository.logoutLocal()
-        session = null
-        navController.navigateToLoginAndClearStack()
-        executor.execute {
-            repository.revokeToken(token)
-            mainHandler.post {
-                session = repository.currentSession()
-                shellState = shellController.state
-            }
-        }
-    }
-
-    val current = session
-    val searchViewModel = remember(current, apiClient, repository) {
+    val cacheContext = navController.context.applicationContext
+    val searchViewModel = remember(current, status.generation, apiClient, repository, cacheContext) {
         SearchViewModel(
             apiClient = apiClient,
             sessionRepository = repository,
+            ownerGeneration = status.generation,
             catalogCacheRepositoryProvider = {
-                current?.let {
-                    try {
-                        CatalogCacheRepository(navController.context, repository)
-                    } catch (e: Exception) {
-                        null
-                    }
-                }
+                CatalogCacheRepository(cacheContext, repository, ownerGeneration = status.generation)
             },
         )
     }
 
-    val stocktakeViewModel = remember(current, apiClient, repository) {
-        StocktakeViewModel(
-            apiClient = apiClient,
-            transport = com.retail.smartops.core.network.UrlConnectionTransport(BuildConfig.API_BASE_URL),
-            sessionRepository = repository,
-            localStore = FileStocktakeLocalStore(File(navController.context.filesDir, "stocktake")),
-        )
+    val stocktakePage = remember(workbench, current, apiClient, repository) {
+        workbench?.localPage(isCurrent = ::stillCurrent) {
+            StocktakeViewModel(
+                apiClient = apiClient,
+                transport = UrlConnectionTransport(BuildConfig.API_BASE_URL),
+                sessionRepository = repository,
+                localStore = FileStocktakeLocalStore(File(navController.context.filesDir, "stocktake")),
+            )
+        }
     }
 
     val salesViewModel = remember(current, apiClient, repository) {
-        val db = current?.let { s ->
-            try {
-                val scope = com.retail.smartops.core.database.CacheIdentity(
-                    organizationId = s.organizationId,
-                    storeId = s.storeId,
-                    subjectId = s.subjectId,
-                )
-                com.retail.smartops.core.database.AppDatabase.open(navController.context, scope)
-            } catch (e: Exception) {
-                null
-            }
-        }
-        val salesDraftRepo = db?.let { SalesDraftRepository(it) }
+        val db = runCatching {
+            com.retail.smartops.core.database.AppDatabase.open(navController.context, identity)
+        }.getOrNull()
         SalesViewModel(
-            salesDraftRepository = salesDraftRepo,
+            salesDraftRepository = db?.let { SalesDraftRepository(it) },
             sessionRepository = repository,
             apiClient = apiClient,
+            closeOwnedDatabase = db?.let { it::close },
         )
+    }
+
+    DisposableEffect(searchViewModel) {
+        onDispose { searchViewModel.close() }
+    }
+    DisposableEffect(salesViewModel) {
+        onDispose { salesViewModel.close() }
+    }
+    DisposableEffect(stocktakePage) {
+        onDispose { if (stocktakePage?.isInitialized() == true) stocktakePage.value?.close() }
     }
 
     val salesUiState by salesViewModel.state.collectAsState()
     LaunchedEffect(salesUiState.syncState, current) {
-        val localCount = runCatching { draftStore.load().size }.getOrDefault(0)
-        val pendingCount = if (salesUiState.syncState == "pending_sync") 1 else 0
-        shellController.updateUnsyncedLocalDraftCount(localCount + pendingCount)
+        shellController.updateUnsyncedLocalDraftCount(if (salesUiState.syncState == "pending_sync") 1 else 0)
     }
 
-    if (current == null) {
-        LoginScreen(repository) { loggedInSession ->
-            session = loggedInSession
-            shellController.invalidateScope()
-            shellState = shellController.state
-            navController.navigateToHomeAndClearLogin()
-        }
-    } else {
-        val visibleDestinations = remember(current, repository.getCapabilityVersion()) {
-            AppDestination.getVisibleBottomNav(repository::hasCapability)
-        }
+    val visibleDestinations = AppDestination.getVisibleBottomNav(status.capabilities::has)
 
-        val navHostContent: @Composable () -> Unit = {
-            NavHost(
-                navController = navController,
-                startDestination = AppDestination.startDestination.route,
-            ) {
-                composable(AppDestination.Login.route) {
-                    LoginScreen(repository) { loggedInSession ->
-                        session = loggedInSession
-                        shellController.invalidateScope()
-                        navController.navigateToHomeAndClearLogin()
-                    }
-                }
-                composable(AppDestination.CatalogSearch.route) {
-                    SearchScreen(
-                        viewModel = searchViewModel,
-                        onUseConfirmedItem = if (AppDestination.SalesDraft in visibleDestinations) {
-                            {
-                                val fresh = repository.currentSession()
-                                val searchState = searchViewModel.state.value
-                                val selected = searchState.confirmedItem
-                                val sameIdentity = fresh != null &&
-                                    fresh.subjectId == current.subjectId &&
-                                    fresh.organizationId == current.organizationId &&
-                                    fresh.storeId == current.storeId &&
-                                    fresh.accessToken == current.accessToken
-                                if (!sameIdentity || selected == null || searchState.isLoading ||
-                                    AppDestination.SalesDraft !in AppDestination.getVisibleBottomNav(repository::hasCapability)) {
-                                    false
-                                } else {
+    val navHostContent: @Composable () -> Unit = {
+        NavHost(
+            navController = navController,
+            startDestination = AppDestination.startDestination.route,
+        ) {
+            composable(AppDestination.CatalogSearch.route) {
+                SearchScreen(
+                    viewModel = searchViewModel,
+                    onUseConfirmedItem = if (AppDestination.SalesDraft in visibleDestinations) {
+                        { renderedRevision ->
+                            val moved = searchViewModel.transferConfirmedItem(renderedRevision) { selected ->
+                                val sales = salesViewModel.state.value
+                                if (!stillCurrent() ||
+                                    !repository.hasCapability(AppDestination.SalesDraft.requiredCapability) ||
+                                    sales.isOpeningDraft || sales.isLoading || sales.submissionLocked
+                                ) false
+                                else {
                                     salesViewModel.selectConfirmedProduct(selected)
-                                    searchViewModel.clearConfirmedItem()
-                                    shellController.selectZone(AppDestination.Objects)
-                                    navController.navigateToDestination(AppDestination.SalesDraft)
                                     true
                                 }
                             }
-                        } else null,
-                    )
-                }
+                            if (!moved || !stillCurrent()) false
+                            else {
+                                shellController.selectZone(AppDestination.Objects)
+                                navController.navigateToDestination(AppDestination.SalesDraft)
+                                true
+                            }
+                        }
+                    } else null,
+                )
+            }
+            if (stocktakePage != null) {
                 composable(AppDestination.Stocktake.route) {
-                    StocktakeScreen(viewModel = stocktakeViewModel)
+                    // Continuation files load once, only upon actual stocktake entry.
+                    stocktakePage.value?.let { StocktakeScreen(viewModel = it) }
                 }
-                composable(AppDestination.SalesDraft.route) {
-                    SalesScreen(
-                        viewModel = salesViewModel,
-                        onNavigateToSearch = {
-                            salesViewModel.clearPendingProduct()
-                            searchViewModel.clearConfirmedItem()
-                            shellController.selectZone(AppDestination.Objects)
-                            navController.navigate(AppDestination.CatalogSearch.route)
-                        },
-                    )
+            }
+            composable(AppDestination.SalesDraft.route) {
+                SalesScreen(
+                    viewModel = salesViewModel,
+                    onNavigateToSearch = {
+                        salesViewModel.clearPendingProduct()
+                        searchViewModel.clearConfirmedItem()
+                        shellController.selectZone(AppDestination.Objects)
+                        navController.navigate(AppDestination.CatalogSearch.route)
+                    },
+                )
+            }
+            composable(AppDestination.AgentChat.route) {
+                AgentChatScreen(
+                    sessions = repository,
+                    gateway = agentGateway,
+                    onLogout = onLogout,
+                    onOpenDraft = {
+                        shellController.selectZone(AppDestination.Objects)
+                        navController.navigateToDestination(AppDestination.SalesDraft)
+                    },
+                )
+            }
+            composable(AppDestination.Receiving.route) {
+                val latest by repository.status.collectAsState()
+                val form = remember(receivingObservations, current, status.generation, latest.capabilities, latest.generation) {
+                    receivingObservations.formFor(current, status.generation)
                 }
-                composable(AppDestination.AgentChat.route) {
-                    AgentChatScreen(
-                        sessions = repository,
-                        gateway = agentGateway,
-                        onLogout = onLogout,
-                        onOpenDraft = {
-                            shellController.selectZone(AppDestination.Objects)
-                            navController.navigateToDestination(AppDestination.SalesDraft)
-                        },
-                    )
-                }
-                composable(AppDestination.Receiving.route) {
-                    ReceivingScreen(
-                        scopeKey = "${current.subjectId}@${current.storeId}",
-                        onReviewDraft = { draft ->
-                            shellController.focusWorkObject(
-                                FieldWorkObjectSummary(
-                                    id = draft.deliveryNoteSha256.take(12).ifBlank { "receiving" },
-                                    kind = "receiving_batch",
-                                    title = "到货清点批次",
-                                    statusLabel = "待核对",
-                                    statusKind = StatusKind.UNVERIFIED,
-                                    isComplexBatchReview = draft.lines.size > 5,
-                                    batchItemCount = draft.lines.size,
-                                    desktopHint = if (draft.lines.size > 5) "去电脑处理" else null,
-                                ),
-                            )
-                        },
-                    )
-                }
+                if (form != null) ReceivingScreen(form)
+                else Text("当前账号不能查看到货观察。")
+            }
+            if (workbench != null) {
                 // C2C-140 parameterized field shell routes
                 composable(
                     route = FieldRouteHelper.OBJECT_ROUTE_PATTERN,
@@ -324,53 +336,56 @@ fun AppNavGraph(
                 }
             }
         }
+    }
 
-        if (useFieldShell) {
-            FieldWorkbenchShell(
-                session = current,
-                state = shellState,
-                controller = shellController,
-                currentNavRoute = currentRoute,
-                hasCapability = repository::hasCapability,
-                capabilities = repository.getCapabilities(),
-                onNavigateObjectRoute = { destination ->
-                    shellController.selectZone(AppDestination.Objects)
-                    navController.navigateToDestination(destination)
-                },
-                onResumeRemoteThread = { threadId ->
-                    executor.execute {
-                        shellController.loadThreadWorkspaceFromBackend(threadId)
-                    }
-                },
-                onLogout = onLogout,
-                onSwitchLegacyShell = { useFieldShell = false },
-                workObjectNavContent = navHostContent,
-            )
-        } else {
-            Scaffold(
-                topBar = {
-                    AppTopBar(
-                        session = current,
-                        onLogout = onLogout,
-                    )
-                },
-                bottomBar = {
-                    AppBottomBar(
-                        currentRoute = currentRoute,
-                        visibleDestinations = visibleDestinations,
-                        onNavigate = { destination ->
-                            navController.navigateToDestination(destination)
-                        },
-                    )
-                },
-            ) { paddingValues ->
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(paddingValues),
-                ) {
-                    navHostContent()
+    if (workbench != null) {
+        FieldWorkbenchShell(
+            session = current,
+            state = shellState,
+            controller = shellController,
+            currentNavRoute = currentRoute,
+            hasCapability = repository::hasCapability,
+            capabilities = repository.getCapabilities(),
+            onNavigateObjectRoute = { destination ->
+                shellController.selectZone(AppDestination.Objects)
+                navController.navigateToDestination(destination)
+            },
+            onResumeRemoteThread = { threadId ->
+                workbench.resumeRemote(isCurrent = ::stillCurrent) {
+                    shellController.loadThreadWorkspaceFromBackend(threadId)
                 }
+            },
+            onLogout = onLogout,
+            onSwitchLegacyShell = {
+                workbench.close()
+                useFieldShell = false
+            },
+            workObjectNavContent = navHostContent,
+        )
+    } else {
+        Scaffold(
+            topBar = {
+                AppTopBar(
+                    session = current,
+                    onLogout = onLogout,
+                )
+            },
+            bottomBar = {
+                AppBottomBar(
+                    currentRoute = currentRoute,
+                    visibleDestinations = visibleDestinations,
+                    onNavigate = { destination ->
+                        navController.navigateToDestination(destination)
+                    },
+                )
+            },
+        ) { paddingValues ->
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(paddingValues),
+            ) {
+                navHostContent()
             }
         }
     }
@@ -420,7 +435,7 @@ private fun AppTopBar(
             fontWeight = FontWeight.SemiBold,
         )
         ConnectionBar(
-            status = ConnectionStatus.ONLINE,
+            status = null, // This shell has no trusted connection-health observation.
             modifier = Modifier.padding(top = 4.dp),
         )
     }

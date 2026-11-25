@@ -1,0 +1,77 @@
+.ar-operational-scroll {
+  margin: 0 .75rem .75rem;
+  max-block-size: min(24rem, 58vh);
+  overflow: auto;
+}
+.ar-operational-scroll:focus-visible {
+  outline: 2px solid #196852;
+  outline-offset: -2px;
+}
+.ar-operational-scroll table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+  font-size: .85rem;
+  font-variant-numeric: tabular-nums;
+  text-align: start;
+}
+.ar-operational-scroll tr :is(td, th) {
+  overflow-wrap: anywhere;
+  text-align: start;
+  border-bottom: 1px solid #e1e9e6;
+  padding: .45rem;
+}
+.ar-operational-scroll thead th {
+  position: sticky;
+  top: 0;
+  background: #eff5f2;
+  z-index: 1;
+}
+.ar-operational-scroll thead th:nth-child(3) {
+  width: 18%;
+}
+.ar-operational-scroll tbody th {
+  font-weight: 500;
+}
+
+.ar-operational-receipt .ar-operational-scroll-hint {
+  display: none;
+}
+
+@media (max-width: 600px) {
+  .ar-operational-receipt .ar-operational-scroll-hint {
+    display: block;
+  }
+
+  .ar-operational-scroll table {
+    min-inline-size: 16rem;
+    table-layout: auto;
+  }
+
+  .ar-operational-scroll tr > :last-child {
+    white-space: nowrap;
+  }
+}
+
+/* An authorized receipt picker can reach the bottom edge of the conversation.
+   Keep the existing history control beside, not above, the composer actions. */
+@media (min-width: 320px) and (max-width: 600px) and (min-height: 441px) {
+  .assistant-layout:not(.assistant-layout--embedded):has(.ar-operational-receipt .ar-next select)
+    .assistant-composer-dock > .assistant-jump {
+    inset-block-end: 21px;
+    inset-inline-start: auto;
+    inset-inline-end: 67px;
+    padding-inline: 6px;
+    transform: none;
+  }
+
+  .assistant-layout:not(.assistant-layout--embedded):has(.ar-operational-receipt .ar-next select)
+    .assistant-composer-dock > .assistant-jump > svg {
+    display: none;
+  }
+}
+
+.ar-operational-receipt .ar-receipt-selection {
+  overflow-wrap: anywhere;
+}

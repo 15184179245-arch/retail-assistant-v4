@@ -13,10 +13,16 @@ from backend.app.modules.assistant.lifecycle import available_core
 router = APIRouter(prefix='/assistant/work', tags=['assistant'])
 
 
-class WorkRequest(BaseModel):
+class MessageRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     text: str = Field(min_length=1)
     request_id: str = Field(min_length=36, max_length=36)
+
+
+from backend.app.modules.assistant.workspace_binding import WorkspaceContextRequest
+
+class WorkRequest(MessageRequest):
+    workspace_context: WorkspaceContextRequest | None = None
 
 
 def envelope(data, message):
@@ -31,13 +37,22 @@ def submit(payload: WorkRequest, request: Request,
     keys = [v for k, v in request.scope['headers'] if k.lower() == b'idempotency-key']
     if keys != [payload.request_id.encode('utf-8')] or key != payload.request_id:
         raise HTTPException(400, 'assistant_idempotency_required')
-    core = available_core(request.app, actor)
+    from backend.app.modules.assistant.lifecycle import intake_work_policy, workspace_context_available
+    core = available_core(request.app, actor, require_dispatch_window=False)
     if type(core) is not DshCoreAdapter:
         raise HTTPException(503, 'assistant_intake_unavailable')
+
+    def prepare_new():
+        if payload.workspace_context is not None and not workspace_context_available(request.app, actor):
+            raise HTTPException(503, 'assistant_workspace_unavailable')
+        if available_core(request.app, actor) is not core:
+            raise HTTPException(503, 'assistant_intake_unavailable')
+        return intake_work_policy(request.app, session, actor)
+
     with session.begin():
-        from backend.app.modules.assistant.lifecycle import intake_work_policy
         data = service.submit_work(session, actor, text=payload.text, request_id=payload.request_id,
-            core=core, authority_policy=intake_work_policy(request.app, session, actor))
+            core=core, prepare_new=prepare_new,
+            workspace_context=payload.workspace_context.model_dump(mode='json') if payload.workspace_context is not None else None)
     return envelope(data, '工作已保存，等待执行。')
 
 
@@ -55,7 +70,10 @@ def intake_status(request: Request, actor: Annotated[AuthenticatedSubject, Depen
     from backend.app.modules.assistant.lifecycle import (available_turn_core, available_inbox_policy,
         inbox_enabled, unavailable_reason)
     available=available_core(request.app,actor) is not None
-    return envelope({'intake_available':available,'followups_supported':True,
+    from backend.app.modules.assistant.lifecycle import workspace_context_available
+    return envelope({'workspace_context_supported':True,
+        'workspace_context_available':workspace_context_available(request.app,actor),
+        'intake_available':available,'followups_supported':True,
         'followups_available':available_turn_core(request.app,actor) is not None,
         'inbox_supported':True,'inbox_enabled':inbox_enabled(request.app,actor),
         'inbox_available':available_inbox_policy(request.app,session,actor) is not None,
@@ -82,7 +100,7 @@ def stop_route(work_id: str, actor: Annotated[AuthenticatedSubject, Depends(requ
     return envelope(stop_work(session, actor, work_id), '已核对停止结果。')
 
 
-class FollowupRequest(WorkRequest):
+class FollowupRequest(MessageRequest):
     previous_turn_id: str = Field(min_length=36,max_length=36)
 
 
@@ -96,13 +114,19 @@ def submit_followup(work_id: str,payload: FollowupRequest,request: Request,
     keys=[v for k,v in request.scope['headers'] if k.lower()==b'idempotency-key']
     if keys!=[payload.request_id.encode('utf-8')] or key!=payload.request_id:
         raise HTTPException(400,'assistant_idempotency_required')
-    core=available_turn_core(request.app,actor)
+    core=available_turn_core(request.app,actor,require_dispatch_window=False)
     if core is None:raise HTTPException(503,'assistant_followup_unavailable')
-    with session.begin():
+
+    def prepare_new():
+        if available_turn_core(request.app,actor) is not core:
+            raise HTTPException(503,'assistant_followup_unavailable')
         policy=intake_work_policy(request.app,session,actor)
         if policy is None:raise HTTPException(503,'assistant_followup_unavailable')
+        return policy
+
+    with session.begin():
         data=turns.append_followup(session,actor,root_work_id=work_id,previous_turn_id=payload.previous_turn_id,
-            text=payload.text,request_id=payload.request_id,core=core,authority_policy=policy)
+            text=payload.text,request_id=payload.request_id,core=core,prepare_new=prepare_new)
     return envelope(data,'补充已保存，等待继续执行。')
 
 
@@ -136,7 +160,7 @@ def stop_followup(work_id: str,turn_id: str,actor: Annotated[AuthenticatedSubjec
     return envelope(stop_turn(session,actor,work_id,turn_id),'已核对停止结果。')
 
 
-class InboxRequest(WorkRequest):
+class InboxRequest(MessageRequest):
     parent_id: str = Field(min_length=36,max_length=36)
 
 

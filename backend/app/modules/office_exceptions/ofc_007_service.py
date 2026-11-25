@@ -14,9 +14,12 @@ from fastapi import HTTPException
 from pydantic import ValidationError, TypeAdapter
 from sqlalchemy import and_, or_, select, text, true
 
+from backend.app.core.security import AuthenticatedSubject
 from backend.app.modules.audit.service import record_event
 from backend.app.modules.auth.service import has_usable_account
-from backend.app.modules.identity.command_guard import lock_employee_authority
+from backend.app.modules.identity.command_guard import (
+    check_command_authority, lock_command_authority, lock_employee_authority,
+)
 from backend.app.modules.identity.service import authorize_scope
 from backend.app.modules.identity.models import Subject
 from backend.app.modules.office_exceptions import ofc_007_sources as sources
@@ -54,6 +57,10 @@ def _allow(db, actor, capability, now):
         _fail("exception_human_required")
     authorize_scope(db, actor, organization_id=actor.organization_id, store_id=actor.store_id,
                     permission="office.exceptions." + capability, now=now)
+    _require_person(db, actor)
+
+
+def _require_person(db, actor):
     if db.scalar(select(Subject.subject_type).where(Subject.organization_id == actor.organization_id,
                                                   Subject.id == actor.subject_id)) != "person":
         _fail("exception_human_required")
@@ -65,6 +72,23 @@ def _guard(db, actor, capability):
     _allow(db, actor, capability, now)
     _allow(db, actor, "read", now)
     return now
+
+
+def _guard_write(db, actor, capability):
+    # The generic command guard also serves Work and sessionless principals.
+    # Exception ownership remains restricted to a logged-in employee.
+    if type(actor) is not AuthenticatedSubject or actor.account_id is None or actor.session_id is None:
+        raise HTTPException(403, "human_session_required")
+    epoch = lock_command_authority(db, actor)
+    now = _clock(db)
+    _allow(db, actor, capability, now)
+    _allow(db, actor, "read", now)
+    return epoch
+
+
+def _check_write(db, actor, capability, epoch, now):
+    check_command_authority(db, actor, permission="office.exceptions." + capability, epoch=epoch, now=now)
+    _require_person(db, actor)
 
 
 def _typed(model, body):
@@ -200,12 +224,12 @@ def _record(db, actor, row, body, key, request_digest, source, now, *, operation
 def create_case(db, actor, body: CaseCreateInput, key):
     body = _typed(CaseCreateInput, body)
     key = _key(key)
-    _guard(db, actor, "manage")
+    epoch = _guard_write(db, actor, "manage")
     request_digest = _request_digest(actor, "create", None, body)
     old = _replay(db, actor, key, request_digest)
     if old is not None:
         result = _view(db, actor, _case(db, actor, old.case_id), command=old, replayed=True)
-        _allow(db, actor, "manage", _clock(db))
+        _check_write(db, actor, "manage", epoch, _clock(db))
         return result
     locator = dict(source_type=body.source_type, source_id=body.source_id, kind=body.kind)
     current = _source(db, actor, locator)
@@ -218,7 +242,7 @@ def create_case(db, actor, body: CaseCreateInput, key):
             OfficeExceptionCase.kind == body.kind)) is not None:
         _fail("exception_source_already_bound")
     now = _clock(db)
-    _allow(db, actor, "manage", now)
+    _check_write(db, actor, "manage", epoch, now)
     pointers = {column: body.source_id if source == body.source_type else None for source, column, _ in SOURCE_POINTERS}
     row = OfficeExceptionCase(id=str(uuid4()), organization_id=actor.organization_id, store_id=actor.store_id,
         **locator, **pointers, initial_source_digest=current["source_digest"], source_version=current["source_version"],
@@ -229,7 +253,7 @@ def create_case(db, actor, body: CaseCreateInput, key):
     result = _view(db, actor, row, command=receipt)
     if result["source"] is None or result["source"]["source_digest"] != current["source_digest"]:
         _fail("exception_source_changed")
-    _allow(db, actor, "manage", _clock(db))
+    _check_write(db, actor, "manage", epoch, _clock(db))
     return result
 
 
@@ -237,12 +261,12 @@ def command_case(db, actor, ident, body: CaseCommandInput, key):
     body = _typed(CaseCommandInput, body)
     key = _key(key)
     capability = _CAPABILITIES[body.operation]
-    _guard(db, actor, capability)
+    epoch = _guard_write(db, actor, capability)
     request_digest = _request_digest(actor, body.operation, ident, body)
     old = _replay(db, actor, key, request_digest)
     if old is not None:
         result = _view(db, actor, _case(db, actor, ident), command=old, replayed=True)
-        _allow(db, actor, capability, _clock(db))
+        _check_write(db, actor, capability, epoch, _clock(db))
         return result
     row = _case(db, actor, ident)
     current = _source(db, actor, _locator(row))
@@ -251,7 +275,7 @@ def command_case(db, actor, ident, body: CaseCommandInput, key):
     if current["source_digest"] != body.expected_source_digest:
         _fail("exception_source_changed")
     now = _clock(db)
-    _allow(db, actor, capability, now)
+    _check_write(db, actor, capability, epoch, now)
     state, owner, pending = row.state, row.owner_id, row.pending_owner_id
     resolved_at, resolution_digest = row.resolved_at, row.resolution_digest
     before_owner = owner
@@ -309,7 +333,7 @@ def command_case(db, actor, ident, body: CaseCommandInput, key):
     result = _view(db, actor, row, command=receipt)
     if result["source"] is None or result["source"]["source_digest"] != current["source_digest"]:
         _fail("exception_source_changed")
-    _allow(db, actor, capability, _clock(db))
+    _check_write(db, actor, capability, epoch, _clock(db))
     return result
 
 
@@ -490,7 +514,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Header, Query
 from backend.app.core.errors import ApiEnvelope
 from backend.app.core.idempotency import require_idempotency_key
-from backend.app.core.security import AuthenticatedSubject, require_authenticated_subject
+from backend.app.core.security import require_authenticated_subject
 from backend.app.db.session import get_session
 from backend.app.modules.office_exceptions.ofc_007_schemas import (
     SourceType, CaseKind, CaseState, Digest, CaseEnvelope, CaseListEnvelope,

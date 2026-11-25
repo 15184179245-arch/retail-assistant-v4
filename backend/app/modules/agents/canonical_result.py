@@ -90,8 +90,7 @@ def _timestamp(value):
     return parsed
 
 
-def validate_envelope(value):
-    """Validate format/commitments only; does not prove DB root or source ACL."""
+def _validated_bytes(value):
     _shape(value)
     _exact(value,_ENVELOPE)
     if type(value['record_version'])is not int or value['record_version']!=1:_fail('canonical_version')
@@ -125,7 +124,12 @@ def validate_envelope(value):
     if value['payload_sha256']!=_digest(value['payload']) or value['output_ref']!='sha256:'+value['payload_sha256']:
         _fail('canonical_payload_digest')
     if value['source_refs_sha256']!=_digest(value['source_refs']):_fail('canonical_refs_digest')
-    canonical_bytes(value)
+    return canonical_bytes(value)
+
+
+def validate_envelope(value):
+    """Validate format/commitments only; does not prove DB root or source ACL."""
+    _validated_bytes(value)
     return value
 
 
@@ -139,14 +143,16 @@ def make_envelope(*,runtime_record,scope,binding,result_kind,payload,source_refs
     return json.loads(canonical_bytes(value))
 
 
+def _reference_bytes(encoded):
+    return 'sha256:'+sha256(encoded).hexdigest()
+
+
 def canonical_reference(value):
-    validate_envelope(value)
-    return 'sha256:'+_digest(value)
+    return _reference_bytes(_validated_bytes(value))
 
 
 def dump_envelope(value):
-    validate_envelope(value)
-    return canonical_bytes(value).decode('utf8')
+    return _validated_bytes(value).decode('utf8')
 
 
 def _pairs(pairs):
@@ -161,7 +167,7 @@ def _non_integer(_):
     _fail('canonical_json_type')
 
 
-def load_envelope(text,*,expected_ref=None):
+def _load_envelope(text,expected_ref):
     if type(text)is not str:_fail('canonical_text')
     try:raw=text.encode('utf8')
     except UnicodeError:_fail('canonical_unicode')
@@ -182,32 +188,40 @@ def load_envelope(text,*,expected_ref=None):
     except (ValueError,RecursionError) as error:
         if isinstance(error,CanonicalResultError):raise
         _fail('canonical_json')
-    validate_envelope(value)
-    if canonical_bytes(value)!=raw:_fail('canonical_encoding')
+    encoded=_validated_bytes(value)
+    if encoded!=raw:_fail('canonical_encoding')
     if expected_ref is not None:
         _hex(expected_ref,True)
-        if canonical_reference(value)!=expected_ref:_fail('canonical_reference')
+        if _reference_bytes(encoded)!=expected_ref:_fail('canonical_reference')
+    return value,encoded
+
+
+def load_envelope(text,*,expected_ref=None):
+    value,_=_load_envelope(text,expected_ref)
     return value
 
 
 def columns_for_envelope(value):
     """Convenience values, not persistence/authorization; B validates one row."""
-    validate_envelope(value)
+    return _columns(value,_validated_bytes(value))
+
+
+def _columns(value,encoded):
     binding=value['binding']
     return {**value['scope'],**{key:binding[key] for key in ('run_id','model_step_id','tool_step_id',
         'pi_receipt_id','native_call_id','tool_key','tool_name','tool_version','toolset_version','input_digest','execution_epoch')},
         'model_kind':'model','tool_kind':'tool','record_version':1,'result_abi':RESULT_ABI,
         'runtime_record_sha256':_digest(value['runtime_record']),'result_kind':value['result_kind'],
         'output_ref':value['output_ref'],'payload_sha256':value['payload_sha256'],
-        'source_refs_sha256':value['source_refs_sha256'],'canonical_ref':canonical_reference(value),
-        'canonical_json':dump_envelope(value),'created_at':_timestamp(value['captured_at'])}
+        'source_refs_sha256':value['source_refs_sha256'],'canonical_ref':_reference_bytes(encoded),
+        'canonical_json':encoded.decode('utf8'),'created_at':_timestamp(value['captured_at'])}
 
 
 def validate_columns(row):
     get=(lambda key:row[key]) if isinstance(row,Mapping) else (lambda key:getattr(row,key))
     try:
-        value=load_envelope(get('canonical_json'),expected_ref=get('canonical_ref'))
-        expected=columns_for_envelope(value)
+        value,encoded=_load_envelope(get('canonical_json'),get('canonical_ref'))
+        expected=_columns(value,encoded)
         for key,item in expected.items():
             actual=get(key)
             if type(item)in(str,int) and type(actual)is not type(item):_fail('canonical_column_binding')

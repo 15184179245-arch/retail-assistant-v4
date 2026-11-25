@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://retail.example.invalid/contracts/guanjia/catalog/product.schema.json",
+  "title": "GuanJia read-only catalog product (synthetic contract)",
+  "description": "Declarative read-only product contract. Live endpoint, pagination, rate limit, permissions and authentication are NOT verified; see x-unverified.",
+  "type": "object",
+  "additionalProperties": false,
+  "x-read-only": true,
+  "x-write-endpoints": [],
+  "x-source-status": "unverified",
+  "x-unverified": ["endpoint", "pagination", "rate_limit", "permissions", "authentication"],
+  "required": [
+    "source_id",
+    "code",
+    "barCode",
+    "name",
+    "unit",
+    "price",
+    "cost",
+    "stock",
+    "disabled",
+    "updated_at",
+    "source_version",
+    "raw"
+  ],
+  "properties": {
+    "source_id": { "type": "string", "minLength": 1 },
+    "code": { "type": "string" },
+    "barCode": { "type": ["string", "null"] },
+    "name": { "type": "string", "minLength": 1 },
+    "unit": { "type": "string", "minLength": 1 },
+    "price": { "type": ["number", "null"] },
+    "cost": { "type": ["number", "null"] },
+    "stock": { "type": ["number", "null"] },
+    "disabled": { "type": "boolean" },
+    "updated_at": { "type": "string" },
+    "source_version": { "type": "string", "minLength": 1 },
+    "raw": { "type": "object" }
+  }
+}

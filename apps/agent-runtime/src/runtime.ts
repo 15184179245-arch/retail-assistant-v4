@@ -1,5 +1,6 @@
 /** Public SDK native session, with no default tools and a Host-only gateway.
  * Synthetic v1 and offline-testable v2 Host proxy share the native session.
+ * AGT-045 Foundation integration: formalized runtime session bindings.
  */
 import {createHash, randomUUID} from 'node:crypto';
 import {join} from 'node:path';

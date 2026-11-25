@@ -1,0 +1,13 @@
+.assistant-terminal-heading {
+  margin: 0 0 8px;
+  color: #344842;
+  font-size: 1em;
+  font-weight: 600;
+  scroll-margin-block-start: 64px;
+  scroll-margin-block-end: 10px;
+}
+
+.assistant-terminal-heading:focus-visible {
+  outline: 2px solid #4b786b;
+  outline-offset: 3px;
+}

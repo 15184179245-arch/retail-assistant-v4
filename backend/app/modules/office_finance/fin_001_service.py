@@ -50,6 +50,13 @@ def _money(value, label, *, nonnegative=False):
     if nonnegative and amount < 0: _fail("finance_" + label + "_invalid", 422)
     return amount
 
+def _observed_at_utc(observed):
+    try:
+        return observed.astimezone(timezone.utc)
+    except OverflowError:
+        _fail("finance_observed_at_invalid", 422)
+
+
 def _normalize(body: WorkpaperCreate) -> dict:
     start, end = _date(body.period_start, "period_start"), _date(body.period_end, "period_end")
     if start > end: _fail("finance_period_invalid", 422)
@@ -86,7 +93,7 @@ def _normalize(body: WorkpaperCreate) -> dict:
         difference = closing - calculated if calculated is not None and closing is not None else None
     return {"source_kind": body.source_kind, "source_snapshot_id": _text(body.source_snapshot_id, "snapshot_id"),
             "source_version": _text(body.source_version, "source_version"),
-            "observed_at": observed.astimezone(timezone.utc).isoformat(),
+            "observed_at": _observed_at_utc(observed).isoformat(),
             "period_start": body.period_start, "period_end": body.period_end,
             "party_type": body.party_type, "party_ref": _text(body.party_ref, "party_ref"),
             "currency": body.currency, "opening_balance": body.opening_balance,

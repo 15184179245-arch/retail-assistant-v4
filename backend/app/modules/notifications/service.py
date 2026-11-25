@@ -71,12 +71,15 @@ def _visibility(actor: AuthenticatedSubject, current: datetime):
 
 
 def _visible_one(session: Session, actor: AuthenticatedSubject, notification_id: str,
-                 current: datetime) -> Notification:
-    row = session.scalar(select(Notification).join(Task, and_(
+                 current: datetime, *, refresh: bool = False) -> Notification:
+    query = select(Notification).join(Task, and_(
         Task.organization_id == Notification.organization_id,
         Task.store_id == Notification.store_id,
         Task.id == Notification.task_id,
-    )).where(*_visibility(actor, current), Notification.id == notification_id))
+    )).where(*_visibility(actor, current), Notification.id == notification_id)
+    if refresh:
+        query = query.execution_options(populate_existing=True)
+    row = session.scalar(query)
     if row is None:
         raise HTTPException(404, "notification_not_found")
     return row
@@ -159,7 +162,10 @@ def mark_read(session: Session, actor: AuthenticatedSubject, notification_id: st
         actor.subject_id, notification_id, expected_version],
         separators=(",", ":")).encode("utf-8")).hexdigest()
 
-    def receipt() -> Notification | None:
+    class ReadVersionConflict(Exception):
+        pass
+
+    def receipt(*, refresh: bool = False) -> Notification | None:
         command = session.scalar(select(NotificationCommand).where(
             NotificationCommand.organization_id == actor.organization_id,
             NotificationCommand.store_id == actor.store_id,
@@ -169,7 +175,7 @@ def mark_read(session: Session, actor: AuthenticatedSubject, notification_id: st
             return None
         if command.payload_digest != digest or command.notification_id != notification_id:
             raise HTTPException(409, "idempotency_conflict")
-        row = _visible_one(session, actor, notification_id, current)
+        row = _visible_one(session, actor, notification_id, current, refresh=refresh)
         if row.version != command.response.get("version") or (
                 row.read_at is None) != (command.response.get("read_at") is None):
             raise HTTPException(409, "notification_receipt_stale")
@@ -183,7 +189,7 @@ def mark_read(session: Session, actor: AuthenticatedSubject, notification_id: st
         with session.begin_nested():
             row = _visible_one(session, actor, notification_id, current)
             if row.version != expected_version or row.read_at is not None:
-                raise HTTPException(409, "notification_version_conflict")
+                raise ReadVersionConflict
             changed = session.execute(update(Notification).where(
                 Notification.id == row.id,
                 Notification.organization_id == actor.organization_id,
@@ -193,7 +199,7 @@ def mark_read(session: Session, actor: AuthenticatedSubject, notification_id: st
                 Notification.read_at.is_(None),
             ).values(read_at=current, version=expected_version + 1))
             if changed.rowcount != 1:
-                raise HTTPException(409, "notification_version_conflict")
+                raise ReadVersionConflict
             session.expire(row)
             row = _visible_one(session, actor, notification_id, current)
             record_event(session, actor_id=actor.subject_id,
@@ -211,11 +217,15 @@ def mark_read(session: Session, actor: AuthenticatedSubject, notification_id: st
                 created_at=current))
             session.flush()
         return row
-    except IntegrityError:
-        prior = receipt()
+    except (ReadVersionConflict, IntegrityError) as error:
+        # The savepoint has unwound. A concurrent exact command may now be
+        # visible, but a previously loaded notification can still be stale.
+        prior = receipt(refresh=True)
         if prior is not None:
             return prior
-        raise HTTPException(409, "notification_command_conflict") from None
+        detail = ("notification_version_conflict" if isinstance(error, ReadVersionConflict)
+                  else "notification_command_conflict")
+        raise HTTPException(409, detail) from None
 
 
 def reconcile_overdue(session: Session, actor: AuthenticatedSubject, *,
@@ -224,6 +234,7 @@ def reconcile_overdue(session: Session, actor: AuthenticatedSubject, *,
 
     The operator cannot choose a recipient. Dedupe is tied to the exact due_at,
     assignee, task and rule version. Requires a dedicated permission.
+    limit bounds newly created reminders; scanned includes already deduped rows.
     """
     _authorize(session, actor, "notifications.manage")
     current = _now(now)
@@ -240,30 +251,53 @@ def reconcile_overdue(session: Session, actor: AuthenticatedSubject, *,
         return {field: previous.details[field] for field in ("created", "scanned", "rule_version")}
     _start_write(session)
     scanned, created = 0, 0
-    rows = session.scalars(select(Task).where(
-        Task.organization_id == actor.organization_id,
-        Task.store_id == actor.store_id,
-        Task.assignee_id.is_not(None),
-        Task.due_at <= current,
-        Task.state.in_(("assigned", "in_progress")),
-    ).order_by(Task.due_at.asc(), Task.id.asc()).limit(limit)).all()
-    for task in rows:
-        scanned += 1
-        due = task.due_at
-        if due is None:
-            continue
-        due_utc = due.replace(tzinfo=timezone.utc) if due.tzinfo is None else due.astimezone(timezone.utc)
-        event_key = sha256(json.dumps([task.id, task.assignee_id,
-            due_utc.isoformat(), OVERDUE_RULE], separators=(",", ":")).encode("utf-8")).hexdigest()
-        if _append(session, task=task, recipient_id=task.assignee_id, kind="overdue",
-                   event_key=event_key, rule_version=OVERDUE_RULE, current=current):
-            created += 1
-            record_event(session, actor_id=actor.subject_id,
-                organization_id=actor.organization_id, store_id=actor.store_id,
-                action="notification.overdue", target_type="task", target_id=task.id,
-                idempotency_key="notification:overdue:" + event_key,
-                details={"recipient_id": task.assignee_id, "rule_version": OVERDUE_RULE,
-                         "due_at": due_utc.isoformat()})
+    # Keyset scan past already-reminded identities. The original exact-event
+    # hash and unique constraint remain authoritative (including due/owner changes).
+    after = None
+    while created < limit:
+        query = select(Task).where(
+            Task.organization_id == actor.organization_id,
+            Task.store_id == actor.store_id,
+            Task.assignee_id.is_not(None), Task.due_at <= current,
+            Task.state.in_(("assigned", "in_progress")),
+        )
+        if after is not None:
+            query = query.where(or_(Task.due_at > after[0],
+                and_(Task.due_at == after[0], Task.id > after[1])))
+        rows = session.scalars(query.order_by(Task.due_at.asc(), Task.id.asc()).limit(limit)
+            .execution_options(populate_existing=True)).all()
+        if not rows:
+            break
+        candidates = []
+        for task in rows:
+            due = task.due_at
+            due_utc = due.replace(tzinfo=timezone.utc) if due.tzinfo is None else due.astimezone(timezone.utc)
+            event_key = sha256(json.dumps([task.id, task.assignee_id,
+                due_utc.isoformat(), OVERDUE_RULE], separators=(",", ":")).encode("utf-8")).hexdigest()
+            candidates.append((task, due_utc, event_key))
+        # Skip known identities in one scoped page lookup, not one SELECT/task.
+        # The original _append remains the authority for all potentially new rows.
+        existing = set(session.execute(select(
+            Notification.source_event_key, Notification.recipient_id).where(
+                Notification.organization_id == actor.organization_id,
+                Notification.store_id == actor.store_id, Notification.kind == "overdue",
+                Notification.source_event_key.in_([key for _, _, key in candidates]))))
+        for task, due_utc, event_key in candidates:
+            after = (task.due_at, task.id)
+            scanned += 1
+            if (event_key, task.assignee_id) in existing:
+                continue
+            if _append(session, task=task, recipient_id=task.assignee_id, kind="overdue",
+                       event_key=event_key, rule_version=OVERDUE_RULE, current=current):
+                created += 1
+                record_event(session, actor_id=actor.subject_id,
+                    organization_id=actor.organization_id, store_id=actor.store_id,
+                    action="notification.overdue", target_type="task", target_id=task.id,
+                    idempotency_key="notification:overdue:" + event_key,
+                    details={"recipient_id": task.assignee_id, "rule_version": OVERDUE_RULE,
+                             "due_at": due_utc.isoformat()})
+            if created >= limit:
+                break
     record_event(session, actor_id=actor.subject_id,
         organization_id=actor.organization_id, store_id=actor.store_id,
         action="notification.reconcile", target_type="notification_rule",

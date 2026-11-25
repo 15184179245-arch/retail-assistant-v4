@@ -1,0 +1,55 @@
+.ar-purchase-order-detail .ar-purchase-order-identity,
+.ar-purchase-order-detail .ar-purchase-order-lines {
+  margin: .75rem;
+}
+
+.ar-purchase-order-detail .ar-purchase-order-identity,
+.ar-purchase-order-detail .ar-purchase-order-lines dl {
+  display: grid;
+  gap: .375rem .875rem;
+}
+
+.ar-purchase-order-detail .ar-purchase-order-identity {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ar-purchase-order-detail .ar-purchase-order-lines {
+  padding-inline-start: 1.4rem;
+}
+
+.ar-purchase-order-detail .ar-purchase-order-lines dl {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr) minmax(0, 1fr);
+  margin-block: 0;
+  padding-block: .5rem;
+  border-block-start: 1px solid #e1e9e6;
+}
+
+.ar-purchase-order-detail--with-quantity .ar-purchase-order-lines dl {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 7rem), 1fr));
+}
+
+.ar-purchase-order-detail--with-quantity .ar-purchase-order-lines bdi {
+  white-space: pre-wrap;
+}
+
+.ar-purchase-order-detail dt {
+  font-weight: 600;
+}
+.ar-purchase-order-detail dd {
+  margin-inline-start: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 600px) {
+  .ar-purchase-order-detail .ar-purchase-order-identity,
+  .ar-purchase-order-detail .ar-purchase-order-lines dl {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ar-purchase-order-detail .ar-purchase-order-identity > div,
+  .ar-purchase-order-detail .ar-purchase-order-lines dl > div {
+    display: grid;
+    grid-template-columns: minmax(0, 6.5rem) minmax(0, 1fr);
+    gap: .5rem;
+  }
+}

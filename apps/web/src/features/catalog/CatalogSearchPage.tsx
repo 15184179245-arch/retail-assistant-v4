@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { FormEvent } from "react";
 import type { Session } from "../../lib/auth/session";
-import { authorizedRequest } from "../../lib/auth/session";
+import { authorizedRequest, getScopeVersion, subscribe } from "../../lib/auth/session";
+import { getCapabilityEpoch, hasCapability, subscribeCapabilities, useCapabilities } from "../../lib/auth/capabilities";
 import { PageHeader } from "../../components/PageHeader";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Button } from "../../components/Button";
@@ -44,36 +45,93 @@ export interface CatalogSearchPageProps {
   baseUrl?: string;
 }
 
-const QUICK_SEARCH_EXAMPLES = ["水管", "JDD", "DEMO-A01", "生料带", "球阀", "螺丝"];
+const QUICK_SEARCH_EXAMPLES = ["水管", "FSJB", "DEMO-A01", "生料带", "球阀", "螺丝"];
+
+type ProductMatches = { product: SearchMatch; reasons: Map<string, SearchMatch> };
+
+function groupSearchProducts(result: SearchResultData | null) {
+  const exact: ProductMatches[] = [];
+  const candidates: ProductMatches[] = [];
+  const byId = new Map<string, ProductMatches>();
+  function collect(matches: SearchMatch[], section: ProductMatches[]) {
+    for (const item of matches) {
+      let group = byId.get(item.product_id);
+      if (!group) {
+        group = { product: item, reasons: new Map() };
+        byId.set(item.product_id, group);
+        section.push(group);
+      }
+      const reasonKey = JSON.stringify([item.match_field, item.match_type, item.original_value, item.normalized_value]);
+      if (!group.reasons.has(reasonKey)) group.reasons.set(reasonKey, item);
+    }
+  }
+  if (result) {
+    collect(result.exact, exact);
+    collect(result.candidates, candidates);
+  }
+  return { exact, candidates };
+}
+
+const matchFields: Record<SearchMatch["match_field"], string> = {
+  code: "编码", barcode: "条码", alias: "副码", name: "名称", derived: "整理线索",
+};
+const matchTypes: Record<SearchMatch["match_type"], string> = {
+  exact_code: "精确命中", exact_barcode: "精确命中", normalized_barcode: "规范化候选", alias_exact: "精确命中", fuzzy_candidate: "模糊候选",
+};
 
 export function CatalogSearchPage({ baseUrl = "" }: CatalogSearchPageProps) {
-  const [query, setQuery] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<SearchResultData | null>(null);
+  const scope = useSyncExternalStore(subscribe, getScopeVersion, getScopeVersion);
+  const epoch = useSyncExternalStore(subscribeCapabilities, getCapabilityEpoch, getCapabilityEpoch);
+  const maySearch = useCapabilities().hasCapability("catalog.read");
+  const identity = useMemo(() => ({ scope, baseUrl }), [scope, baseUrl]);
+  const context = useMemo(() => ({ identity, epoch }), [identity, epoch]);
+  const [input, setInput] = useState({ identity, text: "" });
+  const [status, setStatus] = useState<{ context: typeof context; loading: boolean; error: string | null; result: SearchResultData | null } | null>(null);
+  const query = input.identity === identity ? input.text : "";
+  const visible = maySearch && status?.context === context ? status : null;
+  const { loading = false, error = null, result = null } = visible ?? {};
+  const activeContext = useRef<typeof context | null>(null);
+  const activeRequest = useRef<AbortController | null>(null);
+  const isCurrentContext = () => activeContext.current === context &&
+    getScopeVersion() === scope && getCapabilityEpoch() === epoch && hasCapability("catalog.read");
+
+  useLayoutEffect(() => {
+    activeContext.current = context;
+    setStatus(null);
+    return () => {
+      activeContext.current = null;
+      activeRequest.current?.abort();
+      activeRequest.current = null;
+    };
+  }, [context]);
+
+  function changeQuery(text: string) {
+    if (isCurrentContext()) setInput({ identity, text });
+  }
 
   async function handleSearch(searchTerm: string) {
+    if (!isCurrentContext()) return;
+    activeRequest.current?.abort();
+    activeRequest.current = null;
     const trimmed = searchTerm.trim();
-    if (!trimmed) {
-      setResult(null);
-      setError(null);
-      return;
-    }
+    if (!trimmed) { setStatus(null); return; }
 
-    setLoading(true);
-    setError(null);
+    const controller = new AbortController();
+    activeRequest.current = controller;
+    const isCurrent = () => activeRequest.current === controller && !controller.signal.aborted && isCurrentContext();
+    setStatus({ context, loading: true, error: null, result: null });
     try {
       const data = await authorizedRequest<SearchResultData>(
         `/api/v1/search?q=${encodeURIComponent(trimmed)}&limit=50`,
-        { baseUrl }
+        { baseUrl, signal: controller.signal, cache: "no-store" },
       );
-      setResult(data);
+      if (isCurrent()) setStatus({ context, loading: false, error: null, result: data });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "搜索请求失败，请稍后重试";
-      setError(msg);
-      setResult(null);
+      if (!isCurrent()) return;
+      const error = err instanceof Error ? err.message : "搜索请求失败，请稍后重试";
+      setStatus({ context, loading: false, error, result: null });
     } finally {
-      setLoading(false);
+      if (activeRequest.current === controller) activeRequest.current = null;
     }
   }
 
@@ -83,29 +141,33 @@ export function CatalogSearchPage({ baseUrl = "" }: CatalogSearchPageProps) {
   }
 
   function onQuickClick(example: string) {
-    setQuery(example);
+    changeQuery(example);
     void handleSearch(example);
   }
 
+  const { exact, candidates } = useMemo(() => groupSearchProducts(result), [result]);
   const hasSearched = result !== null;
-  const totalFound = (result?.exact.length ?? 0) + (result?.candidates.length ?? 0);
+  const totalFound = exact.length + candidates.length;
 
   return (
     <div className="catalog-search-page" style={{ padding: "0 16px 40px", maxWidth: 1100, margin: "0 auto" }}>
       <PageHeader
         title="商品与库存查询"
-        eyebrow="商品目录 · 只读检索"
-        source="公开版不附带商品库"
-        statusKind="verified"
+        eyebrow="商品目录 · 只读查询"
+        source="目录查询服务 · 结果以本次回执为准"
       />
 
+      <aside className="catalog-readonly-notice" role="note">
+        <strong>只读商品目录</strong>
+        <p>当前查询为商品目录快照，不是实时价格或库存；结果不构成正式报价。实时来源是否可用，以具体工作的来源回执为准。</p>
+      </aside>
       <Card style={{ marginBottom: 24, padding: "20px 24px" }}>
         <form onSubmit={onSubmit} style={{ display: "flex", gap: 12, alignItems: "center" }}>
           <input
             type="search"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="输入商品名称、拼音缩写（如 JDD）、条码或编码..."
+            onChange={(e) => changeQuery(e.target.value)}
+            placeholder="输入商品名称、拼音缩写（如 FSJB）、条码或编码..."
             style={{
               flex: 1,
               padding: "10px 14px",
@@ -116,7 +178,7 @@ export function CatalogSearchPage({ baseUrl = "" }: CatalogSearchPageProps) {
             }}
             autoFocus
           />
-          <Button type="submit" variant="primary" disabled={loading}>
+          <Button type="submit" variant="primary" disabled={loading || !maySearch}>
             {loading ? "检索中..." : "查询"}
           </Button>
         </form>
@@ -128,6 +190,7 @@ export function CatalogSearchPage({ baseUrl = "" }: CatalogSearchPageProps) {
               <button
                 key={ex}
                 type="button"
+                disabled={!maySearch}
                 onClick={() => onQuickClick(ex)}
                 style={{
                   background: "#f0f4f2",
@@ -158,10 +221,10 @@ export function CatalogSearchPage({ baseUrl = "" }: CatalogSearchPageProps) {
       {hasSearched && (
         <div style={{ marginBottom: 16, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <div style={{ fontSize: 14, color: "#444" }}>
-            检索词 <strong>“{result.query}”</strong>：找到 {result.exact.length} 项精确匹配，{result.candidates.length} 项候选
+            检索词 <strong data-search-result-query>“{result.query}”</strong>：本次显示 {exact.length} 种精确匹配商品，{candidates.length} 种候选商品
             {result.ambiguous && (
               <span style={{ marginLeft: 8, color: "#b45309", fontWeight: 500 }}>
-                (包含模糊/拼音候选，规格与身份请确认)
+                （命中多个商品，请确认规格与身份）
               </span>
             )}
           </div>
@@ -173,39 +236,39 @@ export function CatalogSearchPage({ baseUrl = "" }: CatalogSearchPageProps) {
         <EmptyState
           type="empty"
           title="未找到匹配商品"
-          description={`在当前可访问的商品目录中未检索到与 “${result.query}” 匹配的项目。建议尝试其他关键词、拼音首字母或商品编码。`}
+          description={`在当前可查询目录中未检索到与 “${result.query}” 匹配的项目。建议尝试其他关键词、拼音首字母或商品编码。`}
         />
       )}
 
       {/* 精确匹配区域 */}
-      {result && result.exact.length > 0 && (
+      {exact.length > 0 && (
         <div style={{ marginBottom: 32 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
             <h3 style={{ fontSize: 16, margin: 0, color: "#166534" }}>
-              精确匹配结果 ({result.exact.length})
+              精确匹配结果 ({exact.length})
             </h3>
             <StatusBadge kind="verified" />
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 16 }}>
-            {result.exact.map((item) => (
-              <ProductCard key={item.product_id} item={item} isExact />
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 320px), 1fr))", gap: 16 }}>
+            {exact.map((group) => (
+              <ProductCard key={group.product.product_id} group={group} isExact />
             ))}
           </div>
         </div>
       )}
 
       {/* 模糊/拼音候选区域 */}
-      {result && result.candidates.length > 0 && (
+      {candidates.length > 0 && (
         <div>
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
             <h3 style={{ fontSize: 16, margin: 0, color: "#1e293b" }}>
-              候选匹配结果 ({result.candidates.length})
+              候选匹配结果 ({candidates.length})
             </h3>
             <StatusBadge kind="suggestion" />
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 16 }}>
-            {result.candidates.map((item) => (
-              <ProductCard key={item.product_id} item={item} isExact={false} />
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 320px), 1fr))", gap: 16 }}>
+            {candidates.map((group) => (
+              <ProductCard key={group.product.product_id} group={group} isExact={false} />
             ))}
           </div>
         </div>
@@ -213,9 +276,9 @@ export function CatalogSearchPage({ baseUrl = "" }: CatalogSearchPageProps) {
 
       {!hasSearched && (
         <Card style={{ padding: "40px 24px", textAlign: "center", color: "#666" }}>
-          <h3 style={{ fontSize: 16, color: "#222", marginBottom: 8 }}>商品目录与只读索引</h3>
+          <h3 style={{ fontSize: 16, color: "#222", marginBottom: 8 }}>连接到管家婆商品只读真实索引</h3>
           <p style={{ maxWidth: 540, margin: "0 auto", fontSize: 14, lineHeight: 1.6 }}>
-            当前公开版不内置业务快照。输入商品名称、规格、条形码或拼音首字母即可毫秒级检索。
+            查询当前账号可访问的商品目录。输入商品名称、规格、条形码或拼音首字母开始检索。
           </p>
         </Card>
       )}
@@ -223,11 +286,13 @@ export function CatalogSearchPage({ baseUrl = "" }: CatalogSearchPageProps) {
   );
 }
 
-function ProductCard({ item, isExact }: { item: SearchMatch; isExact: boolean }) {
+function ProductCard({ group: { product: item, reasons }, isExact }: { group: ProductMatches; isExact: boolean }) {
   return (
     <Card
       style={{
         padding: 16,
+        minWidth: 0,
+        overflowWrap: "anywhere",
         display: "flex",
         flexDirection: "column",
         gap: 8,
@@ -253,7 +318,7 @@ function ProductCard({ item, isExact }: { item: SearchMatch; isExact: boolean })
         </span>
       </div>
 
-      <div style={{ fontSize: 13, color: "#475569", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 8px" }}>
+      <div style={{ fontSize: 13, color: "#475569", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 130px), 1fr))", gap: "4px 8px" }}>
         <div>
           <span style={{ color: "#94a3b8" }}>规格：</span>
           {item.spec || "—"}
@@ -280,12 +345,31 @@ function ProductCard({ item, isExact }: { item: SearchMatch; isExact: boolean })
           fontSize: 11,
           color: "#94a3b8",
           display: "flex",
-          justifyContent: "space-between",
+          flexDirection: "column",
+          gap: 4,
         }}
       >
-        <span>来源: {item.source_system}</span>
-        <span>快照: {new Date(item.captured_at).toLocaleDateString()}</span>
+        <ul aria-label="匹配依据" style={{ margin: 0, paddingInlineStart: 16 }}>
+          {[...reasons].map(([key, reason]) => (
+            <li key={key}>
+              {matchFields[reason.match_field]} · {matchTypes[reason.match_type]}：<code>{reason.original_value}</code>
+              {reason.normalized_value && reason.normalized_value !== reason.original_value ? (
+                <> → <code>{reason.normalized_value}</code></>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+        <span>目录来源：{item.source_system || "未提供"}</span>
+        <span>来源版本：{item.source_version || "未提供"}</span>
+        <span>采集时点：{formatSourceTime(item.captured_at)}</span>
+        <span>源更新时间：{formatSourceTime(item.source_updated_at)}</span>
       </div>
     </Card>
   );
+}
+
+
+function formatSourceTime(value: string | null): string {
+  if (!value || !Number.isFinite(Date.parse(value))) return "未提供";
+  return new Date(value).toLocaleString(undefined, { hour12: false });
 }

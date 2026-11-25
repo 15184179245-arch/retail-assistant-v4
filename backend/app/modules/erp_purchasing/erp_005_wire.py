@@ -5,6 +5,7 @@ synthetic readback is only a sandbox observation; it never claims stock posting.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from decimal import Decimal, localcontext
 import re
 from typing import Any, Literal
@@ -93,6 +94,15 @@ class ReceiptWireLine(StrictDTO):
 def _validate_cumulative(cumulative: list[ReceiptCumulative]) -> None:
     if len({item.intent_line_id for item in cumulative}) != len(cumulative):
         raise ValueError("receipt_duplicate_cumulative_line")
+
+
+def _validate_external_line_refs(refs: Iterable[str | None]) -> None:
+    used = set()
+    for ref in refs:
+        if ref is not None:
+            if ref in used:
+                raise ValueError("receipt_duplicate_external_line_ref")
+            used.add(ref)
 
 
 def _validate_lines(lines: list[ReceiptWireLine], total_amount: str) -> None:
@@ -257,6 +267,7 @@ class ReceiptReadbackReceipt(ReceiptWireCommon):
     def evidence_matches_document_state(self) -> ReceiptReadbackReceipt:
         _validate_cumulative(self.cumulative)
         _validate_lines(self.lines, self.total_amount)
+        _validate_external_line_refs(line.external_line_ref for line in self.lines)
         accepted = [line.status == "accepted" for line in self.lines]
         if self.document_state == "accepted":
             if (not all(accepted) or self.external_ref is None

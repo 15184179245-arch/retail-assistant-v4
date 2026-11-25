@@ -12,6 +12,7 @@ from backend.app.core.security import AuthenticatedSubject
 from backend.app.modules.search import service as search_service
 from backend.app.modules.search.refinement import SearchPlan
 from backend.app.modules.search.hybrid import search_hybrid
+from backend.app.modules.search.schemas import SearchDisplayText
 
 
 class CatalogSearchInput(BaseModel):
@@ -29,9 +30,9 @@ class CatalogMatch(BaseModel):
     match_type: str
     original_value: str
     normalized_value: str | None
-    name: str | None
-    spec: str | None
-    unit: str | None
+    name: SearchDisplayText
+    spec: SearchDisplayText
+    unit: SearchDisplayText
     barcode: str | None
     source_system: str
     source_version: str

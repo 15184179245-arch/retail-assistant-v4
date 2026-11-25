@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
-import { captureSessionScope } from "../lib/auth/session";
+import { captureSessionScope, getScopeVersion, subscribe as subscribeSession } from "../lib/auth/session";
+import { getCapabilityEpoch, subscribeCapabilities } from "../lib/auth/capabilities";
 import {
   getThreadWorkspace,
   subscribeWorkspaceEvents,
@@ -7,6 +8,7 @@ import {
   type StreamConnectionState,
   type ThreadMessageDto,
   type WorkspaceEventEnvelope,
+  type WorkspaceNavigationRef,
 } from "../lib/api/workspace";
 import type {
   ArtifactOpDto,
@@ -62,6 +64,12 @@ export interface DirtyLeavePrompt {
   resolveAction: () => void;
 }
 
+type ArtifactSummary = Pick<WorkspaceArtifactDto, "id" | "title" | "kind" | "version" | "status"> & { lockedCount: number };
+type ArtifactReadStamp = { scope: number; epoch: number };
+type VerifiedArtifactIndex = ArtifactReadStamp & { summaries: Readonly<Record<string, ArtifactSummary>> };
+const emptyArtifactSummaries: VerifiedArtifactIndex["summaries"] = Object.freeze({});
+const unverifiedArtifactLabel = "草稿待核对";
+
 export interface WorkspaceState {
   subjectId: string | null;
   leftSection: "today" | "objects" | "threads" | "settings";
@@ -72,10 +80,12 @@ export interface WorkspaceState {
   threads: WorkspaceThread[];
   activeThreadId: string;
   artifactsById: Record<string, WorkspaceArtifactDto>;
+  verifiedArtifactIndex: VerifiedArtifactIndex | null;
   opsByArtifactId: Record<string, ArtifactOpDto[]>;
   partialUndoByArtifactId: Record<string, { skippedFields: string[]; message: string } | null>;
   aiModifiedFields: Record<string, Record<string, AiFieldModification>>;
   dirtyByTabId: Record<string, boolean>;
+  draftInputsByThread: Record<string, Record<string, Record<string, string>>>;
   dirtyLeavePrompt: DirtyLeavePrompt | null;
   toasts: WorkspaceToast[];
   syncWarning: string | null;
@@ -116,10 +126,12 @@ function createInitialState(): WorkspaceState {
     threads: [createDefaultThread()],
     activeThreadId: "thread-today",
     artifactsById: {},
+    verifiedArtifactIndex: null,
     opsByArtifactId: {},
     partialUndoByArtifactId: {},
     aiModifiedFields: {},
     dirtyByTabId: {},
+    draftInputsByThread: {},
     dirtyLeavePrompt: null,
     toasts: [],
     syncWarning: null,
@@ -154,6 +166,25 @@ export function useWorkspaceState(): WorkspaceState {
     getWorkspaceState,
     getWorkspaceState,
   );
+}
+
+function verifiedSummaries(state: WorkspaceState, scope: number, epoch: number) {
+  const index = state.verifiedArtifactIndex;
+  return index?.scope === scope && index.epoch === epoch ? index.summaries : emptyArtifactSummaries;
+}
+
+export function useVerifiedArtifactSummaries(state: WorkspaceState) {
+  const scope = useSyncExternalStore(subscribeSession, getScopeVersion, getScopeVersion);
+  const epoch = useSyncExternalStore(subscribeCapabilities, getCapabilityEpoch, getCapabilityEpoch);
+  return verifiedSummaries(state, scope, epoch);
+}
+
+export function isVerifiedArtifactSummaryCurrent(summary: ArtifactSummary): boolean {
+  return verifiedSummaries(state, getScopeVersion(), getCapabilityEpoch())[summary.id] === summary;
+}
+
+export function workspaceTabLabel(tab: WorkbenchTab, verified = emptyArtifactSummaries): string {
+  return tab.kind === "artifact" ? verified[tab.artifactId ?? ""]?.title ?? unverifiedArtifactLabel : tab.title;
 }
 
 export function setWorkspaceUrlSyncEnabled(enabled: boolean): void {
@@ -242,6 +273,35 @@ export function setTabDirty(tabId: string, dirty: boolean): void {
   emit();
 }
 
+/** Human text only: never server facts, never persisted or replayed on remount. */
+export function updateArtifactDraftInputs(
+  threadId: string, tabId: string,
+  update: (previous: Record<string, string>) => Record<string, string>,
+): void {
+  if (threadId !== state.activeThreadId) return;
+  const tabs = state.draftInputsByThread[threadId] ?? {};
+  const next = update(tabs[tabId] ?? {});
+  state = { ...state, draftInputsByThread: { ...state.draftInputsByThread, [threadId]: { ...tabs, [tabId]: next } } };
+  setTabDirty(tabId, Object.keys(next).length > 0);
+  emit();
+}
+
+function draftsWithoutTab(tabId: string): WorkspaceState["draftInputsByThread"] {
+  const tabs = { ...(state.draftInputsByThread[state.activeThreadId] ?? {}) };
+  delete tabs[tabId];
+  return { ...state.draftInputsByThread, [state.activeThreadId]: tabs };
+}
+
+/** A current access denial evicts server-derived content, not isolated human input. */
+export function evictArtifactFacts(artifactId: string): void {
+  const without = <T,>(values: Record<string, T>) => { const next = { ...values }; delete next[artifactId]; return next; };
+  const index = state.verifiedArtifactIndex;
+  state = { ...state, artifactsById: without(state.artifactsById), opsByArtifactId: without(state.opsByArtifactId),
+    aiModifiedFields: without(state.aiModifiedFields), partialUndoByArtifactId: without(state.partialUndoByArtifactId),
+    verifiedArtifactIndex: index ? { ...index, summaries: without(index.summaries) } : null };
+  emit();
+}
+
 export function dismissDirtyLeavePrompt(): void {
   if (!state.dirtyLeavePrompt) {
     return;
@@ -261,6 +321,7 @@ export function confirmDirtyLeavePrompt(): void {
     ...state,
     dirtyByTabId: nextDirty,
     dirtyLeavePrompt: null,
+    draftInputsByThread: draftsWithoutTab(prompt.tabId),
     openTabs: state.openTabs.map((t) =>
       t.id === prompt.tabId ? { ...t, dirty: false } : t,
     ),
@@ -326,14 +387,13 @@ function updateActiveThread(updater: (thread: WorkspaceThread) => WorkspaceThrea
   state = { ...state, threads: nextThreads };
 }
 
-function toObjectRef(tab: WorkbenchTab): OpenObjectRefDto | null {
+function toObjectRef(tab: WorkbenchTab): WorkspaceNavigationRef | null {
   if (tab.kind === "today") {
     return null;
   }
   return {
     kind: tab.objectKind ?? tab.kind,
     id: tab.objectId ?? tab.id,
-    title: tab.title,
     path: tab.path,
     artifact_id: tab.artifactId ?? null,
   };
@@ -355,7 +415,7 @@ export function syncThreadToBackend(): void {
   const thread = getActiveThread();
   const openObjects = state.openTabs
     .map(toObjectRef)
-    .filter((item): item is OpenObjectRefDto => item !== null);
+    .filter((item): item is WorkspaceNavigationRef => item !== null);
   const activeTab = state.openTabs.find((t) => t.id === state.activeTabId);
   const activeObjectRef = activeTab ? toObjectRef(activeTab) : null;
   const isCurrent = captureThreadRequest(thread.id);
@@ -384,7 +444,7 @@ export function syncThreadToBackend(): void {
 
 export function openWorkbenchTab(
   tab: WorkbenchTab,
-  options: { activate?: boolean; force?: boolean; syncBackend?: boolean } = {},
+  options: { activate?: boolean; force?: boolean; syncBackend?: boolean; onActivated?: () => void } = {},
 ): boolean {
   const activate = options.activate ?? true;
   const existing = state.openTabs.find((t) => t.id === tab.id);
@@ -399,7 +459,7 @@ export function openWorkbenchTab(
       ...state,
       dirtyLeavePrompt: {
         tabId: state.activeTabId,
-        targetDescription: `切换到「${tab.title}」`,
+        targetDescription: `切换到「${workspaceTabLabel(tab)}」`,
         resolveAction: () => {
           openWorkbenchTab(tab, { ...options, force: true });
         },
@@ -425,7 +485,7 @@ export function openWorkbenchTab(
     ...t,
     openObjects: nextTabs
       .map(toObjectRef)
-      .filter((item): item is OpenObjectRefDto => item !== null),
+      .filter((item): item is WorkspaceNavigationRef => item !== null),
     activeObjectRef: activeTab ? toObjectRef(activeTab) : null,
   }));
 
@@ -434,18 +494,20 @@ export function openWorkbenchTab(
   if (options.syncBackend !== false) {
     syncThreadToBackend();
   }
+  if (activate) options.onActivated?.();
   return true;
 }
 
 export function selectWorkbenchTab(
   tabId: string,
-  options: { force?: boolean } = {},
+  options: { force?: boolean; onActivated?: () => void } = {},
 ): boolean {
   const target = state.openTabs.find((t) => t.id === tabId);
   if (!target) {
     return false;
   }
   if (tabId === state.activeTabId) {
+    options.onActivated?.();
     return true;
   }
   if (!options.force && !canLeaveTab(state.activeTabId)) {
@@ -453,9 +515,9 @@ export function selectWorkbenchTab(
       ...state,
       dirtyLeavePrompt: {
         tabId: state.activeTabId,
-        targetDescription: `切换到「${target.title}」`,
+        targetDescription: `切换到「${workspaceTabLabel(target)}」`,
         resolveAction: () => {
-          selectWorkbenchTab(tabId, { force: true });
+          selectWorkbenchTab(tabId, { ...options, force: true });
         },
       },
     };
@@ -470,6 +532,7 @@ export function selectWorkbenchTab(
   syncTabsToUrl();
   emit();
   syncThreadToBackend();
+  options.onActivated?.();
   return true;
 }
 
@@ -486,7 +549,7 @@ export function closeWorkbenchTab(
       ...state,
       dirtyLeavePrompt: {
         tabId,
-        targetDescription: `关闭「${target.title}」`,
+        targetDescription: `关闭「${workspaceTabLabel(target)}」`,
         resolveAction: () => {
           closeWorkbenchTab(tabId, { force: true });
         },
@@ -510,6 +573,7 @@ export function closeWorkbenchTab(
     openTabs: remaining,
     activeTabId: nextActiveId,
     dirtyByTabId: nextDirty,
+    draftInputsByThread: draftsWithoutTab(tabId),
   };
 
   const activeTab = remaining.find((t) => t.id === nextActiveId);
@@ -517,7 +581,7 @@ export function closeWorkbenchTab(
     ...t,
     openObjects: remaining
       .map(toObjectRef)
-      .filter((item): item is OpenObjectRefDto => item !== null),
+      .filter((item): item is WorkspaceNavigationRef => item !== null),
     activeObjectRef: activeTab ? toObjectRef(activeTab) : null,
   }));
 
@@ -529,7 +593,7 @@ export function closeWorkbenchTab(
 
 export function upsertArtifact(
   artifact: WorkspaceArtifactDto,
-  options: { openTab?: boolean; aiFieldDiffs?: AiFieldModification[] } = {},
+  options: { openTab?: boolean; aiFieldDiffs?: AiFieldModification[]; verifiedRead?: ArtifactReadStamp } = {},
 ): void {
   const nextArtifacts = {
     ...state.artifactsById,
@@ -548,11 +612,15 @@ export function upsertArtifact(
     };
   }
 
-  state = {
-    ...state,
-    artifactsById: nextArtifacts,
-    aiModifiedFields: nextAiFields,
-  };
+  // Cache, push events and mutation receipts do not prove current read access.
+  const stamp = options.verifiedRead;
+  const verifiedArtifactIndex = stamp?.scope === getScopeVersion() && stamp.epoch === getCapabilityEpoch()
+    ? { ...stamp, summaries: { ...verifiedSummaries(state, stamp.scope, stamp.epoch), [artifact.id]: {
+        id: artifact.id, title: artifact.title, kind: artifact.kind, version: artifact.version, status: artifact.status,
+        lockedCount: artifact.locked_fields.length,
+      } } }
+    : state.verifiedArtifactIndex;
+  state = { ...state, artifactsById: nextArtifacts, aiModifiedFields: nextAiFields, verifiedArtifactIndex };
 
   if (options.openTab) {
     openWorkbenchTab({

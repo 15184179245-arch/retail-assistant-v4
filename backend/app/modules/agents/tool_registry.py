@@ -48,6 +48,8 @@ from backend.app.modules.identity.service import authorize_scope
 from backend.app.modules.tasks.repository import list_tasks_visible
 from backend.app.modules.tasks.service import create_task
 from backend.app.application import commit_guard
+from backend.app.modules.workspace import service as workspace_service
+from backend.app.modules.workspace.schemas import ArtifactCreateRequest, ArtifactPatchRequest, ArtifactRecord, ArtifactOpRecord
 from backend.app.application.dispatch import execute_agent_suggestion, read_agent_tasks_mine
 from backend.app.modules.identity.command_guard import lock_command_authority, check_command_authority, refresh_authority
 
@@ -79,6 +81,36 @@ class _Input(BaseModel):
 
 class ListMineInput(_Input):
     limit: int = Field(default=20, ge=1, le=20)
+
+
+class ArtifactReadInput(_Input):
+    artifact_id: str = Field(min_length=1, max_length=64)
+
+
+class ArtifactCreateInput(ArtifactCreateRequest):
+    pass
+
+
+class ArtifactReadOutput(BaseModel):
+    """Single-artifact read: the record page plus its operation history."""
+
+    model_config = ConfigDict(extra="forbid")
+    artifacts: list[ArtifactRecord]
+    ops: list[ArtifactOpRecord] = Field(default_factory=list)
+
+
+class ArtifactMutationOutput(BaseModel):
+    """Mutation receipt for model callers: record + lock-ceiling outcome."""
+
+    model_config = ConfigDict(extra="forbid")
+    artifact: ArtifactRecord
+    skipped_fields: list[str] = Field(default_factory=list)
+    pending_suggestions_count: int = 0
+    idempotent_replay: bool = False
+
+
+class ArtifactPatchInput(ArtifactPatchRequest):
+    artifact_id: str = Field(min_length=1, max_length=64)
 
 
 class SuggestReviewInput(_Input):
@@ -189,6 +221,13 @@ class ToolDefinition:
     extra_requester_permissions: tuple[str, ...] = ()
     input_sha256: str = ""
     output_sha256: str = ""
+    # Write tools default to a registry savepoint so output-contract validation
+    # and the tool audit stay atomic with the business write.  Tools whose
+    # service enforces its own physical-root create contract (workspace
+    # persistence.begin_create refuses SAVEPOINT callers) set savepoint=False;
+    # their mutation atomicity is owned by the service's nested savepoint,
+    # matching the workspace router's _run_write semantics.
+    savepoint: bool = True
 
     def __post_init__(self) -> None:
         if self.host_only and self.model_visible:
@@ -274,6 +313,49 @@ def _agent_scope(session: Session, requester: AuthenticatedSubject,
 # ---------------------------------------------------------------------------
 
 
+def _invoke_artifact_read(session: Session, requester: AuthenticatedSubject,
+                          agent: AuthenticatedSubject, payload: BaseModel,
+                          idempotency_key: str | None) -> ToolExecution:
+    detail = workspace_service.get_artifact_detail(session, requester, payload.artifact_id)
+    result = ArtifactReadOutput(artifacts=[detail.artifact], ops=detail.ops)
+    return ToolExecution(result=result)
+
+
+def _invoke_artifact_create(session: Session, requester: AuthenticatedSubject,
+                            agent: AuthenticatedSubject, payload: BaseModel,
+                            idempotency_key: str | None) -> ToolExecution:
+    key = scoped_task_tool_key(requester.subject_id, agent.subject_id,
+                               "artifact.create", "1", idempotency_key or str(uuid4()))
+    # Model callers act as agents: never inherit or claim human authority.
+    req = payload.model_copy(update={"actor_type": "agent"})
+    mutation = workspace_service.create_artifact(session, requester, req, header_idempotency_key=key)
+    result = ArtifactMutationOutput(
+        artifact=mutation.artifact,
+        skipped_fields=mutation.skipped_fields,
+        pending_suggestions_count=len(mutation.artifact.pending_suggestions),
+        idempotent_replay=mutation.idempotent_replay,
+    )
+    return ToolExecution(result=result, audit_key=key)
+
+
+def _invoke_artifact_patch(session: Session, requester: AuthenticatedSubject,
+                           agent: AuthenticatedSubject, payload: BaseModel,
+                           idempotency_key: str | None) -> ToolExecution:
+    key = scoped_task_tool_key(requester.subject_id, agent.subject_id,
+                               "artifact.patch", "1", idempotency_key or str(uuid4()))
+    # Model callers act as agents: never inherit or claim human authority,
+    # so human-locked fields are skipped and routed to suggestions.
+    req = payload.model_copy(update={"actor_type": "agent"})
+    mutation = workspace_service.patch_artifact(session, requester, payload.artifact_id, req, header_idempotency_key=key)
+    result = ArtifactMutationOutput(
+        artifact=mutation.artifact,
+        skipped_fields=mutation.skipped_fields,
+        pending_suggestions_count=len(mutation.artifact.pending_suggestions),
+        idempotent_replay=mutation.idempotent_replay,
+    )
+    return ToolExecution(result=result, audit_key=key)
+
+
 def _invoke_list_mine(session: Session, requester: AuthenticatedSubject,
                       agent: AuthenticatedSubject, payload: BaseModel,
                       idempotency_key: str | None) -> ToolExecution:
@@ -293,7 +375,7 @@ def _invoke_knowledge_search(session: Session, requester: AuthenticatedSubject,
     # exists -> new path" switch and no legacy fallback for the Pi path.
     profile = session.info.get('knowledge_projection_profile')
     prepared = session.info.get('p1c_prepared')
-    if profile in PI_PROFILES and prepared is not None:
+    if profile in PI_ALL_PROFILES and prepared is not None:
         from backend.app.modules.knowledge import p1c as knowledge_p1c
         from backend.app.modules.knowledge import projection as knowledge_projection
         try:
@@ -433,6 +515,9 @@ _HANDLERS: dict[str, Callable[..., ToolExecution]] = {
     "guanjia.observe_prices.v1": _invoke_guanjia_unbound,
     "guanjia.observe_stock.v1": _invoke_guanjia_unbound,
     "tasks.list_mine.v1": _invoke_list_mine,
+    "artifact.read.v1": _invoke_artifact_read,
+    "artifact.create.v1": _invoke_artifact_create,
+    "artifact.patch.v1": _invoke_artifact_patch,
     "knowledge.search.v1": _invoke_knowledge_search,
     "memory.search.v1": _invoke_memory_search,
     "memory.save.v1": _memory_writer('save'),
@@ -498,6 +583,39 @@ TOOLS = {
         idempotency="required", confirmation="reviewer_decides_later",
         input_model=SuggestReviewInput, output_model=SuggestReviewOutput,
         handler_id="tasks.suggest_review.v1", side_effect="business_write",
+    ),
+}
+
+# Workspace artifact tools (AGENT-02): the definitions are fixed by this same
+# single registry (no parallel registry exists), but they are NOT part of the
+# ordinary business catalog.  resolve_tool() never resolves them; without an
+# authenticated Work context they do not enter a Run's granted tools.  Only
+# workbench-profile paths with an explicitly selected artifact pair resolve
+# through the registry-resident group below.  Frozen authority contract: the
+# machine agent needs identity only (agent_permission None, same as the
+# structural runtime.tool_search); artifact authority flows through the
+# requester's explicit Work delegation plus the workspace kind permissions,
+# never through a standing machine-agent grant.
+WORKSPACE_TOOLS = {
+    ("artifact.read", "1"): ToolDefinition(
+        key="artifact.read", description="按 Artifact ID 读取当前工作区工件内容及操作历史。", version="1", requester_permission="agents.run",
+        agent_permission=None, mode="read", timeout_seconds=5,
+        idempotency="none", confirmation="none", input_model=ArtifactReadInput,
+        output_model=ArtifactReadOutput, handler_id="artifact.read.v1",
+    ),
+    ("artifact.create", "1"): ToolDefinition(
+        key="artifact.create", description="在指定线程内创建新工件，自动设置初始版本。", version="1", requester_permission="agents.run",
+        agent_permission=None, mode="write", timeout_seconds=5,
+        idempotency="required", confirmation="none", input_model=ArtifactCreateInput,
+        output_model=ArtifactMutationOutput, handler_id="artifact.create.v1", side_effect="business_write",
+        savepoint=False,
+    ),
+    ("artifact.patch", "1"): ToolDefinition(
+        key="artifact.patch", description="应用增量补丁至现有工件，需提供基准版本。", version="1", requester_permission="agents.run",
+        agent_permission=None, mode="write", timeout_seconds=5,
+        idempotency="required", confirmation="none", input_model=ArtifactPatchInput,
+        output_model=ArtifactMutationOutput, handler_id="artifact.patch.v1", side_effect="business_write",
+        savepoint=False,
     ),
 }
 
@@ -795,6 +913,40 @@ def _build_registry() -> dict[tuple[str, str], ToolDefinition]:
 
 CAPABILITY_REGISTRY = _build_registry()
 
+
+def _validate_workspace_group() -> None:
+    """Same structural invariants as _build_registry, for the workspace group.
+
+    The workspace artifact tools stay outside CAPABILITY_REGISTRY (the ordinary
+    business catalog) but must obey the identical identity/handler checks so a
+    typo can never ship silently behind the workbench profile.
+    """
+    for identity, definition in WORKSPACE_TOOLS.items():
+        if identity != (definition.key, definition.version):
+            raise RuntimeError(f"tool_registry_invalid:identity:{identity[0]}:{identity[1]}")
+        if definition.handler_id not in _HANDLERS:
+            raise RuntimeError(
+                f"tool_registry_handler_missing:{identity[0]}:{identity[1]}")
+
+
+_validate_workspace_group()
+
+
+def workspace_definition(tool_key: object, version: object) -> ToolDefinition:
+    """Resolve a fixed workspace artifact definition by exact identity.
+
+    This is definition lookup, never invocation authority: every caller must
+    have already authenticated a workbench Run binding whose explicit
+    tool_selection contains this pair.  resolve_tool() keeps raising
+    tool_not_registered for these keys on every other path.
+    """
+    if type(tool_key) is not str or type(version) is not str:
+        raise ToolRegistryError("tool_not_registered")
+    definition = WORKSPACE_TOOLS.get((tool_key, version))
+    if definition is None:
+        raise ToolRegistryError("tool_not_registered")
+    return definition
+
 # Runtime-only, per-store registrations created by tools.create_tool.  Keyed by
 # (store_id, tool_key, version) so the same key can exist in two stores without
 # sharing an implementation or a scope.
@@ -841,7 +993,13 @@ def toolset_manifest(descriptions: object, *, store_id: str | None = None) -> li
         if (tool_key, version) in seen:
             raise ToolRegistryError("tool_registry_duplicate")
         seen.add((tool_key, version))
-        definition = resolve_tool(tool_key, version, store_id=store_id)
+        if type(tool_key) is str and type(version) is str and (tool_key, version) in WORKSPACE_TOOLS:
+            # Fixed registry-resident workspace contract: manifest rows are
+            # descriptions of already-authorized pairs (workbench bindings
+            # only); resolve_tool keeps rejecting these keys elsewhere.
+            definition = workspace_definition(tool_key, version)
+        else:
+            definition = resolve_tool(tool_key, version, store_id=store_id)
         entries.append({
             "tool_key": tool_key,
             "version": version,
@@ -931,7 +1089,13 @@ def invoke_tool(session: Session, *, requester: AuthenticatedSubject,
     try:
         if legacy_code_tool(tool_key, version, store_id=requester.store_id):
             raise ToolRegistryError(sandbox_tool.LEGACY_CODE_DISABLED)
-        definition = resolve_tool(tool_key, version, store_id=requester.store_id)
+        if type(tool_key) is str and type(version) is str and (tool_key, version) in WORKSPACE_TOOLS:
+            # Delegated seam (AGENT-02): the fixed workspace contract is
+            # callable only through this gateway's requester/agent ACL
+            # ceiling; ordinary registry resolution keeps rejecting it.
+            definition = workspace_definition(tool_key, version)
+        else:
+            definition = resolve_tool(tool_key, version, store_id=requester.store_id)
         if definition.host_only:
             raise ToolRegistryError("tool_not_registered")
         epoch = None
@@ -981,7 +1145,10 @@ def invoke_tool(session: Session, *, requester: AuthenticatedSubject,
                     return NoEffectToolResult(dict(canonical_result.ERROR_PAYLOAD))
         # Include the output contract and tool audit in the write savepoint.
         # A Worker may catch this error and commit its failure control later.
-        with session.begin_nested() if definition.mode == "write" else nullcontext():
+        # savepoint=False write tools manage their own create atomicity at the
+        # physical root (workspace persistence contract); they run bare like
+        # the workspace router's _run_write path.
+        with session.begin_nested() if definition.mode == "write" and definition.savepoint else nullcontext():
             execution = handler(session, requester, agent, payload, idempotency_key)
             if not isinstance(execution, ToolExecution):
                 raise ToolRegistryError("tool_registry_inconsistent")
@@ -1003,10 +1170,21 @@ def invoke_tool(session: Session, *, requester: AuthenticatedSubject,
                                                     epoch=epoch, now=instant)
                         _person_scope(db, requester, now=instant)
                         _agent_scope(db, requester, agent, definition.agent_permission, now=instant)
-                    except HTTPException as error:
-                        raise ToolRegistryError("tool_requester_permission_denied") from error
+                    except (HTTPException, ToolRegistryError):
+                        # CommitGuard checks abort the transaction via CommitGuardError
+                        raise commit_guard.CommitGuardError("tool_requester_permission_denied")
                 commit_guard.enlist(session, action="agent_tool:" + definition.key, check=final)
         return result.model_dump(mode="json")
+    except workspace_service.WorkspaceError as exc:
+        # Workspace service enforces the requester's per-kind business ceiling
+        # (require_kind_permission) below the registry bar; surface its denials
+        # as canonical tool codes so model callers see the uniform contract.
+        code = ("tool_requester_permission_denied" if exc.status_code == 403 else
+                "tool_not_found" if exc.status_code == 404 else
+                "tool_state_conflict" if exc.status_code == 409 else
+                "tool_input_invalid" if exc.status_code == 422 else
+                "tool_execution_denied")
+        raise ToolRegistryError(code) from exc
     except (ToolRegistryError, HTTPException) as exc:
         code = (exc.code if isinstance(exc, ToolRegistryError) else
                 _TASK_ERROR_CODES.get(exc.detail, "tool_execution_denied")
@@ -1139,6 +1317,18 @@ PI_MEMORY_PROFILE = "pi-memory-v1"
 PI_DISCOVERY_PROFILE = discovery.PROFILE
 PI_SOURCE_PROFILE = discovery.SOURCE_PROFILE
 PI_PROFILES = frozenset((PI_READONLY_PROFILE, PI_MEMORY_PROFILE, PI_DISCOVERY_PROFILE, PI_SOURCE_PROFILE))
+# The workbench profile is a recognizable upper bound over the source policy
+# plus the workspace artifact tools; it never grants tools by default and is
+# always cropped by an explicit, persisted tool_selection (see
+# WORKBENCH-TOOLS-AUTHORITY-CONTRACT section 3). Old profiles keep their
+# exact frozen shape and gain no new binding field.
+PI_WORKBENCH_PROFILE = "pi-workbench-v1"
+PI_ALL_PROFILES = frozenset((*PI_PROFILES, PI_WORKBENCH_PROFILE))
+_PI_ARTIFACT_NAMES = MappingProxyType({
+    ("artifact.read", "1"): "v4_artifact_read_v1",
+    ("artifact.create", "1"): "v4_artifact_create_v1",
+    ("artifact.patch", "1"): "v4_artifact_patch_v1",
+})
 _PI_READONLY_NAMES = MappingProxyType({
     ("memory.search", "1"): "v4_memory_search_v1",
     ("tasks.list_mine", "1"): "v4_tasks_list_mine_v1",
@@ -1167,6 +1357,8 @@ _PI_CATEGORY_STATUS_NAMES = MappingProxyType({
     ('guanjia.category_products_status', '1'): 'v4_guanjia_category_products_status_v1'})
 _PI_SOURCE_HANDLERS = MappingProxyType({pair: _HANDLERS[f"{pair[0]}.v{pair[1]}"]
     for pair in (*_PI_SOURCE_NAMES, *_PI_CATEGORY_NAMES, *_PI_CATEGORY_STATUS_NAMES, *research_runtime.NAMES, *sales_ranking_runtime.NAMES, *sales_product_runtime.NAMES, *local_sales_runtime.NAMES)})
+_PI_ARTIFACT_HANDLERS = MappingProxyType({pair: _HANDLERS[f"{pair[0]}.v{pair[1]}"]
+    for pair in _PI_ARTIFACT_NAMES})
 
 def _pi_names(profile, category_source=None, category_products_contract=None, research_source=None, sales_source=None, sales_contract='1'):
     if sales_contract not in ('1', '2', '3') or sales_source is None and sales_contract != '1':
@@ -1174,16 +1366,16 @@ def _pi_names(profile, category_source=None, category_products_contract=None, re
     if sales_source is not None:
         try: (local_sales_runtime if sales_contract=='3' else sales_ranking_runtime).validate_source(sales_source)
         except (ValueError, TypeError, KeyError): raise ToolRegistryError('agent_pi_toolset_invalid') from None
-        if profile != PI_SOURCE_PROFILE: raise ToolRegistryError('agent_pi_toolset_invalid')
+        if profile not in (PI_SOURCE_PROFILE, PI_WORKBENCH_PROFILE): raise ToolRegistryError('agent_pi_toolset_invalid')
     if research_source is not None:
         from .research_host import validate_pin
         try: validate_pin(research_source)
         except (ValueError,TypeError,KeyError):raise ToolRegistryError('agent_pi_toolset_invalid') from None
-        if profile!=PI_SOURCE_PROFILE:raise ToolRegistryError('agent_pi_toolset_invalid')
+        if profile not in (PI_SOURCE_PROFILE, PI_WORKBENCH_PROFILE):raise ToolRegistryError('agent_pi_toolset_invalid')
     if category_products_contract is not None and (
             type(category_products_contract) is not str
             or category_products_contract != CATEGORY_STATUS_CONTRACT
-            or profile != PI_SOURCE_PROFILE or category_source is None):
+            or profile not in (PI_SOURCE_PROFILE, PI_WORKBENCH_PROFILE) or category_source is None):
         raise ToolRegistryError('agent_pi_toolset_invalid')
     if profile == PI_READONLY_PROFILE:
         return _PI_READONLY_NAMES
@@ -1210,6 +1402,20 @@ def _pi_names(profile, category_source=None, category_products_contract=None, re
         return {**_PI_SOURCE_NAMES, **(category_names if category_source is not None else {}),
                 **(research_names if research_source is not None else {}),
                 **((sales_product_runtime.NAMES if sales_contract == '2' else sales_ranking_runtime.NAMES) if sales_source is not None else {})}
+    if profile == PI_WORKBENCH_PROFILE:
+        if research_source is not None and 'trial_name' in research_source:
+            # An isolated research trial never gains workspace artifact
+            # tools, even when a workbench profile name is layered on top
+            # of its pinned isolation.
+            raise ToolRegistryError('agent_pi_toolset_invalid')
+        # Base policy is the source catalog (workbench requires every
+        # capability flag), first cropped by the original pins; the
+        # artifact tools extend the recognizable bound only. Binding-time
+        # tool_selection crops this again to the configured upper bound.
+        return {**_pi_names(PI_SOURCE_PROFILE, category_source,
+                            category_products_contract, research_source,
+                            sales_source, sales_contract),
+                **_PI_ARTIFACT_NAMES}
     raise ToolRegistryError('agent_pi_profile_invalid')
 
 
@@ -1230,21 +1436,25 @@ def _pi_json(value: object) -> str:
         raise ToolRegistryError("agent_pi_toolset_invalid") from None
 
 
-def _pi_definition(key: str, version: str, *, profile=PI_READONLY_PROFILE, category_source=None) -> ToolDefinition:
+def _pi_definition(key: str, version: str, *, profile=PI_READONLY_PROFILE) -> ToolDefinition:
     # Resolve a fixed definition, not invocation authority. The executor first
     # checks exact membership in the already verified Run binding. Old bindings
-    # cannot acquire category names through this identity-only helper.
-    names = ({**_PI_SOURCE_NAMES, **_PI_CATEGORY_NAMES, **_PI_CATEGORY_STATUS_NAMES, **research_runtime.NAMES, **sales_ranking_runtime.NAMES, **sales_product_runtime.NAMES, **local_sales_runtime.NAMES} if profile == PI_SOURCE_PROFILE
-             else _pi_names(profile, category_source))
-    memory_write = profile in (PI_MEMORY_PROFILE, PI_DISCOVERY_PROFILE, PI_SOURCE_PROFILE) and key in ("memory.save", "memory.correct", "memory.withdraw")
+    # cannot acquire source tools through this identity-only helper.
+    if profile not in PI_ALL_PROFILES:
+        raise ToolRegistryError('agent_pi_profile_invalid')
+    memory_write = (profile in (PI_MEMORY_PROFILE, PI_DISCOVERY_PROFILE, PI_SOURCE_PROFILE, PI_WORKBENCH_PROFILE) and key in ("memory.save", "memory.correct", "memory.withdraw")) or (profile == PI_WORKBENCH_PROFILE and key in ("artifact.create", "artifact.patch"))
     handlers = (_PI_SOURCE_HANDLERS if profile == PI_SOURCE_PROFILE else
+                {**_PI_SOURCE_HANDLERS, **_PI_ARTIFACT_HANDLERS} if profile == PI_WORKBENCH_PROFILE else
                 _PI_DISCOVERY_HANDLERS if profile == PI_DISCOVERY_PROFILE else
                 _PI_MEMORY_HANDLERS if profile == PI_MEMORY_PROFILE else _PI_READONLY_HANDLERS)
-    metadata = profile in (PI_DISCOVERY_PROFILE, PI_SOURCE_PROFILE) and key == discovery.KEY
-    source = profile == PI_SOURCE_PROFILE and ((key, version) in GUANJIA_SOURCE_TOOLS or (key, version) in GUANJIA_CATEGORY_TOOLS or (key, version) in RESEARCH_TOOLS or (key, version) in GUANJIA_SALES_TOOLS)
-    if (key, version) not in names:
+    metadata = profile in (PI_DISCOVERY_PROFILE, PI_SOURCE_PROFILE, PI_WORKBENCH_PROFILE) and key == discovery.KEY
+    source = profile in (PI_SOURCE_PROFILE, PI_WORKBENCH_PROFILE) and ((key, version) in GUANJIA_SOURCE_TOOLS or (key, version) in GUANJIA_CATEGORY_TOOLS or (key, version) in RESEARCH_TOOLS or (key, version) in GUANJIA_SALES_TOOLS)
+    if (key, version) not in handlers:
         raise ToolRegistryError("agent_pi_tool_not_allowed")
-    definition = resolve_tool(key, version)
+    if profile == PI_WORKBENCH_PROFILE and (key, version) in WORKSPACE_TOOLS:
+        definition = workspace_definition(key, version)
+    else:
+        definition = resolve_tool(key, version)
     if (definition.mode != ("write" if memory_write else "read")
             or definition.side_effect != ("business_write" if memory_write else "read_only")
             or definition.idempotency != ("required" if memory_write else "none")
@@ -1274,17 +1484,31 @@ def _pi_binding_shape(binding: object, *, profile=PI_READONLY_PROFILE) -> dict:
             validate_pin(category_source)
         except (ValueError,TypeError,KeyError):
             raise ToolRegistryError('agent_pi_toolset_invalid') from None
-        if profile != PI_SOURCE_PROFILE:
+        if profile not in (PI_SOURCE_PROFILE, PI_WORKBENCH_PROFILE):
             raise ToolRegistryError('agent_pi_toolset_invalid')
     sales_contract = binding.get('sales_contract', '1') if type(binding) is dict else '1'
     if type(binding) is dict and 'sales_contract' in binding and sales_contract not in ('2','3'):
         raise ToolRegistryError('agent_pi_toolset_invalid')
     names = _pi_names(profile, category_source, category_products_contract, research_source, sales_source, sales_contract)
+    tool_selection = binding.get('tool_selection') if type(binding) is dict else None
+    if profile == PI_WORKBENCH_PROFILE:
+        if (type(tool_selection) is not list or not tool_selection
+                or any(type(item) is not dict or set(item) != {"tool_key", "version"}
+                       or type(item.get("tool_key")) is not str or type(item.get("version")) is not str
+                       for item in tool_selection)):
+            raise ToolRegistryError('agent_pi_toolset_invalid')
+        selection_pairs = [(item["tool_key"], item["version"]) for item in tool_selection]
+        if (sorted(set(selection_pairs)) != selection_pairs
+                or not set(selection_pairs) <= set(names)):
+            raise ToolRegistryError('agent_pi_toolset_invalid')
+    elif tool_selection is not None:
+        raise ToolRegistryError('agent_pi_toolset_invalid')
     fields = (_PI_BINDING_FIELDS | ({'category_source'} if category_source is not None else set())
               | ({'category_products_contract'} if category_products_contract is not None else set())
               | ({'research_source'} if research_source is not None else set())
               | ({'sales_source'} if sales_source is not None else set())
-              | ({'sales_contract'} if sales_contract in ('2','3') else set()))
+              | ({'sales_contract'} if sales_contract in ('2','3') else set())
+              | ({'tool_selection'} if profile == PI_WORKBENCH_PROFILE else set()))
     if (type(binding) is not dict or set(binding) != fields
             or binding.get("profile") != profile
             or any(type(binding.get(k)) is not str or not binding[k]
@@ -1307,13 +1531,15 @@ def _pi_binding_shape(binding: object, *, profile=PI_READONLY_PROFILE) -> dict:
             raise ToolRegistryError("agent_pi_toolset_invalid")
         pair = item["tool_key"], item["version"]
         if (pair in seen or pair not in names
+                or (profile == PI_WORKBENCH_PROFILE and pair not in selection_pairs
+                    and pair != (discovery.KEY, "1"))
                 or item["name"] != names[pair]
                 or type(item["description"]) is not str
                 or type(item["input_schema"]) is not dict
                 or type(item["contract"]) is not dict):
             raise ToolRegistryError("agent_pi_toolset_invalid")
         seen.add(pair)
-        definition = _pi_definition(*pair, profile=profile, category_source=category_source)
+        definition = _pi_definition(*pair, profile=profile)
         expected = {"name": names[pair], "tool_key": pair[0],
             "version": pair[1], "description": definition.description,
             "input_schema": definition.input_model.model_json_schema(),
@@ -1330,17 +1556,78 @@ def pi_binding_digest(binding: object) -> str:
     return "sha256:" + sha256(_pi_json(_pi_binding_shape(binding, profile=_binding_profile(binding))).encode("utf-8")).hexdigest()
 
 
+def _workbench_artifact_pairs(session: Session, requester: AuthenticatedSubject, *, now=None) -> frozenset:
+    """Artifact pairs admitted by the requester's current Work delegation.
+
+    Frozen authority rule: a workbench artifact tool enters a Run's frozen
+    binding only when the delegated requester's Work carries an explicit
+    workspace context whose kinds/ops the current principal still holds the
+    kind permissions for (create/patch additionally require the selected
+    read delegation).  Standing personal or machine grants never substitute
+    for the Work resource delegation; Works without a context admit none.
+    """
+    from backend.app.modules.assistant.authority import _models
+    from backend.app.modules.assistant.principal import WorkPrincipal, projection_permissions
+    from backend.app.modules.assistant.workspace_binding import root_context
+    from backend.app.modules.workspace.service import _KIND_PERMISSION_MAP
+    if type(requester) is not WorkPrincipal or requester.kind not in ('work', 'turn'):
+        return frozenset()
+    work = session.get(_models(requester.kind)[0], requester.work_id, populate_existing=True)
+    if work is None:
+        return frozenset()
+    context = root_context(session, work, kind=requester.kind)
+    if context is None:
+        return frozenset()
+    held = projection_permissions(session, requester, now=now)
+    allowed = set()
+    for artifact in context.get('artifacts') or ():
+        if type(artifact) is not dict:
+            continue
+        permissions = _KIND_PERMISSION_MAP.get(artifact.get('kind'))
+        operations = artifact.get('operations')
+        if permissions is None or type(operations) is not list:
+            continue
+        read_ok = ('read' in operations
+                   and any(permission in held for permission in permissions['read']))
+        if not read_ok:
+            continue
+        allowed.add(("artifact.read", "1"))
+        write_ok = any(permission in held for permission in permissions['write'])
+        if write_ok and 'create' in operations:
+            allowed.add(("artifact.create", "1"))
+        if write_ok and 'patch' in operations:
+            allowed.add(("artifact.patch", "1"))
+    return frozenset(allowed)
+
+
 def freeze_pi_binding(session: Session, requester: AuthenticatedSubject,
                                agent: AuthenticatedSubject, *, run_id: str,
                                now=None, profile=PI_READONLY_PROFILE, category_source=None,
-                               category_products_contract=None, research_source=None, sales_source=None, sales_contract='2') -> dict:
+                               category_products_contract=None, research_source=None, sales_source=None, sales_contract='2',
+                               tool_selection=None) -> dict:
     """Build a new Run's finite allowlist under current double authorization.
 
     The caller owns initial Run persistence. This function never repins a Run,
     changes permissions, dispatches a tool or commits a transaction.
+    Workbench runs additionally require an explicit tool_selection (the
+    configured upper bound); omission must never default to all tools.
     """
     sales_contract = sales_contract if sales_source is not None else '1'
     names = _pi_names(profile, category_source, category_products_contract, research_source, sales_source, sales_contract)
+    if profile == PI_WORKBENCH_PROFILE:
+        if (type(tool_selection) is not list or not tool_selection
+                or any(type(item) is not dict or set(item) != {"tool_key", "version"}
+                       or type(item.get("tool_key")) is not str or type(item.get("version")) is not str
+                       for item in tool_selection)):
+            raise ToolRegistryError("agent_pi_toolset_invalid")
+        selection_pairs = [(item["tool_key"], item["version"]) for item in tool_selection]
+        if (sorted(set(selection_pairs)) != selection_pairs
+                or not set(selection_pairs) <= set(names)):
+            raise ToolRegistryError("agent_pi_toolset_invalid")
+        tool_selection = [{"tool_key": key, "version": version}
+                          for key, version in sorted(set(selection_pairs))]
+    elif tool_selection is not None:
+        raise ToolRegistryError("agent_pi_toolset_invalid")
     with session.no_autoflush:
         _person_scope(session, requester, now=now)
         if (requester.organization_id, requester.store_id) != (
@@ -1362,9 +1649,9 @@ def freeze_pi_binding(session: Session, requester: AuthenticatedSubject,
             raise ToolRegistryError("agent_pi_toolset_invalid") from None
         descriptions = model_tool_descriptions(session, requester, agent, now=now)
         ordinary_pin = toolset_digest(descriptions, store_id=requester.store_id)
-        if profile in (PI_DISCOVERY_PROFILE, PI_SOURCE_PROFILE):
+        if profile in (PI_DISCOVERY_PROFILE, PI_SOURCE_PROFILE, PI_WORKBENCH_PROFILE):
             descriptions = descriptions + [{"tool_key": discovery.KEY, "version": "1"}]
-        if profile == PI_SOURCE_PROFILE:
+        if profile in (PI_SOURCE_PROFILE, PI_WORKBENCH_PROFILE):
             descriptions = descriptions + [{"tool_key": key, "version": version} for key, version in GUANJIA_SOURCE_TOOLS]
             if research_source is not None:
                 descriptions += [{'tool_key':key,'version':version} for key,version in RESEARCH_TOOLS]
@@ -1374,12 +1661,35 @@ def freeze_pi_binding(session: Session, requester: AuthenticatedSubject,
                 (local_sales_runtime if sales_contract=='3' else sales_ranking_runtime).validate_source(sales_source, {'organization_id':requester.organization_id,
                     'store_id':requester.store_id,'requester_id':requester.subject_id,'agent_id':agent.subject_id}, now=now)
                 descriptions += [{'tool_key':sales_ranking_runtime.KEY,'version':sales_contract}]
+        if profile == PI_WORKBENCH_PROFILE:
+            # Artifact tools are ordinary registry tools and may already be
+            # present in the model-visible descriptions when both ACLs
+            # grant them; never append a duplicate entry.
+            present = {(item["tool_key"], item["version"]) for item in descriptions}
+            descriptions += [{"tool_key": key, "version": version}
+                             for key, version in _PI_ARTIFACT_NAMES
+                             if (key, version) not in present]
+            # Artifact pairs additionally require the requester's explicit
+            # Work delegation (thread binding + workspace kinds/ops with
+            # currently held kind permissions), never a standing grant.
+            artifact_pairs = _workbench_artifact_pairs(session, requester, now=now)
+            selected_pairs = {(entry["tool_key"], entry["version"]) for entry in tool_selection}
         entries = []
         for item in descriptions:
             pair = item["tool_key"], item["version"]
             if pair not in names:
                 continue
-            definition = _pi_definition(*pair, profile=profile, category_source=category_source)
+            if profile == PI_WORKBENCH_PROFILE:
+                if pair == (discovery.KEY, "1"):
+                    # Structural discovery machinery of the profile itself,
+                    # not a business tool inside the selection upper bound;
+                    # the child runtime requires it in the frozen manifest.
+                    pass
+                elif pair not in selected_pairs:
+                    continue
+                elif pair in WORKSPACE_TOOLS and pair not in artifact_pairs:
+                    continue
+            definition = _pi_definition(*pair, profile=profile)
             try:
                 authorize_scope(session, requester,
                     organization_id=requester.organization_id, store_id=requester.store_id,
@@ -1414,6 +1724,8 @@ def freeze_pi_binding(session: Session, requester: AuthenticatedSubject,
             binding['category_source'] = category_source
         if category_products_contract is not None:
             binding['category_products_contract'] = category_products_contract
+        if profile == PI_WORKBENCH_PROFILE:
+            binding['tool_selection'] = tool_selection
         return json.loads(_pi_json(_pi_binding_shape(binding, profile=profile)))
 
 
@@ -1428,7 +1740,8 @@ def verify_pi_binding(session: Session, requester: AuthenticatedSubject,
             or not hmac.compare_digest(pi_binding_digest(frozen), expected_digest)):
         raise ToolRegistryError("agent_worker_toolset_changed")
     current = freeze_pi_binding(session, requester, agent, run_id=run_id, now=now, profile=profile,
-        category_source=frozen.get('category_source'), category_products_contract=frozen.get('category_products_contract'), research_source=frozen.get('research_source'), sales_source=frozen.get('sales_source'), sales_contract=frozen.get('sales_contract', '1'))
+        category_source=frozen.get('category_source'), category_products_contract=frozen.get('category_products_contract'), research_source=frozen.get('research_source'), sales_source=frozen.get('sales_source'), sales_contract=frozen.get('sales_contract', '1'),
+        tool_selection=frozen.get('tool_selection'))
     if not hmac.compare_digest(_pi_json(current).encode(), _pi_json(frozen).encode()):
         raise ToolRegistryError("agent_worker_toolset_changed")
     return [{"tool_key": e["tool_key"], "version": e["version"],
@@ -1457,8 +1770,11 @@ def pi_pair(binding: object, name: object, version: object) -> tuple[str, str]:
 
 
 def _binding_profile(binding):
-    if type(binding) is not dict or type(binding.get('profile')) is not str or binding['profile'] not in PI_PROFILES:
-        raise ToolRegistryError('agent_pi_profile_invalid')
+    # A persisted binding is untrusted run data: any structural malformation
+    # is a corrupted toolset pin and must fail closed as toolset-invalid,
+    # never re-classified as a profile selection or fall back to another set.
+    if type(binding) is not dict or type(binding.get('profile')) is not str or binding['profile'] not in PI_ALL_PROFILES:
+        raise ToolRegistryError('agent_pi_toolset_invalid')
     return binding['profile']
 
 

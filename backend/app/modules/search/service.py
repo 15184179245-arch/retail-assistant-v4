@@ -109,7 +109,6 @@ def _search_products(session: Session, *, organization_id: str, store_id: str,
     truncated = len(exact_rows) > MAX_EXACT
     source_exact: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
-    exact_barcode_products: set[str] = set()
     for product, snapshot in exact_rows:
         if product.external_code == raw_query and (product.id, "code") not in seen:
             source_exact.append(_match(product, snapshot, field="code",
@@ -120,7 +119,6 @@ def _search_products(session: Session, *, organization_id: str, store_id: str,
             source_exact.append(_match(product, snapshot, field="barcode",
                                        match_type="exact_barcode", original=raw_query))
             seen.add((product.id, "barcode"))
-            exact_barcode_products.add(product.id)
     if source_exact:
         return finish_exact(source_exact, "精确命中。", truncated=truncated)
 
@@ -160,11 +158,12 @@ def _search_products(session: Session, *, organization_id: str, store_id: str,
             if product.id in seen_products:
                 continue
             barcode = (snapshot.payload or {}).get("barCode")
-            if normalize_barcode_candidate(barcode) != normalized_query:
+            normalized_barcode = normalize_barcode_candidate(barcode)
+            if normalized_barcode != normalized_query:
                 continue
             candidates.append(_match(product, snapshot, field="barcode",
                                      match_type="normalized_barcode", original=barcode,
-                                     normalized=normalize_barcode_candidate(barcode)))
+                                     normalized=normalized_barcode))
             seen_products.add(product.id)
     if candidates:
         base["candidate_total"] = len(candidates)

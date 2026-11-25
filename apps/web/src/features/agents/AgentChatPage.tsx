@@ -391,9 +391,10 @@ export function AgentChatPage({
     } catch (caught) { report(caught, ticket); }
     finally { finish(ticket); }
   }
-  async function decide(decision: "approve" | "reject"): Promise<void> {
-    if (!visibleRun?.pending_action || !allowsHumanDecision(visibleRun) || busyRef.current) return;
-    await command(visibleRun.run_id, "confirmation", buildDecisionRequest(visibleRun.pending_action, decision));
+  async function decide(run: AgentRunReceipt, decision: "approve" | "reject"): Promise<void> {
+    // The clicked card owns the reviewed digest/versions, not the latest transcript Run.
+    if (!run.pending_action || !allowsHumanDecision(run) || busyRef.current) return;
+    await command(run.run_id, "confirmation", buildDecisionRequest(run.pending_action, decision));
   }
   async function stop(): Promise<void> {
     const id = activeRunId ?? visibleRun?.run_id;
@@ -455,7 +456,7 @@ export function AgentChatPage({
           </div>
         ) : (
           <RunCard key={`r${entry.key}`} run={entry.run} pending={pending}
-            onDecision={(decision) => void decide(decision)} commandsEnabled={commandsEnabled} />
+            onDecision={(decision) => void decide(entry.run, decision)} commandsEnabled={commandsEnabled} />
         ))}
 
         {pending ? (

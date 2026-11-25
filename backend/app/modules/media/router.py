@@ -105,9 +105,9 @@ def content_route(
 ) -> Response:
     try:
         asset, _ = service.get_asset(session, actor, asset_id)
-        path = service.content_path(asset)
+        data = service.content_bytes(asset)
     except service.MediaError as error:
         raise _http(error) from error
     encoded = quote(asset.original_name, safe="")
-    return Response(content=path.read_bytes(), media_type=asset.content_type,
+    return Response(content=data, media_type=asset.content_type,
                     headers={"Content-Disposition": f"inline; filename*=UTF-8''{encoded}"})

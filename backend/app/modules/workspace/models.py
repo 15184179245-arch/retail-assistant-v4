@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -83,6 +84,10 @@ class WorkspaceArtifactOp(Base):
             "idempotency_key",
             name="uq_workspace_artifact_ops_idem",
         ),
+        Index("uq_workspace_create_actor_key", "organization_id", "store_id",
+            "actor_subject_id", "idempotency_key", unique=True,
+            sqlite_where=text("op_type = 'create' AND idempotency_key IS NOT NULL AND idempotency_key <> ''"),
+            postgresql_where=text("op_type = 'create' AND idempotency_key IS NOT NULL AND idempotency_key <> ''")),
         ForeignKeyConstraint(
             ["organization_id", "store_id", "artifact_id"],
             [

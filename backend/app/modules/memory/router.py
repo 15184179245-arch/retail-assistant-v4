@@ -1,3 +1,5 @@
+from datetime import datetime
+import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -36,18 +38,36 @@ def _http(error: service.MemoryError) -> HTTPException:
     return HTTPException(status_code=status, detail=error.code)
 
 
+_EXPIRY_OFFSET = re.compile(
+    r"(?P<hour>[0-9]{2})(?:(?P<separator>:?)(?P<minute>[0-9]{2})"
+    r"(?:(?P=separator)(?P<second>[0-9]{2}))?)?(?=[.,]|\Z)"
+)
+
+
+def _parse_expiry(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    wire = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(wire)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="memory_expiry_invalid")
+    if parsed.utcoffset() is not None:
+        # Inspect only the offset of a recognized aware value, without reinterpreting it.
+        start = max(wire.rfind("+"), wire.rfind("-")) + 1
+        offset = _EXPIRY_OFFSET.match(wire, start) if start else None
+        if (offset is None or int(offset["hour"]) > 23
+                or int(offset["minute"] or 0) > 59 or int(offset["second"] or 0) > 59):
+            raise HTTPException(status_code=400, detail="memory_expiry_invalid")
+    return parsed
+
+
 @router.post("", response_model=MemoryEnvelope, status_code=201)
 def save_route(payload: MemoryCreate,
                actor: Annotated[AuthenticatedSubject, Depends(require_authenticated_subject)],
                session: Annotated[Session, Depends(get_session)],
                idempotency_key: Annotated[str, Depends(require_idempotency_key)]) -> MemoryEnvelope:
-    from datetime import datetime
-    expires = None
-    if payload.expires_at is not None:
-        try:
-            expires = datetime.fromisoformat(payload.expires_at.replace("Z", "+00:00"))
-        except ValueError:
-            raise HTTPException(status_code=400, detail="memory_expiry_invalid")
+    expires = _parse_expiry(payload.expires_at)
     try:
         result = service.save_memory(session, actor, content=payload.content,
                                      purpose=payload.purpose, persist=payload.persist,
@@ -141,13 +161,7 @@ def correct_route(memory_id: str, payload: MemoryCorrect,
                   actor: Annotated[AuthenticatedSubject, Depends(require_authenticated_subject)],
                   session: Annotated[Session, Depends(get_session)],
                   idempotency_key: Annotated[str, Depends(require_idempotency_key)]) -> MemoryEnvelope:
-    from datetime import datetime
-    expires = None
-    if payload.expires_at is not None:
-        try:
-            expires = datetime.fromisoformat(payload.expires_at.replace("Z", "+00:00"))
-        except ValueError:
-            raise HTTPException(status_code=400, detail="memory_expiry_invalid")
+    expires = _parse_expiry(payload.expires_at)
     try:
         item = service.correct_memory(session, actor, memory_id, content=payload.content,
                                       expected_version=payload.expected_version,

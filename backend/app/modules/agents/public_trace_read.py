@@ -36,9 +36,13 @@ def _value(fields, key):
     return node["value"]
 
 def _tool_permission(session, actor, agent, key, version):
-    definition = tool_registry.resolve_tool(key, version)
+    if type(key) is str and type(version) is str and (key, version) in tool_registry.WORKSPACE_TOOLS:
+        definition = tool_registry.workspace_definition(key, version)
+    else:
+        definition = tool_registry.resolve_tool(key, version)
     tool_registry._agent_scope(session, actor, agent, definition.agent_permission)
-    _permission(session, actor, definition.requester_permission)
+    for permission in (definition.requester_permission, *definition.extra_requester_permissions):
+        _permission(session, actor, permission)
 
 def _allowed(session, actor, run, control, native, records):
     frozen = control.frozen_context["pi_readonly_binding"]

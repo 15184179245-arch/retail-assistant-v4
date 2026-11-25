@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 PROFILE = 'pi-discovery-v1'
 SOURCE_PROFILE = 'pi-source-v1'
+WORKBENCH_PROFILE = 'pi-workbench-v1'
 NAME = 'tool_search'
 KEY = 'runtime.tool_search'
 EVENTS = 'pi_discovery_events'
@@ -36,7 +37,10 @@ def _digest(value):
 
 
 def enabled(ctx):
-    return ctx.execution.frozen_context['pi_readonly_binding']['profile'] in (PROFILE, SOURCE_PROFILE)
+    # The workbench profile carries every capability flag (memory, discovery,
+    # source, workbench); its artifact tools load exclusively through this
+    # same metadata-only discovery machinery as the discovery/source profiles.
+    return ctx.execution.frozen_context['pi_readonly_binding']['profile'] in (PROFILE, SOURCE_PROFILE, WORKBENCH_PROFILE)
 
 
 def _deny():

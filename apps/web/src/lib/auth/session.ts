@@ -1,10 +1,10 @@
+import { clearDraftCheckpoint, reconcileDraftCheckpointScope } from './assistantDraftCheckpoint';
 import { ApiError, apiRequest } from "../api/client";
 import type { RequestOptions } from "../api/client";
 import { clearQueryCache } from "../api/query";
 import { closeAllWorkspaceStreams } from "../api/workspace";
 import { bindWorkspaceSubject, resetWorkspaceStore } from "../../workspace/store";
 import {
-  ALL_KNOWN_CAPABILITIES,
   clearCapabilities,
   setCapabilities,
 } from "./capabilities";
@@ -68,6 +68,7 @@ function abortInflight(): void {
 
 export function setSession(next: Session): void {
   const switching = Boolean(current);
+  reconcileDraftCheckpointScope(next);
   if (switching) {
     // Switching identity must not let the previous request scope, cache, tabs, or SSE streams survive.
     abortInflight();
@@ -82,12 +83,13 @@ export function setSession(next: Session): void {
   if (next.capabilities) {
     setCapabilities(next.capabilities);
   } else {
-    setCapabilities(ALL_KNOWN_CAPABILITIES, "v0-bootstrap");
+    clearCapabilities();
   }
   emit();
 }
 
 export function clearSession(): void {
+  clearDraftCheckpoint();
   abortInflight();
   current = null;
   scopeVersion += 1;
@@ -112,14 +114,18 @@ export interface ScopedRequest {
   isCurrent: () => boolean;
 }
 
-export function beginScopedRequest(): ScopedRequest {
+export function beginScopedRequest(signal?: AbortSignal): ScopedRequest {
   const controller = new AbortController();
+  const abortExternal = () => controller.abort(signal?.reason);
+  if (signal?.aborted) abortExternal();
+  else signal?.addEventListener("abort", abortExternal, { once: true });
   inflight.add(controller);
   const version = scopeVersion;
   return {
     signal: controller.signal,
     version,
     finish: () => {
+      signal?.removeEventListener("abort", abortExternal);
       inflight.delete(controller);
     },
     isCurrent: () => version === scopeVersion,
@@ -136,7 +142,7 @@ export function authorizedRequest<T>(
   options: Omit<RequestOptions, "token" | "onUnauthorized"> = {},
 ): Promise<T> {
   const session = getSession();
-  const scoped = beginScopedRequest();
+  const scoped = beginScopedRequest(options.signal);
   let invalidatedByThisRequest = false;
   return apiRequest<T>(path, {
     ...options,

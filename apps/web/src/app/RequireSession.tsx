@@ -13,16 +13,18 @@ export function RequireSession({ session, currentPath, children }: RequireSessio
   const searchParams = useSearchParams();
   if (!session) {
     const redirectParam = searchParams.get("redirect");
+    // A direct link is already at its destination. Do not rewrite its search
+    // (workspace tabs and other route state) after the session becomes available.
     const target = isSafeInternalPath(redirectParam)
       ? redirectParam!
       : isSafeInternalPath(currentPath) && currentPath !== "/login"
-        ? currentPath
+        ? null
         : "/";
 
     return (
       <LoginPage
         onLoggedIn={() => {
-          navigate(target, { replace: true });
+          if (target !== null) navigate(target, { replace: true });
         }}
       />
     );

@@ -96,18 +96,18 @@ class HttpApiClient(
         } catch (error: IOException) {
             return networkFailure()
         }
-        return when {
-            response.status == 401 -> unauthorized(response.body)
-            else -> {
-                val envelope = envelope(response.body)
-                if (envelope == null) return invalidEnvelope()
-                val success = envelope["success"] as? Boolean ?: return invalidEnvelope()
-                val data = envelope["data"] as? Map<*, *>
-                if (response.status !in 200..299 || !success) return businessFailure(response.status, envelope, data)
-                val login = data.toLoginData() ?: return invalidEnvelope()
-                ApiResult.Success(login)
-            }
-        }
+        if (response.status == 401) return unauthorized(response.body)
+        val strict = if (response.status == 200) readLoginSuccessJson(response.body) else null
+        val envelope = strict ?: envelope(response.body) ?: return invalidEnvelope()
+        val success = envelope["success"] as? Boolean ?: return invalidEnvelope()
+        if (response.status !in 200..299 || !success) return businessFailure(response.status, envelope)
+        // The compatibility parser may explain a business failure, but cannot
+        // authenticate. Success must have consumed one complete strict JSON object.
+        if (strict == null || envelope.keys != REQUIRED_FIELDS || envelope["code"] != "OK" ||
+            envelope["error"] != null || envelope["user_message"] !is String ||
+            (envelope["hint"] != null && envelope["hint"] !is String)) return invalidEnvelope()
+        val login = (envelope["data"] as? Map<*, *>)?.toLoginData() ?: return invalidEnvelope()
+        return ApiResult.Success(login)
     }
 
     override fun logout(token: String): ApiResult<Unit> {
@@ -118,7 +118,7 @@ class HttpApiClient(
         }
         if (response.status == 401) return unauthorized(response.body)
         val envelope = envelope(response.body) ?: return invalidEnvelope()
-        if (response.status !in 200..299 || envelope["success"] != true) return businessFailure(response.status, envelope, null)
+        if (response.status !in 200..299 || envelope["success"] != true) return businessFailure(response.status, envelope)
         return ApiResult.Success(Unit)
     }
 
@@ -133,7 +133,7 @@ class HttpApiClient(
         val envelope = envelope(response.body) ?: return ApiResult.Failure(
             response.status, "INVALID_ENVELOPE", "服务端返回格式异常，请核对原运行。", null)
         if (response.status !in 200..299 || envelope["success"] != true)
-            return businessFailure(response.status, envelope, null)
+            return businessFailure(response.status, envelope)
         val data = envelope["data"] as? Map<String, Any?> ?: return invalidEnvelope()
         return ApiResult.Success(data)
     }
@@ -143,8 +143,7 @@ class HttpApiClient(
         return parsed.takeIf { REQUIRED_FIELDS.all(it::containsKey) }
     }
 
-    private fun businessFailure(status: Int, envelope: Map<String, Any?>,
-                                data: Map<*, *>?): ApiResult.Failure = ApiResult.createFailure(
+    private fun businessFailure(status: Int, envelope: Map<String, Any?>): ApiResult.Failure = ApiResult.createFailure(
         status = status,
         code = envelope["code"] as? String ?: "UNKNOWN",
         userMessage = envelope["user_message"] as? String ?: "请求失败，请稍后重试。",
@@ -160,12 +159,6 @@ class HttpApiClient(
         )
     }
 
-    private fun invalidEnvelope(): ApiResult.Failure = ApiResult.Failure.InvalidEnvelope(
-        code = "INVALID_ENVELOPE",
-        userMessage = "服务端返回格式异常，请稍后重试。",
-        hint = "响应缺少必须的标准信封字段。",
-    )
-
     private fun networkFailure(): ApiResult.Failure = ApiResult.Failure.NetworkError(
         code = "NETWORK_ERROR",
         userMessage = "无法连接服务，请检查网络后重试。",
@@ -173,17 +166,32 @@ class HttpApiClient(
     )
 }
 
-private fun Map<*, *>?.toLoginData(): LoginData? {
-    if (this == null) return null
+internal fun invalidEnvelope(): ApiResult.Failure.InvalidEnvelope = ApiResult.Failure.InvalidEnvelope(
+    code = "INVALID_ENVELOPE",
+    userMessage = "服务端返回格式异常，请稍后重试。",
+    hint = "服务端响应未通过标准格式校验。",
+)
+
+internal fun hasValidLoginScope(accessToken: String, subjectId: String, organizationId: String, storeId: String): Boolean =
+    accessToken.isNotEmpty() && accessToken.none { it.isWhitespace() || it.isISOControl() } &&
+        listOf(subjectId, organizationId, storeId).all { field ->
+            field.isNotBlank() && field == field.trim() && field.none { it.isISOControl() }
+        }
+
+internal fun LoginData.hasValidScope(): Boolean =
+    hasValidLoginScope(accessToken, subjectId, organizationId, storeId)
+
+private val LOGIN_DATA_FIELDS = setOf("access_token", "token_type", "subject_id", "organization_id", "store_id", "expires_at")
+
+private fun Map<*, *>.toLoginData(): LoginData? {
+    if (keys != LOGIN_DATA_FIELDS || this["token_type"] != "Bearer") return null
     val token = this["access_token"] as? String ?: return null
-    val type = this["token_type"] as? String ?: return null
-    if (type != "Bearer") return null
     val subject = this["subject_id"] as? String ?: return null
     val organization = this["organization_id"] as? String ?: return null
     val store = this["store_id"] as? String ?: return null
     val expiresRaw = this["expires_at"] as? String ?: return null
     val expires = parseIsoInstant(expiresRaw) ?: return null
-    return LoginData(token, subject, organization, store, expires)
+    return LoginData(token, subject, organization, store, expires).takeIf { it.hasValidScope() }
 }
 
 internal fun parseIsoInstant(raw: String): Long? = try {

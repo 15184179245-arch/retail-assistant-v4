@@ -1,5 +1,6 @@
 package com.retail.smartops.features.shell
 
+import com.retail.smartops.core.auth.RequestScope
 import com.retail.smartops.core.auth.Session
 import com.retail.smartops.core.auth.SessionRepository
 import com.retail.smartops.core.navigation.AppDestination
@@ -324,46 +325,114 @@ class FieldShellController(
         )
     }
 
-    /**
-     * Fetches ThreadWorkspace (and its active Artifact) from backend for cross-device Web -> Android resume.
-     */
-    fun loadThreadWorkspaceFromBackend(threadId: String): ApiResult<ThreadWorkspace> {
-        val session = sessions.currentSession()
-            ?: return ApiResult.Failure.Unauthorized(userMessage = "请先登录后再接续跨端线程。")
-        val client = workspaceApi
-            ?: return ApiResult.Failure.NetworkError(userMessage = "未配置工作区客户端。")
-        if (!current.isNetworkReachable) {
-            return ApiResult.Failure.NetworkError(userMessage = "待网络：当前离线，无法拉取远端线程。")
-        }
+    private data class ResumeOwner(val session: Session, val scope: RequestScope, val invalidationCount: Int)
 
-        val wsResult = client.getThreadWorkspace(session, threadId)
-        if (wsResult is ApiResult.Success) {
+    /** A multi-read resume cannot outlive its original controller and session lease. */
+    private fun ownsResume(owner: ResumeOwner): Boolean {
+        val actual = sessions.currentSession()
+        return !closed && actual == owner.session && owner.scope.isActive() &&
+            current.scopeInvalidationCount == owner.invalidationCount
+    }
+
+    private fun resumeResponseMismatch() = ApiResult.Failure.InvalidEnvelope(
+        code = "WORKSPACE_RESPONSE_MISMATCH",
+        userMessage = "工作区响应与所选线程或对象不一致，请重试。",
+        hint = null,
+    )
+
+    fun loadThreadWorkspaceFromBackend(threadId: String): ApiResult<ThreadWorkspace> {
+        val owner = synchronized(sessions) {
+            if (closed) return ApiResult.Cancelled
+            val (session, scope) = sessions.captureRequest()
+                ?: return ApiResult.Failure.Unauthorized(userMessage = "请先登录后再接续跨端线程。")
+            ResumeOwner(session, scope, current.scopeInvalidationCount)
+        }
+        fun isCurrent(): Boolean = synchronized(sessions) { ownsResume(owner) }
+        try {
+            val client = workspaceApi
+                ?: return ApiResult.Failure.NetworkError(userMessage = "未配置工作区客户端。")
+            if (!current.isNetworkReachable) {
+                return ApiResult.Failure.NetworkError(userMessage = "待网络：当前离线，无法拉取远端线程。")
+            }
+
+            if (!isCurrent()) return ApiResult.Cancelled
+            val wsResult = client.getThreadWorkspace(owner.session, threadId)
+            if (!isCurrent()) return ApiResult.Cancelled
+            if (wsResult !is ApiResult.Success) return wsResult
+
             val ws = wsResult.data
+            val expected = owner.session
+            // A valid lease alone does not bind the response to this thread or employee.
+            if (ws.threadId != threadId ||
+                ws.organizationId != expected.organizationId ||
+                ws.storeId != expected.storeId ||
+                ws.subjectId != expected.subjectId
+            ) return resumeResponseMismatch()
+
             val artifactId = ws.activeObjectRef?.artifactId
-            val artifact = if (!artifactId.isNullOrBlank()) {
-                when (val artRes = client.getArtifact(session, artifactId)) {
-                    is ApiResult.Success -> artRes.data
-                    else -> null
+            val artifact = if (artifactId != null) {
+                if (artifactId.isBlank()) return resumeResponseMismatch()
+                if (!isCurrent()) return ApiResult.Cancelled
+                val artResult = client.getArtifact(expected, artifactId)
+                if (!isCurrent()) return ApiResult.Cancelled
+                when (artResult) {
+                    is ApiResult.Success -> {
+                        val item = artResult.data
+                        // Navigation object IDs need not equal the explicit artifact ID.
+                        if (item.id != artifactId ||
+                            item.organizationId != expected.organizationId ||
+                            item.storeId != expected.storeId ||
+                            item.ownerSubjectId != expected.subjectId
+                        ) return resumeResponseMismatch()
+                        item
+                    }
+                    ApiResult.Cancelled -> return ApiResult.Cancelled
+                    is ApiResult.Failure -> {
+                        if (artResult.code == "INVALID_ENVELOPE") return artResult
+                        null // Real read failures preserve the trusted thread summary.
+                    }
                 }
             } else null
-            resumeFromThreadWorkspace(ws, artifact)
-            attachSseStream(session, threadId)
+
+            synchronized(sessions) {
+                if (!ownsResume(owner)) return ApiResult.Cancelled
+                resumeFromThreadWorkspace(ws, artifact)
+            }
+            if (!installSseStream(threadId) { ownsResume(owner) }) return ApiResult.Cancelled
+            return wsResult
+        } finally {
+            sessions.finishRequest(owner.scope)
         }
-        return wsResult
     }
 
     fun attachSseStream(session: Session, threadId: String) {
-        eventStream?.close()
-        val client = workspaceApi ?: return
-        val controller = client.createEventStreamController(
-            threadId = threadId,
-            initialCursor = current.sseCursor,
-            onEvent = ::onSseEvent,
-            onConnectionChanged = { connected ->
-                publish(current.copy(sseConnected = connected))
-            },
-        )
-        eventStream = controller
+        installSseStream(threadId) { !closed && sessions.currentSession() == session }
+    }
+
+    /** Installation registers the existing holder only; it does not open or pump a stream. */
+    private fun installSseStream(threadId: String, mayInstall: () -> Boolean): Boolean {
+        val client = workspaceApi ?: return false
+        val retired = synchronized(sessions) {
+            if (!mayInstall()) return false
+            lateinit var installed: WorkspaceEventStreamController
+            installed = client.createEventStreamController(
+                threadId = threadId,
+                initialCursor = current.sseCursor,
+                onEvent = { event ->
+                    synchronized(sessions) {
+                        if (eventStream === installed) onSseEvent(event)
+                    }
+                },
+                onConnectionChanged = { connected ->
+                    synchronized(sessions) {
+                        if (eventStream === installed) publish(current.copy(sseConnected = connected))
+                    }
+                },
+            )
+            eventStream.also { eventStream = installed }
+        }
+        retired?.close()
+        return true
     }
 
     fun pumpActiveSseStreamOnce(expected: Session, maxReconnects: Int = 2): Boolean =
@@ -540,76 +609,88 @@ class FieldShellController(
         return outcome
     }
 
-    // --- L1 Co-Editing delegators (backed by ArtifactCoeditEngine + optional remote sync) ---
-
-    fun applyHumanFieldEdit(field: String, value: Any?) {
-        val coedit = current.activeArtifactCoedit ?: return
-        val session = sessions.currentSession()
-        val updated = if (workspaceApi != null && session != null && current.isNetworkReachable) {
-            when (val res = workspaceApi.patchArtifact(session, coedit.artifact.id, coedit.artifact.version, mapOf(field to value), "human")) {
-                is ApiResult.Success -> ArtifactCoeditEngine.fromArtifact(res.data, coedit.opsHistory + listOfNotNull(res.data.lastOp))
-                else -> ArtifactCoeditEngine.applyHumanEdit(coedit, field, value, session.subjectId)
+    private fun applyCoedit(
+        localEdit: (ArtifactCoeditUiState, String) -> ArtifactCoeditUiState,
+        remoteEdit: WorkspaceApiClient.(Session, WorkspaceArtifact) -> ApiResult<WorkspaceArtifact>,
+    ) {
+        val (before, client, owner) = synchronized(sessions) {
+            if (closed) return
+            val session = sessions.currentSession()
+            val coedit = current.activeArtifactCoedit ?: return
+            val api = workspaceApi
+            if (api == null || session == null || !current.isNetworkReachable) {
+                publish(current.copy(activeArtifactCoedit = localEdit(coedit, session?.subjectId ?: "local")))
+                return
             }
-        } else {
-            ArtifactCoeditEngine.applyHumanEdit(coedit, field, value, session?.subjectId ?: "local")
+            val (captured, scope) = sessions.captureRequest() ?: return
+            Triple(coedit, api, ResumeOwner(captured, scope, current.scopeInvalidationCount))
         }
-        publish(current.copy(activeArtifactCoedit = updated))
+        fun stillCurrent() = ownsResume(owner) && current.activeArtifactCoedit === before
+        try {
+            if (!synchronized(sessions) { stillCurrent() }) return
+            val outcome = try {
+                client.remoteEdit(owner.session, before.artifact)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                ApiResult.Cancelled
+            } catch (_: Exception) {
+                ApiResult.Failure.NetworkError()
+            }
+            synchronized(sessions) {
+                if (!stillCurrent()) return
+                val old = before.artifact
+                val updated = (outcome as? ApiResult.Success)?.data?.takeIf {
+                    it.id == old.id && it.organizationId == old.organizationId &&
+                        it.storeId == old.storeId && it.ownerSubjectId == old.ownerSubjectId
+                }
+                if (updated != null) {
+                    publish(current.copy(activeArtifactCoedit = ArtifactCoeditEngine.fromArtifact(
+                        updated, before.opsHistory + listOfNotNull(updated.lastOp),
+                    ), errorBanner = null))
+                } else {
+                    // An attempted remote edit is not interchangeable with a standalone local edit.
+                    val notice = when ((outcome as? ApiResult.Failure)?.status) {
+                        403 -> "上次共编被拒绝：当前没有权限。原稿保留。"
+                        409 -> "上次共编被拒绝：版本冲突。请核对服务器上的草稿。"
+                        422 -> "上次共编被拒绝：输入未通过校验。原稿保留。"
+                        else -> "上次共编结果待核对；本机未记为成功，请勿直接重发。"
+                    }
+                    publish(current.copy(errorBanner = notice))
+                }
+            }
+        } finally {
+            sessions.finishRequest(owner.scope)
+        }
     }
 
-    fun unlockField(field: String) {
-        val coedit = current.activeArtifactCoedit ?: return
-        val session = sessions.currentSession()
-        val updated = if (workspaceApi != null && session != null && current.isNetworkReachable) {
-            when (val res = workspaceApi.unlockField(session, coedit.artifact.id, field, coedit.artifact.version)) {
-                is ApiResult.Success -> ArtifactCoeditEngine.fromArtifact(res.data, coedit.opsHistory + listOfNotNull(res.data.lastOp))
-                else -> ArtifactCoeditEngine.unlockField(coedit, field, session.subjectId)
-            }
-        } else {
-            ArtifactCoeditEngine.unlockField(coedit, field, session?.subjectId ?: "local")
-        }
-        publish(current.copy(activeArtifactCoedit = updated))
+    fun applyHumanFieldEdit(field: String, value: Any?) = applyCoedit(
+        localEdit = { coedit, subject -> ArtifactCoeditEngine.applyHumanEdit(coedit, field, value, subject) },
+    ) { session, artifact ->
+        patchArtifact(session, artifact.id, artifact.version, mapOf(field to value), "human")
     }
 
-    fun acceptSuggestion(field: String, opId: String) {
-        val coedit = current.activeArtifactCoedit ?: return
-        val session = sessions.currentSession()
-        val updated = if (workspaceApi != null && session != null && current.isNetworkReachable) {
-            when (val res = workspaceApi.acceptSuggestion(session, coedit.artifact.id, opId, field, coedit.artifact.version)) {
-                is ApiResult.Success -> ArtifactCoeditEngine.fromArtifact(res.data, coedit.opsHistory + listOfNotNull(res.data.lastOp))
-                else -> ArtifactCoeditEngine.acceptSuggestion(coedit, field, opId, session.subjectId)
-            }
-        } else {
-            ArtifactCoeditEngine.acceptSuggestion(coedit, field, opId, session?.subjectId ?: "local")
-        }
-        publish(current.copy(activeArtifactCoedit = updated))
+    fun unlockField(field: String) = applyCoedit(
+        localEdit = { coedit, subject -> ArtifactCoeditEngine.unlockField(coedit, field, subject) },
+    ) { session, artifact ->
+        unlockField(session, artifact.id, field, artifact.version)
     }
 
-    fun ignoreSuggestion(field: String, opId: String) {
-        val coedit = current.activeArtifactCoedit ?: return
-        val session = sessions.currentSession()
-        val updated = if (workspaceApi != null && session != null && current.isNetworkReachable) {
-            when (val res = workspaceApi.ignoreSuggestion(session, coedit.artifact.id, opId, field, coedit.artifact.version)) {
-                is ApiResult.Success -> ArtifactCoeditEngine.fromArtifact(res.data, coedit.opsHistory + listOfNotNull(res.data.lastOp))
-                else -> ArtifactCoeditEngine.ignoreSuggestion(coedit, field, opId, session.subjectId)
-            }
-        } else {
-            ArtifactCoeditEngine.ignoreSuggestion(coedit, field, opId, session?.subjectId ?: "local")
-        }
-        publish(current.copy(activeArtifactCoedit = updated))
+    fun acceptSuggestion(field: String, opId: String) = applyCoedit(
+        localEdit = { coedit, subject -> ArtifactCoeditEngine.acceptSuggestion(coedit, field, opId, subject) },
+    ) { session, artifact ->
+        acceptSuggestion(session, artifact.id, opId, field, artifact.version)
     }
 
-    fun undoOperation(opId: String) {
-        val coedit = current.activeArtifactCoedit ?: return
-        val session = sessions.currentSession()
-        val updated = if (workspaceApi != null && session != null && current.isNetworkReachable) {
-            when (val res = workspaceApi.undoArtifactOp(session, coedit.artifact.id, opId, coedit.artifact.version)) {
-                is ApiResult.Success -> ArtifactCoeditEngine.fromArtifact(res.data, coedit.opsHistory + listOfNotNull(res.data.lastOp))
-                else -> ArtifactCoeditEngine.undoOperation(coedit, opId, session.subjectId)
-            }
-        } else {
-            ArtifactCoeditEngine.undoOperation(coedit, opId, session?.subjectId ?: "local")
-        }
-        publish(current.copy(activeArtifactCoedit = updated))
+    fun ignoreSuggestion(field: String, opId: String) = applyCoedit(
+        localEdit = { coedit, subject -> ArtifactCoeditEngine.ignoreSuggestion(coedit, field, opId, subject) },
+    ) { session, artifact ->
+        ignoreSuggestion(session, artifact.id, opId, field, artifact.version)
+    }
+
+    fun undoOperation(opId: String) = applyCoedit(
+        localEdit = { coedit, subject -> ArtifactCoeditEngine.undoOperation(coedit, opId, subject) },
+    ) { session, artifact ->
+        undoArtifactOp(session, artifact.id, opId, artifact.version)
     }
 
     /**
@@ -617,18 +698,22 @@ class FieldShellController(
      * Immediately wipes thread, open objects, context chips, chat drawer, and SSE connection.
      */
     fun invalidateScope() {
-        eventStream?.close()
-        eventStream = null
-        val nextSession = sessions.currentSession()
-        publish(
-            FieldShellState(
-                session = nextSession,
-                connectionStatus = current.connectionStatus,
-                l2OfflineBlocked = !current.isNetworkReachable,
-                l2ButtonLabel = if (!current.isNetworkReachable) "待网络" else "确认执行",
-                scopeInvalidationCount = current.scopeInvalidationCount + 1,
-            ),
-        )
+        val retired = synchronized(sessions) {
+            val previous = eventStream
+            eventStream = null
+            val nextSession = sessions.currentSession()
+            publish(
+                FieldShellState(
+                    session = nextSession,
+                    connectionStatus = current.connectionStatus,
+                    l2OfflineBlocked = !current.isNetworkReachable,
+                    l2ButtonLabel = if (!current.isNetworkReachable) "待网络" else "确认执行",
+                    scopeInvalidationCount = current.scopeInvalidationCount + 1,
+                ),
+            )
+            previous
+        }
+        retired?.close()
     }
 
     private fun toSummary(ref: WorkObjectRef): FieldWorkObjectSummary {
@@ -663,9 +748,11 @@ class FieldShellController(
     }
 
     override fun close() {
-        closed = true
+        val retired = synchronized(sessions) {
+            closed = true
+            eventStream.also { eventStream = null }
+        }
         removeScopeListener()
-        eventStream?.close()
-        eventStream = null
+        retired?.close()
     }
 }

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import hashlib
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -65,3 +67,38 @@ def write_immutable(data: bytes, key: str) -> Path:
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def read_verified(*, organization_id: str, store_id: str, key: str, sha256: str,
+                  byte_size: int, content_type: str) -> bytes:
+    """Read one bounded immutable snapshot below the configured media root."""
+    missing = "media_content_missing"
+    scope = (organization_id, store_id)
+    if (any(type(part) is not str or part in ("", ".", "..") or
+            any(char in part for char in ("/", "\\", "\x00")) for part in scope)
+            or type(sha256) is not str or len(sha256) != 64
+            or any(char not in "0123456789abcdef" for char in sha256)
+            or type(byte_size) is not int or not 1 <= byte_size <= MAX_BYTES
+            or key != storage_key(*scope, sha256)):
+        raise MediaStorageError(missing)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        with ExitStack() as descriptors:
+            directory = os.open(media_root(), directory_flags)
+            descriptors.callback(os.close, directory)
+            for part in (*scope, sha256[:2]):
+                directory = os.open(part, directory_flags, dir_fd=directory)
+                descriptors.callback(os.close, directory)
+            fd = os.open(sha256 + ".bin", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=directory)
+            descriptors.callback(os.close, fd)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size != byte_size:
+                raise MediaStorageError(missing)
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                data = stream.read(byte_size + 1)
+        if len(data) != byte_size or digest(data) != sha256 or detect_content_type(data) != content_type:
+            raise MediaStorageError(missing)
+    except (OSError, MediaStorageError):
+        raise MediaStorageError(missing) from None
+    return data

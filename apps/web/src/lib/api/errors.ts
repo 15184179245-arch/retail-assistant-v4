@@ -4,6 +4,7 @@ export interface ApiErrorOptions {
   userMessage?: string;
   hint?: string | null;
   cause?: unknown;
+  serverError?: string | null;
 }
 
 export class ApiError extends Error {
@@ -11,6 +12,7 @@ export class ApiError extends Error {
   readonly code: string;
   readonly userMessage: string;
   readonly hint: string | null;
+  readonly serverError: string | null;
 
   constructor(message: string, options: ApiErrorOptions = {}) {
     super(message);
@@ -19,6 +21,7 @@ export class ApiError extends Error {
     this.code = options.code ?? "NETWORK_ERROR";
     this.userMessage = options.userMessage ?? "请求失败，请稍后重试。";
     this.hint = options.hint ?? null;
+    this.serverError = options.serverError ?? null;
     if (options.cause) {
       this.cause = options.cause;
     }
@@ -113,5 +116,6 @@ export function createCategorizedApiError(
     code: defaultCode,
     userMessage: defaultUserMessage,
     hint: defaultHint,
+    serverError: rawError,
   });
 }

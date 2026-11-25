@@ -50,8 +50,8 @@ def test_missing_barcode_stays_missing_and_code_is_never_derived():
 def test_quoted_and_whitespace_barcodes_are_verbatim():
     quoted = service.map_source_payload(_payload(barcode='"12345"'))
     assert quoted["barCode"] == '"12345"'
-    spaced = service.map_source_payload(_payload(barcode=" 6901234567890 "))
-    assert spaced["barCode"] == " 6901234567890 "
+    spaced = service.map_source_payload(_payload(barcode=" 2000000003009 "))
+    assert spaced["barCode"] == " 2000000003009 "
 
 
 @pytest.fixture

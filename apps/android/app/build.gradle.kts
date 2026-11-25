@@ -27,12 +27,6 @@ android {
 
     testOptions { unitTests.isIncludeAndroidResources = false }
 
-    sourceSets {
-        getByName("test") {
-            resources.srcDirs("src/test/resources", file("../../../docs/ui"), file("../../../contracts"))
-        }
-    }
-
     buildTypes {
         debug {
             val debugOrigin = (project.findProperty("apiBaseUrl") as String?)
@@ -51,6 +45,22 @@ android {
         }
         release {
             buildConfigField("String", "API_BASE_URL", "\"https://api.retail.example.invalid\"")
+        }
+    }
+}
+
+// Only these two inputs enter the JVM Test task. No app/AndroidTest source-set changes.
+val stageUnitTestFixtures by tasks.registering(Sync::class) {
+    from(file("../../../docs/ui/status-vocabulary.json"))
+    from(file("../../../contracts/openapi.snapshot.json"))
+    into(layout.buildDirectory.dir("unit-test-fixtures"))
+}
+
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        variant.unitTest?.configureTestTask { test ->
+            test.dependsOn(stageUnitTestFixtures)
+            test.classpath += files(stageUnitTestFixtures.map { it.destinationDir })
         }
     }
 }

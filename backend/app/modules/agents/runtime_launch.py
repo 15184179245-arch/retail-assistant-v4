@@ -4,6 +4,7 @@ Expected digest and roots must come from independent trusted Host configuration.
 The release and SDK tree must not be writable by untrusted subjects. Hashing does
 not remove TOCTOU. The old supervisor remains an internal trusted lower-level API.
 """
+from backend.app.modules.agents.pi_runtime_contract import contract_for_profile, profiles_for_platform
 from dataclasses import dataclass
 from contextlib import closing
 from pathlib import Path, PurePosixPath
@@ -120,16 +121,21 @@ def prepare_release(config):
  meta=seen[('sdk',SDK_ROLES['sdk_package'])];entry=seen[('sdk',SDK_ROLES['sdk_entry'])]
  verified=supervisor.verify_sdk(package=roots['sdk']/SDK_ROLES['sdk_package'],entry=roots['sdk']/SDK_ROLES['sdk_entry'],package_sha256=meta['sha256'],entry_sha256=entry['sha256'])
  return PreparedRelease(config,verified,config.expected_manifest_sha256,len(seen))
+def preflight_sdk_private_tree(prepared,private_tree):
+ """Check a candidate under a verified legacy SDK release without creating it."""
+ root=Path(prepared.config.release_root)
+ private=Path(private_tree)
+ if not private.is_absolute()or root/'runtime'not in private.parents or private.exists()or private.is_symlink():reject('private_tree_reused_or_foreign')
+ relative(str(private.relative_to(root)))
+ if private.parent.resolve()!=private.parent or not private.parent.is_dir():reject('private_tree_parent')
+ return private
 def prepare_invocation(prepared,private_tree):
  _prepared_shape(prepared)
  _private_shape(prepared,private_tree)
  # Repeat before spawn; this is still an assumption of Host-owned immutability,
  # not an atomic filesystem snapshot or a new persistent per-Run source pin.
  prepared=prepare_release(prepared.config);config=prepared.config;root=Path(config.release_root)
- private=Path(private_tree)
- if not private.is_absolute()or root/'runtime'not in private.parents or private.exists()or private.is_symlink():reject('private_tree_reused_or_foreign')
- relative(str(private.relative_to(root)))
- if private.parent.resolve()!=private.parent or not private.parent.is_dir():reject('private_tree_parent')
+ private=preflight_sdk_private_tree(prepared,private_tree)
  private.mkdir(mode=0o700)
  for name in ('home','tmp','cwd','sessions'):(private/name).mkdir(mode=0o700)
  reads=[root/config.manifest_name,root/'node_modules',Path(config.sdk_root),private,*[root/v for v in RELEASE_ROLES.values()]]
@@ -193,7 +199,7 @@ PI_RELEASE_ROLES = {
     "package": "package.json", "lock": "package-lock.json",
 }
 def pi_release_roles(profile):
-    return {**PI_RELEASE_ROLES, **({'capabilities':'dist/src/capabilities.js'} if profile.startswith(('host-pi-discovery-', 'host-pi-source-')) else {})}
+    return {**PI_RELEASE_ROLES, **({'capabilities':'dist/src/capabilities.js'} if profile.startswith(('host-pi-discovery-', 'host-pi-source-', 'host-pi-workbench-')) else {})}
 
 
 PI_SYNTHETIC_CASES = frozenset(("tasks", "knowledge", "catalog", "memory", "memory-save", "memory-correct", "memory-withdraw"))
@@ -218,13 +224,9 @@ class PreparedPiRelease:
     launch_profile: str
 
     def runtime_record(self):
-        streaming = self.launch_profile.endswith(('-online-stream-v1','-online-stream-result-v1'))
-        online = streaming or self.launch_profile.endswith('-online-v1')
-        family = ('source' if self.launch_profile.startswith('host-pi-source-') else
-                  'discovery' if self.launch_profile.startswith('host-pi-discovery-') else
-                  'memory' if self.launch_profile.startswith('host-pi-memory-') else 'readonly')
-        return {"contract_version": 3 if streaming else 2 if online else 1,
-                "wire_protocol": "v4.pi-" + family + ("/3" if streaming else "/2" if online else "/1"),
+        contract = contract_for_profile(self.launch_profile)
+        return {"contract_version": contract.version,
+                "wire_protocol": contract.wire_protocol,
                 "launch_profile": self.launch_profile, "source_manifest_sha256": self.manifest_sha256}
 
 
@@ -327,24 +329,6 @@ def _pi_verify_sdk_files(root, expected, links):
         reject('pi_sdk_closure')
 
 
-def _pi_sdk_inventory(root):
-    # root has already been resolved/admitted; os.walk never follows links.
-    # Do not repeatedly re-parse 20k full paths with Path.relative_to().
-    prefix = os.fspath(root) + os.sep
-    actual, actual_links = set(), set()
-    def unreadable(error):
-        raise error
-    for parent, dirs, files in os.walk(root, followlinks=False, onerror=unreadable):
-        for name in dirs:
-            if os.path.islink(os.path.join(parent, name)):
-                reject('pi_sdk_directory_link')
-        for name in files:
-            path = os.path.join(parent, name)
-            key = path[len(prefix):]
-            (actual_links if os.path.islink(path) else actual).add(key)
-    return actual, actual_links
-
-
 def prepare_pi_release(config):
     """Verify a formal built package and exact installed closure, never a fixture.
 
@@ -364,17 +348,17 @@ def prepare_pi_release(config):
         reject("pi_manifest_digest")
     manifest = strict_json(raw)
     exact(manifest, ("profile", "wire_protocol", "sdk", "provider", "roles", "files", "links"))
-    memory = manifest['profile'] in (profile.replace('readonly','memory'), profile.replace('readonly','memory').removesuffix('-v1')+'-online-v1')
-    discovery = manifest['profile'] in (profile.replace('readonly','discovery'), profile.replace('readonly','discovery').removesuffix('-v1')+'-online-v1')
-    source = manifest['profile'] in (profile.replace('readonly','source'), profile.replace('readonly','source').removesuffix('-v1')+'-online-v1')
-    family = 'source' if source else 'discovery' if discovery else 'memory' if memory else 'readonly'
-    profile = profile.replace('readonly', family)
-    streaming = family == 'readonly' and manifest["profile"] in (profile.removesuffix('-v1') + '-online-stream-v1',profile.removesuffix('-v1') + '-online-stream-result-v1')
-    online = streaming or manifest["profile"] == profile.removesuffix('-v1') + '-online-v1'
-    if online:
-        profile = manifest["profile"]
-    if (manifest["profile"] != profile
-            or manifest["wire_protocol"] != ("v4.pi-" + family + ("/3" if streaming else "/2" if online else "/1"))
+    try:
+        contract = contract_for_profile(manifest["profile"])
+    except ValueError:
+        reject("pi_manifest_identity")
+    if manifest["profile"] not in profiles_for_platform(profile):
+        reject("pi_manifest_identity")
+    family = contract.family
+    memory, discovery, source = family == "memory", family == "discovery", family == "source"
+    streaming, online = contract.streaming, contract.online
+    profile = contract.launch_profile
+    if (manifest["wire_protocol"] != contract.wire_protocol
             or manifest["sdk"] != supervisor.wire.SDK):
         reject("pi_manifest_identity")
     if online:
@@ -462,7 +446,7 @@ def prepare_pi_invocation(prepared, private_tree):
     env = {"PATH": "/usr/bin:/bin", "HOME": str(private/"home"), "TMPDIR": str(private/"tmp"),
         "XDG_CONFIG_HOME": str(private/"home"), "XDG_CACHE_HOME": str(private/"home/cache"),
         "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TZ": "UTC", "PI_PRIVATE_ROOT": str(private)}
-    if ready.launch_profile.replace('memory', 'readonly').replace('discovery', 'readonly').replace('source', 'readonly') in (PI_DARWIN_PROFILE, PI_DARWIN_PROFILE.removesuffix('-v1') + '-online-v1', PI_DARWIN_PROFILE.removesuffix('-v1') + '-online-stream-v1', PI_DARWIN_PROFILE.removesuffix('-v1') + '-online-stream-result-v1'):
+    if ready.launch_profile.replace('memory', 'readonly').replace('discovery', 'readonly').replace('source', 'readonly').replace('workbench', 'readonly') in (PI_DARWIN_PROFILE, PI_DARWIN_PROFILE.removesuffix('-v1') + '-online-v1', PI_DARWIN_PROFILE.removesuffix('-v1') + '-online-stream-v1', PI_DARWIN_PROFILE.removesuffix('-v1') + '-online-stream-result-v1'):
         env["__CF_USER_TEXT_ENCODING"] = f"0x{os.getuid():X}:0x0:0x0"
     return ready, argv, str(private/"cwd"), env
 

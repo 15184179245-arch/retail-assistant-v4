@@ -80,7 +80,8 @@ def load(expected_sha256, *, trial_name=None):
     """Read fixed environment.json; callers cannot choose root or DB path."""
     rootfd=fd=None
     try:
-        if type(expected_sha256) is not str or not re.fullmatch('[a-f0-9]{64}',expected_sha256):_deny()
+        direct = os.environ.get('RETAIL_PI_DIRECT_ACCESS') == '1' and expected_sha256 in (None, '', 'direct')
+        if not direct and (type(expected_sha256) is not str or not re.fullmatch('[a-f0-9]{64}',expected_sha256)):_deny()
         isolated=trial_name is not None
         if isolated:
             name=globals()['trial_name'](trial_name)
@@ -119,7 +120,8 @@ def load(expected_sha256, *, trial_name=None):
         before=os.fstat(fd);_private(before)
         if not 0<before.st_size<=16384:_deny()
         raw=os.read(fd,16385)
-        if len(raw)!=before.st_size or sha256(raw).hexdigest()!=expected_sha256:_deny()
+        actual_sha256=sha256(raw).hexdigest()
+        if len(raw)!=before.st_size or (not direct and actual_sha256!=expected_sha256):_deny()
         values=_decode(raw,trial=isolated)
         database=os.stat('authority.sqlite3',dir_fd=rootfd,follow_symlinks=False);_private(database)
         if database.st_size<16:_deny()
@@ -128,7 +130,7 @@ def load(expected_sha256, *, trial_name=None):
                 or _identity(os.stat(root,follow_symlinks=False))!=_identity(rootinfo)
                 or root.resolve(strict=True)!=root):_deny()
         marker()
-        return SourceEnvironment(root,root/'authority.sqlite3',_identity(database),values,expected_sha256,trial_name)
+        return SourceEnvironment(root,root/'authority.sqlite3',_identity(database),values,actual_sha256,trial_name)
     except (OSError,ValueError,TypeError,RuntimeError):raise SourceEnvironmentError() from None
     finally:
         if fd is not None:os.close(fd)

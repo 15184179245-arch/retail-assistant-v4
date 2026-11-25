@@ -6,25 +6,25 @@
 :root {
   /* Surfaces and canvas */
   --surface: #ffffff;
-  --surface-subtle: #f4f6f8;
+  --surface-subtle: #fcfcf5;
   --surface-elevated: #ffffff;
 
   /* Ink and typography colors */
-  --ink: #17232b;
-  --ink-secondary: #4c5a56;
-  --muted: #65736f;
+  --ink: #14332c;
+  --ink-secondary: #4a5c58;
+  --muted: #7a8a86;
   --ink-eyebrow: #6b7b78;
 
   /* Primary brand tones */
-  --brand-primary: #173f35;
-  --brand-primary-hover: #1f4f43;
-  --brand-primary-active: #102a24;
-  --brand-primary-subtle: #eff7f3;
+  --brand-primary: #0066ff;
+  --brand-primary-hover: #0052cc;
+  --brand-primary-active: #0040a3;
+  --brand-primary-subtle: #e6f0ff;
 
   /* Border tones */
-  --border: #e4e9e8;
-  --border-subtle: #d7dedb;
-  --border-focus: #8fc7b5;
+  --border: #b3cce6;
+  --border-subtle: #d1e0f0;
+  --border-focus: #0066ff;
 
   /* Status semantic tones */
   --info: #246a9a;

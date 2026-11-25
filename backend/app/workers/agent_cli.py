@@ -127,6 +127,17 @@ def _runtime_enabled() -> bool:
     return all(os.environ.get(flag) == "1" for flag in _RUN_FLAGS)
 
 
+def _dispose_engine(engine) -> None:
+    """Attempt local cleanup without replacing the command's outcome."""
+    if engine is None:
+        return
+    try:
+        engine.dispose()
+    except Exception:
+        # A driver cleanup failure is not permission to retry the command.
+        pass
+
+
 def _prepare(action: str):
     """Config + DB-time machine pre-authentication before any claim/execution."""
     database_url = _env(_DB_ENV)
@@ -151,14 +162,12 @@ def _prepare(action: str):
                 organization_id=principal.organization_id,
                 store_id=principal.store_id, action=action, now=now)
     except HTTPException as error:
-        if engine is not None:
-            engine.dispose()
+        _dispose_engine(engine)
         raise _AuthDenied() from error
     except Exception as error:
         # Engine construction or any DB failure: stable code only, never the
         # raw URL/traceback (a malformed DATABASE_URL is still a storage error).
-        if engine is not None:
-            engine.dispose()
+        _dispose_engine(engine)
         raise _StorageError() from error
     return engine, factory, principal, token
 
@@ -373,7 +382,7 @@ def main(argv: list[str] | None = None) -> int:
                "code": "internal_error", "exit": EXIT_INTERNAL})
         return EXIT_INTERNAL
     finally:
-        engine.dispose()
+        _dispose_engine(engine)
 
     _emit(payload)
     return payload["exit"]

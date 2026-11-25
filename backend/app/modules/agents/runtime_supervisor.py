@@ -89,6 +89,8 @@ Successful return is a transport outcome, never permission to synthesize receipt
  source=formal and bridge.runtime_record['wire_protocol'].startswith('v4.pi-source/')
  discovery=formal and (source or bridge.runtime_record['wire_protocol'].startswith('v4.pi-discovery/'))
  session_seconds=wire.STREAM_SESSION_SECONDS if streaming else wire.DISCOVERY_SESSION_SECONDS if discovery else wire.SESSION_SECONDS
+ workbench=formal and bridge.runtime_record['wire_protocol']=='v4.pi-workbench/2'
+ if workbench:discovery=True;session_seconds=wire.DISCOVERY_SESSION_SECONDS
  memory=formal and bridge.runtime_record['wire_protocol'].startswith('v4.pi-memory/')
  pi_peer=(wire.PiMemoryOnlinePeer if online else wire.PiMemoryPeer) if memory else (wire.PiOnlinePeer if online else wire.PiPeer)
  if discovery:pi_peer=wire.PiDiscoveryOnlinePeer if online else wire.PiDiscoveryPeer
@@ -96,6 +98,7 @@ Successful return is a transport outcome, never permission to synthesize receipt
  pi_hello=(wire.PI_MEMORY_ONLINE_PROFILE if online else wire.PI_MEMORY_PROFILE) if memory else (wire.PI_ONLINE_PROFILE if online else wire.PI_PROFILE)
  if discovery:pi_hello=wire.PI_DISCOVERY_ONLINE_PROFILE if online else wire.PI_DISCOVERY_PROFILE
  if source:pi_hello=wire.PI_SOURCE_ONLINE_PROFILE if online else wire.PI_SOURCE_PROFILE
+ if workbench:pi_peer=wire.PiWorkbenchOnlinePeer;pi_hello=wire.PI_WORKBENCH_ONLINE_PROFILE
  if streaming:pi_peer=wire.PiStreamPeer;pi_hello=wire.PI_STREAM_PROFILE
  if formal and bridge.runtime_record['launch_profile'] in wire.PI_RESULT_LAUNCH_PROFILES:
   pi_peer=wire.PiCanonicalPeer;pi_hello=wire.PI_RESULT_PROFILE
@@ -302,6 +305,8 @@ Successful return is a transport outcome, never permission to synthesize receipt
      elif kind=='session_end':
       if body['status']!='ok':wire.fail('sdk_failed')
       end=True
+     elif formal and kind=='error' and body['code']==wire.PI_PROVIDER_CAPACITY_CODE:
+      wire.fail(wire.PI_PROVIDER_CAPACITY_CODE)
      else:wire.fail('sdk_failed')
    if proc.poll() is not None and stdout_eof and stderr_eof:break
    if stdout_eof and not end:wire.fail('unexpected_eof')
@@ -322,7 +327,12 @@ Successful return is a transport outcome, never permission to synthesize receipt
   elif bridge.close_attempts:report['disposition']=bridge.close_attempts[0]['status'];report['disposition_origin']='PRESERVED_FIRST_HOST_ATTEMPT'
   else:
    report['disposition_origin']='FIRST_TRANSPORT_DISPOSITION'
-   try:report['disposition']=bridge.abandon_unknown()
+   try:
+    # The peer code supplies a reason, never a disposition. The existing locked
+    # DB-fact classifier still preserves any dispatched/unknown effects.
+    report['disposition']=(bridge._fail_closed('pi_provider_capacity_exceeded')
+      if formal and isinstance(error,wire.ProtocolError) and error.code==wire.PI_PROVIDER_CAPACITY_CODE
+      else bridge.abandon_unknown())
    except BaseException as recovery_error:
     report['disposition']='unresolved';report['recovery_error']=_sdk_exception_detail(recovery_error)
  finally:

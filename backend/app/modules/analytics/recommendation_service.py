@@ -7,7 +7,7 @@ or make a true external source verification claim.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal
 from hashlib import sha256
 import json
 import re
@@ -171,9 +171,11 @@ def _project(evidence: dict, now: datetime,
 
     velocity = _number(evidence["sales"]["daily_units"], "daily_units", integer=False)
     lead = int(evidence["supplier"]["lead_time_days"])
-    safety = int((velocity * SAFETY_DAYS).to_integral_value(rounding=ROUND_CEILING))
-    expected = int((velocity * (lead + REVIEW_DAYS)).to_integral_value(
-        rounding=ROUND_CEILING)) + safety
+    # Ceil each term on the exact nonnegative source value; Decimal
+    # multiplication could round it first under the caller's context.
+    numerator, denominator = velocity.as_integer_ratio()
+    safety = (numerator * SAFETY_DAYS + denominator - 1) // denominator
+    expected = (numerator * (lead + REVIEW_DAYS) + denominator - 1) // denominator + safety
     available = int(evidence["stock"]["available_units"])
     inbound = int(evidence["inbound"]["open_units"])
     shortfall = max(0, expected - available - inbound)
@@ -384,10 +386,14 @@ def decide_recommendation(
         _fail("recommendation_snapshot_cas_changed")
     old = _decision(db, actor, row)
     if old is not None:
-        if (old.decided_by != actor.subject_id or old.decision_key != idempotency_key
-                or old.decision != decision or old.reason != reason.strip()
-                or old.quantity_pieces != quantity_pieces
-                and not (old.decision == "accept" and quantity_pieces is None)):
+        # Replay the original request shape, not the materialized accept quantity.
+        same_quantity = (
+            type(quantity_pieces) is int and quantity_pieces == old.quantity_pieces
+            if old.decision == "modify" else quantity_pieces is None
+        )
+        if (type(decision) is not str or old.decided_by != actor.subject_id
+                or old.decision_key != idempotency_key or old.decision != decision
+                or old.reason != reason.strip() or not same_quantity):
             _fail("recommendation_already_decided")
         return _view(db, actor, row, replayed=True)
     if instant < _utc(row.created_at) or instant - _utc(row.created_at) > timedelta(hours=24):

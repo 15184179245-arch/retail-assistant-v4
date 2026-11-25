@@ -234,6 +234,7 @@ class ReceiptSourceSnapshot(StrictDTO):
         # Recompute exception approval from the WHOLE frozen batch set. An
         # old per-batch check (or a concurrent import) is not proof that the
         # current overage/final shortage has been independently accepted.
+        needed = set()
         for count in self.cumulative:
             expected, observed = Decimal(count.expected_quantity), Decimal(count.observed_quantity)
             kind = 'overage' if observed > expected else (
@@ -243,13 +244,20 @@ class ReceiptSourceSnapshot(StrictDTO):
             evidence = canonical_digest(dict(expected_quantity=format(expected, 'f'),
                 cumulative_observed_quantity=format(observed, 'f'),
                 unit_verification='employee_attested_unknown_conversion'))
-            matches = []
-            for related in self.related_batches:
-                ids = {line.id for line in related.lines if line.intent_line_id == count.intent_line_id}
-                matches.extend(d for d in related.decisions if d.line_id in ids
-                    and d.kind == kind and d.detail_digest == evidence)
-            if not matches:
-                raise ValueError('receipt_quantity_decision_missing')
+            needed.add((count.intent_line_id, kind, evidence))
+        for related in self.related_batches:
+            if not needed:
+                break
+            if not related.decisions:
+                continue
+            # The decision's line ID is meaningful within the same batch.
+            owners = {line.id: line.intent_line_id for line in related.lines}
+            needed.difference_update(
+                (owners[d.line_id], d.kind, d.detail_digest)
+                for d in related.decisions if d.line_id in owners
+            )
+        if needed:
+            raise ValueError('receipt_quantity_decision_missing')
         return self
 
     @property

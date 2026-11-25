@@ -96,6 +96,8 @@ def _xlsx_safe(data: bytes):
             if not 1 <= len(members) <= 2500:
                 _fail("office_spreadsheet_unsafe")
             names = {m.filename for m in members}
+            if len(names) != len(members):
+                _fail("office_spreadsheet_unsafe")
             if "[Content_Types].xml" not in names or "xl/workbook.xml" not in names:
                 _fail("office_spreadsheet_unsafe")
             for member in members:
@@ -236,6 +238,13 @@ def receive(db: Session, actor: AuthenticatedSubject, *,
             _fail("office_blob_corrupt")
         return {**_out(evidence), "receipt_id": existing_receipt.id,
                 "source_channel": existing_receipt.source_channel, "replayed": True}
+    # A SAVEPOINT without a physical SQLite root commits on RELEASE in the
+    # driver's legacy mode. Keep evidence, receipt and audit in the caller's
+    # transaction; never commit or replace an already-active root here.
+    connection = db.connection()
+    if connection.dialect.name == "sqlite":
+        if not connection.connection.driver_connection.in_transaction:
+            connection.exec_driver_sql("BEGIN")
     e = db.scalar(select(OfficeEvidence).where(
         OfficeEvidence.organization_id == actor.organization_id,
         OfficeEvidence.store_id == actor.store_id,

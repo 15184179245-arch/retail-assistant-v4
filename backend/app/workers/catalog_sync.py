@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import Callable
 
@@ -64,6 +66,14 @@ def _save_state(path: Path, *, next_skip: int, completed: bool,
     }, ensure_ascii=False), encoding="utf-8")
 
 
+def _page_fingerprint(items):
+    try:
+        raw = json.dumps(items, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
+        raise SyncError("invalid source page content") from None
+    return sha256(raw.encode("ascii")).digest()
+
+
 def run_sync(session: Session, client: GuanJiaClient, *, organization_id: str,
              store_id: str, source_system: str, source_version: str,
              state_path: Path = DEFAULT_STATE, page_size: int = 100,
@@ -93,7 +103,9 @@ def run_sync(session: Session, client: GuanJiaClient, *, organization_id: str,
         elif source_sequence is not None and stored_sequence is not None:
             if source_sequence < int(stored_sequence):
                 raise SyncError("source_sequence regressed; refusing to publish older data")
-    skip = start
+    skip = verification_skip = start
+    known_total = None
+    processed_pages: dict[int, bytes] = {}
     completed = False
     try:
         iterator = client.iter_product_pages(page_size=page_size, start_skip=start)
@@ -101,6 +113,10 @@ def run_sync(session: Session, client: GuanJiaClient, *, organization_id: str,
             try:
                 page = next(iterator)
             except StopIteration:
+                if verification_skip != skip:
+                    raise SyncError("source retry ended before the processed prefix")
+                if known_total is not None and verification_skip != known_total:
+                    raise SyncError("source ended before the previously declared total")
                 completed = True
                 break
             except RateLimited as error:
@@ -112,34 +128,65 @@ def run_sync(session: Session, client: GuanJiaClient, *, organization_id: str,
                 # rebuilt; skipping directly to the failed page would forget
                 # what was already verified in this round.
                 iterator = client.iter_product_pages(page_size=page_size, start_skip=0)
+                verification_skip = start
                 continue
+            if page.skip != verification_skip:
+                raise SyncError("source page offset changed")
+            if page.total is not None:
+                if known_total is not None and page.total != known_total:
+                    raise SyncError("source total changed during retry")
+                known_total = page.total
+            verification_skip = page.skip + len(page.items)
+            if known_total is not None and (verification_skip > known_total
+                    or (not page.items and verification_skip < known_total)):
+                raise SyncError("source page disagrees with the previously declared total")
+            fingerprint = _page_fingerprint(page.items)
+            if page.skip in processed_pages:
+                if fingerprint != processed_pages[page.skip]:
+                    raise SyncError("source page changed during retry")
+                # The fresh iterator still validates every replayed row. A
+                # verified retry is not a second catalog classification/commit.
+                continue
+            if page.skip != skip:
+                raise SyncError("source retry lost part of the processed prefix")
             for item in page.items:
                 try:
                     payload = map_product_item(item)
                 except ValueError as error:
                     raise SyncError(f"invalid source item: {error}") from error
                 report.scanned += 1
-                existing = repository.find_by_external(
-                    session, organization_id, store_id, source_system, payload["code"])
-                if dry_run:
-                    if existing is None:
-                        report.new += 1
-                    else:
-                        report.unchanged += 1
-                    continue
+                with session.no_autoflush if dry_run else nullcontext():
+                    existing = repository.find_by_external(
+                        session, organization_id, store_id, source_system, payload["code"])
+                    if dry_run:
+                        if existing is None:
+                            report.new += 1
+                        else:
+                            mapped = service.map_source_payload(payload)
+                            digest = service.observation_digest(
+                                mapped, source_version=source_version, source_updated_at=None)
+                            current = repository.latest_snapshot(session, existing)
+                            active = service.source_active(payload)
+                            if (current is None or current.payload_sha256 != digest
+                                    or (active is not None and existing.active != active)):
+                                report.changed += 1
+                            else:
+                                report.unchanged += 1
+                        continue
                 before_snapshot = existing.current_snapshot_id if existing else None
+                before_active = existing.active if existing else None
                 product, snapshot, _ = service.record_snapshot(
                     session, organization_id=organization_id, store_id=store_id,
                     source_system=source_system, source_version=source_version,
                     source_updated_at=None, payload=payload)
                 if existing is None:
                     report.new += 1
-                elif before_snapshot != snapshot.id:
+                elif before_snapshot != snapshot.id or before_active != product.active:
                     report.changed += 1
                 else:
                     report.unchanged += 1
             report.pages += 1
-            skip = page.skip + len(page.items)
+            skip = verification_skip
             report.next_skip = skip
             if not dry_run:
                 # A page cursor is only meaningful after the page's V4 writes
@@ -151,6 +198,7 @@ def run_sync(session: Session, client: GuanJiaClient, *, organization_id: str,
                             source_sequence=source_sequence,
                             organization_id=organization_id, store_id=store_id,
                             source_system=source_system)
+            processed_pages[page.skip] = fingerprint
             if not page.items:
                 completed = True
                 break

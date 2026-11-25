@@ -298,6 +298,12 @@ Resource overrides are trusted Host/test configuration, never model arguments.
         self._check_root()
         self._validate_file('writer.lock', self._lock)
         for name, expected in self._read_set.items():
+            if expected is None:  # A read-only lookup pinned this named pointer as absent.
+                try:
+                    os.stat(name, dir_fd=self._root, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                _deny()
             info = os.stat(name, dir_fd=self._root, follow_symlinks=False)
             if _fingerprint(info) != expected:
                 _deny()
@@ -714,9 +720,13 @@ resolve timeouts, unreceived bodies, partial raw files or failed filesystem IO.
         record = self._prefix(acquisition)
         a, ar, take = self._pass(acquisition, 1)
         b, br, btake = self._pass(acquisition, 2)
-        counter = lambda rows: Counter(_encode(_canonical(row)) for row in rows)
-        if take != btake or counter(a) != counter(b):
+        if take != btake:
             _deny()
+        items = Counter(_encode(_canonical(row)) for row in a)
+        if items != Counter(_encode(_canonical(row)) for row in b):
+            _deny()
+        total_count = len(a)
+        del a, b  # The verified multiset is the only input needed for its digest.
         expected_keys = {r['key'] for r in ar + br}
         auth_receipt = None
         auth_key = acquisition + '.auth'
@@ -742,9 +752,9 @@ resolve timeouts, unreceived bodies, partial raw files or failed filesystem IO.
                     name[:-13] + '.returned.json' not in os.listdir(self._root)):
                 _deny()
         return dict(version=VERSION, binding_sha256=self.binding_sha, day=record['day'],
-            acquisition=acquisition, page_receipts=ar + br, total_count=len(a), take=take,
+            acquisition=acquisition, page_receipts=ar + br, total_count=total_count, take=take,
             authentication_receipt=auth_receipt,
-            items_multiset_sha256=sha256(_encode(sorted((k.decode(), v) for k, v in counter(a).items()))).hexdigest(),
+            items_multiset_sha256=sha256(_encode(sorted((k.decode(), v) for k, v in items.items()))).hexdigest(),
             structural_complete=True, business_semantics_verified=False,
             stable_source_line_identity_verified=False, atomic_snapshot_verified=False)
 
@@ -807,6 +817,11 @@ resolve timeouts, unreceived bodies, partial raw files or failed filesystem IO.
         self._read_binding()
         pointer = self._latest(day)
         if pointer is None:
+            if not self._active:
+                name = day + '.latest.json'
+                if self._read_set.get(name) is not None:
+                    _deny()
+                self._read_set[name] = None
             return None
         data = self._read(pointer['acquisition'] + '.manifest.json')
         if sha256(data).hexdigest() != pointer['manifest_sha256']:
@@ -827,4 +842,7 @@ resolve timeouts, unreceived bodies, partial raw files or failed filesystem IO.
         self._read_set = {}
         # Immutable objects can be read while another day is being collected.
         # A concurrent same-day pointer replacement fails closed at set-end.
-        return self._read_latest(day)
+        result = self._read_latest(day)
+        if result is None:
+            self._finish_reads()
+        return result

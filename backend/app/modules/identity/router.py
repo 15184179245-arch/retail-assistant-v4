@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy.orm import Session
 
 from backend.app.core.security import AuthenticatedSubject, require_authenticated_subject
@@ -15,10 +15,11 @@ router = APIRouter(prefix="/identity", tags=["identity"])
 def identity_context(
     actor: Annotated[AuthenticatedSubject, Depends(require_authenticated_subject)],
     session: Annotated[Session, Depends(get_session)],
+    response: Response,
 ) -> IdentityContextEnvelope:
     authorize_scope(session, actor, organization_id=actor.organization_id, store_id=actor.store_id)
     capabilities, cap_version = resolve_effective_capabilities(session, actor)
-    return IdentityContextEnvelope(
+    envelope = IdentityContextEnvelope(
         success=True,
         data=IdentityContext(
             subject_id=actor.subject_id,
@@ -33,3 +34,5 @@ def identity_context(
         user_message="身份范围已确认。",
         hint=None,
     )
+    response.headers["Cache-Control"] = "no-store"
+    return envelope

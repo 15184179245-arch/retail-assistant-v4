@@ -49,17 +49,11 @@ import com.retail.smartops.core.ui.theme.RetailRadius
 import com.retail.smartops.core.ui.theme.RetailSpacing
 
 /**
- * Callbacks for mobile block interactions, L1 co-editing, and L2 confirmation.
+ * History-block interactions. L1 editing is owned only by the current work object.
  */
 data class BlockInteractionCallbacks(
     val onPinToWorkbench: (ParsedUiBlock.Valid) -> Unit = {},
     val onOpenArtifact: (String) -> Unit = {},
-    val onHumanFieldEdit: (artifactId: String, field: String, value: String) -> Unit = { _, _, _ -> },
-    val onUnlockField: (artifactId: String, field: String) -> Unit = { _, _ -> },
-    val onLockField: (artifactId: String, field: String) -> Unit = { _, _ -> },
-    val onAcceptSuggestion: (artifactId: String, field: String, opId: String) -> Unit = { _, _, _ -> },
-    val onIgnoreSuggestion: (artifactId: String, field: String, opId: String) -> Unit = { _, _, _ -> },
-    val onUndoOp: (artifactId: String, opId: String) -> Unit = { _, _ -> },
     val onOpenActionConfirm: (ParsedUiBlock.Valid) -> Unit = {},
     val onSubmitFormRequest: (ParsedUiBlock.Valid, Map<String, String>) -> Unit = { _, _ -> },
     val onSelectProduct: (Map<String, Any?>) -> Unit = {},
@@ -69,7 +63,6 @@ data class BlockInteractionCallbacks(
 fun UiBlockView(
     block: ParsedUiBlock,
     online: Boolean,
-    coeditState: ArtifactCoeditUiState? = null,
     callbacks: BlockInteractionCallbacks = BlockInteractionCallbacks(),
     modifier: Modifier = Modifier,
 ) {
@@ -79,7 +72,6 @@ fun UiBlockView(
         is ParsedUiBlock.Valid -> ValidUiBlockCard(
             block = block,
             online = online,
-            coeditState = coeditState,
             callbacks = callbacks,
             modifier = modifier,
         )
@@ -184,7 +176,6 @@ fun DegradedTextBlockView(
 private fun ValidUiBlockCard(
     block: ParsedUiBlock.Valid,
     online: Boolean,
-    coeditState: ArtifactCoeditUiState?,
     callbacks: BlockInteractionCallbacks,
     modifier: Modifier = Modifier,
 ) {
@@ -237,11 +228,7 @@ private fun ValidUiBlockCard(
                 UiBlockType.PRODUCT_CARD -> RenderProductCard(block, callbacks)
                 UiBlockType.PRODUCT_LIST -> RenderProductList(block, callbacks)
                 UiBlockType.COMPARE_TABLE -> RenderCompareTable(block)
-                UiBlockType.QUOTE_DRAFT, UiBlockType.PURCHASE_DRAFT -> RenderDraftBlock(
-                    block = block,
-                    coeditState = coeditState,
-                    callbacks = callbacks,
-                )
+                UiBlockType.QUOTE_DRAFT, UiBlockType.PURCHASE_DRAFT -> RenderHistoricalDraft(block)
                 UiBlockType.STOCK_LOCATION -> RenderStockLocation(block)
                 UiBlockType.WORK_ITEM_LIST -> RenderWorkItemList(block)
                 UiBlockType.EVIDENCE_PANEL -> RenderEvidencePanel(block)
@@ -363,91 +350,32 @@ private fun RenderCompareTable(block: ParsedUiBlock.Valid) {
     }
 }
 
+internal data class HistoricalDraftPreview(
+    val stage: String?,
+    val status: String?,
+    val fields: List<Pair<String, String>>,
+)
+
+internal fun historicalDraftPreview(block: ParsedUiBlock.Valid): HistoricalDraftPreview =
+    HistoricalDraftPreview(
+        stage = (block.props["stage"] as? String)?.takeIf { it.isNotBlank() },
+        status = (block.props["status"] as? String)?.takeIf { it.isNotBlank() },
+        fields = block.props.entries.asSequence()
+            .filter { it.key !in setOf("title", "stage", "status", "artifact_id", "draft_id") }
+            .take(8)
+            .map { (field, value) -> field to value?.toString().orEmpty() }
+            .toList(),
+    )
+
 @Composable
-private fun RenderDraftBlock(
-    block: ParsedUiBlock.Valid,
-    coeditState: ArtifactCoeditUiState?,
-    callbacks: BlockInteractionCallbacks,
-) {
-    val artifact = coeditState?.artifact
-    val artifactId = artifact?.id ?: block.artifactId ?: (block.props["artifact_id"] as? String) ?: ""
-    val stage = (artifact?.payload?.get("stage") as? String) ?: (block.props["stage"] as? String) ?: "draft"
-    val status = (artifact?.payload?.get("status") as? String) ?: (block.props["status"] as? String) ?: "pending"
-
+private fun RenderHistoricalDraft(block: ParsedUiBlock.Valid) {
+    val preview = historicalDraftPreview(block)
     Column(verticalArrangement = Arrangement.spacedBy(RetailSpacing.xs)) {
-        Text(
-            text = "阶段 stage=$stage · 支付 status=$status",
-            fontSize = 12.sp,
-            color = RetailColors.inkSecondary,
-        )
-
-        coeditState?.activeEditorNotice?.takeIf { it.isNotBlank() }?.let { notice ->
-            Text(
-                text = "提示：$notice",
-                color = RetailColors.info,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Medium,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(RetailColors.infoBg, RoundedCornerShape(RetailRadius.sm))
-                    .padding(RetailSpacing.xs),
-            )
-        }
-
-        coeditState?.partialUndoNotice?.takeIf { it.isNotBlank() }?.let { notice ->
-            Text(
-                text = notice,
-                color = RetailColors.warning,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(RetailColors.warningBg, RoundedCornerShape(RetailRadius.sm))
-                    .padding(RetailSpacing.xs),
-            )
-        }
-
-        val displayFields = buildMap<String, Any?> {
-            if (artifact != null) {
-                putAll(artifact.payload)
-            } else {
-                block.props.forEach { (k, v) ->
-                    if (k !in setOf("title", "stage", "status", "artifact_id", "draft_id")) {
-                        put(k, v)
-                    }
-                }
-            }
-        }
-
-        displayFields.entries.take(8).forEach { (field, value) ->
-            val fieldVisual = coeditState?.fieldState(field) ?: FieldCoeditVisualState(
-                field = field,
-                isHumanLocked = false,
-                isAiJustModified = false,
-            )
-            L1CoeditFieldRow(
-                artifactId = artifactId,
-                field = field,
-                valueText = value?.toString().orEmpty(),
-                visual = fieldVisual,
-                onSaveHumanEdit = { newVal -> callbacks.onHumanFieldEdit(artifactId, field, newVal) },
-                onUnlock = { callbacks.onUnlockField(artifactId, field) },
-                onLock = { callbacks.onLockField(artifactId, field) },
-                onAcceptSuggestion = { opId -> callbacks.onAcceptSuggestion(artifactId, field, opId) },
-                onIgnoreSuggestion = { opId -> callbacks.onIgnoreSuggestion(artifactId, field, opId) },
-            )
-        }
-
-        val lastAiOp = coeditState?.opsHistory?.lastOrNull { it.actorType == "agent" && it.opType == "patch" }
-        if (lastAiOp != null && artifactId.isNotBlank()) {
-            OutlinedButton(
-                onClick = { callbacks.onUndoOp(artifactId, lastAiOp.id) },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = RetailSpacing.minTouchTarget),
-            ) {
-                Text("撤销上次 AI 修改")
-            }
+        Text("历史草稿预览（只读）· 在工作台编辑", fontSize = 12.sp, color = RetailColors.inkSecondary)
+        val state = listOfNotNull(preview.stage?.let { "阶段 stage=$it" }, preview.status?.let { "状态 status=$it" })
+        if (state.isNotEmpty()) Text(state.joinToString(" · "), fontSize = 12.sp, color = RetailColors.inkSecondary)
+        preview.fields.forEach { (field, value) ->
+            Text("$field: ${value.ifBlank { "（空）" }}", fontSize = 13.sp, color = RetailColors.ink)
         }
     }
 }

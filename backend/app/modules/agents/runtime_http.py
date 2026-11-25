@@ -16,7 +16,7 @@ from backend.app.modules.auth.service import validate_actor_session
 from backend.app.modules.agents import service, repository
 from backend.app.modules.agents.models import AgentExecution
 from backend.app.modules.agents.runtime_bridge import FreshRunBridge
-from backend.app.modules.agents.runtime_launch import HostConfig, prepare_release, run_prepared
+from backend.app.modules.agents.runtime_launch import HostConfig, prepare_release, preflight_sdk_private_tree, run_prepared
 from backend.app.workers.agent_executor import _origin_text
 
 @dataclass(frozen=True)
@@ -116,7 +116,7 @@ def submit(request: Request, payload: SdkRequest, actor, auth_session: Session):
         prepared = prepare_release(config.launch)
         # Complete fallible private-name preparation before acquiring any Run.
         # Existing receipts already returned above and never need a new name.
-        private = config.private_parent/('sdk-http-'+str(uuid4()))
+        private = preflight_sdk_private_tree(prepared, config.private_parent/('sdk-http-'+str(uuid4())))
     except Exception as exc:
         raise service.AgentRuntimeError('sdk_release_unavailable',503) from exc
     try:
@@ -138,7 +138,7 @@ def submit(request: Request, payload: SdkRequest, actor, auth_session: Session):
         if receipt is None:
             _fail('sdk_submission_unresolved')
         return receipt
-    # All operational preparation is complete before ownership. A normally
+    # Read-only preparation is complete before ownership. A normally
     # returned new claimant goes directly to the factory/supervisor; this HTTP
     # layer never calls abandon, including after their first unresolved result.
     try:
@@ -223,13 +223,18 @@ def validate_pi_config(config, actor):
     return config
 
 
-def _pi_route_profile(memory, discovery, source=False):
-    if type(memory) is not bool or type(discovery) is not bool or type(source) is not bool or discovery and not memory or source and not discovery:
+def _pi_route_profile(memory, discovery, source=False, workbench=False):
+    if (type(memory) is not bool or type(discovery) is not bool or type(source) is not bool
+            or type(workbench) is not bool or discovery and not memory or source and not discovery):
         _fail('pi_profile_route_mismatch', 409)
+    if workbench:
+        if not (memory and discovery and source):
+            _fail('pi_profile_route_mismatch', 409)
+        return 'pi-workbench-v1'
     return 'pi-source-v1' if source else 'pi-discovery-v1' if discovery else 'pi-memory-v1' if memory else 'pi-readonly-v1'
 
 
-def _pi_existing(session, actor, payload, *, memory=False, discovery=False, source=False):
+def _pi_existing(session, actor, payload, *, memory=False, discovery=False, source=False, workbench=False):
     from backend.app.modules.assistant import principal
     if type(actor) is principal.WorkPrincipal:
         principal.check(session, actor)
@@ -254,7 +259,7 @@ def _pi_existing(session, actor, payload, *, memory=False, discovery=False, sour
             _fail('agent_idempotency_runtime_conflict', 409)
     frozen = execution.frozen_context if execution is not None else None
     if (type(frozen) is not dict or type(frozen.get("pi_readonly_binding")) is not dict
-            or frozen["pi_readonly_binding"].get("profile") != _pi_route_profile(memory, discovery, source)):
+            or frozen["pi_readonly_binding"].get("profile") != _pi_route_profile(memory, discovery, source, workbench)):
         _fail("agent_idempotency_runtime_conflict", 409)
     try:
         record = repository.validate_pi_runtime_record(frozen.get("pi_runtime_record"))
@@ -290,14 +295,15 @@ def submit_pi(request: Request, payload: PiRequest, actor, auth_session: Session
     return execute_pi_submission(config, actor, payload, prepared, private, memory=memory)
 
 
-def prepare_pi_submission(config, actor, payload, *, memory=False, discovery=False, source=False):
+def prepare_pi_submission(config, actor, payload, *, memory=False, discovery=False, source=False, workbench=False):
     """No Run creation, claim, dispatch or network. Caller must recheck authority."""
     validate_pi_config(config, actor)
     try:
         prepared = prepare_pi_release(config.launch)
-        if repository.pi_record_tool_profile(prepared.runtime_record()) != _pi_route_profile(memory, discovery, source):
+        if repository.pi_record_tool_profile(prepared.runtime_record()) != _pi_route_profile(memory, discovery, source, workbench):
             _fail("pi_profile_route_mismatch",409)
-        if prepared.runtime_record()['contract_version'] == 2:
+        from .pi_runtime_contract import contract_for_record
+        if contract_for_record(prepared.runtime_record()).online:
             from backend.app.modules.agents.pi_online_transport import PiOnlineTransport
             # HTTPS is available only to the explicit trusted one-response probe.
             # Ordinary v2 and the existing synthetic campaign stay offline.
@@ -320,20 +326,23 @@ def prepare_pi_submission(config, actor, payload, *, memory=False, discovery=Fal
         if (not private.parent.is_dir() or private.parent.resolve() != private.parent
                 or private.exists() or private.is_symlink()):
             raise ValueError('pi_private_parent_unavailable')
+    except service.AgentRuntimeError:
+        raise
     except Exception as error:
         raise service.AgentRuntimeError("pi_release_unavailable", 503) from error
     return prepared, private
 
 
-def execute_pi_submission(config, actor, payload, prepared, private, *, memory=False, discovery=False, source=False):
+def execute_pi_submission(config, actor, payload, prepared, private, *, memory=False, discovery=False, source=False, workbench=False, tool_selection=None):
     """Execute only a new, normally returned Pi claim; never adopt an old Run."""
-    if repository.pi_record_tool_profile(prepared.runtime_record()) != _pi_route_profile(memory, discovery, source):
+    if repository.pi_record_tool_profile(prepared.runtime_record()) != _pi_route_profile(memory, discovery, source, workbench):
         _fail('pi_profile_route_mismatch', 409)
     try:
         receipt, bridge = PiRunBridge.submit_for_http(session_factory=config.session_factory,
             requester=actor, machine_token=config.machine_token, text=payload.text,
             key=payload.run_id, requested_run_id=payload.run_id, runtime_record=prepared.runtime_record(),
-            offline_transport=config.offline_transport, campaign=config.campaign, category_source=config.category_source, research_source=config.research_source, sales_source=config.sales_source)
+            offline_transport=config.offline_transport, campaign=config.campaign, category_source=config.category_source, research_source=config.research_source, sales_source=config.sales_source,
+            tool_selection=tool_selection if workbench else None)
     except service.AgentRuntimeError:
         raise
     except Exception as error:
@@ -341,7 +350,7 @@ def execute_pi_submission(config, actor, payload, prepared, private, *, memory=F
         raise service.AgentRuntimeError("pi_submission_unresolved", 503) from error
     if bridge is None:
         with config.session_factory() as session:
-            receipt = _pi_existing(session, actor, payload, memory=memory, discovery=discovery, source=source)
+            receipt = _pi_existing(session, actor, payload, memory=memory, discovery=discovery, source=source, workbench=workbench)
         if receipt is None:
             _fail("pi_submission_unresolved")
         return receipt
@@ -352,8 +361,15 @@ def execute_pi_submission(config, actor, payload, prepared, private, *, memory=F
                 record_runtime_report(config.campaign.artifact_directory, report)
         run_pi_prepared(prepared=prepared, private_tree=private, bridge=bridge, prompt=payload.text, publish=publish)
     except Exception as error:
-        # Supervisor already owns its single A disposition. This layer only
-        # returns a generic failure; it never retries or calls abandon again.
+        # A finite child reason is not proof of no send. Only the supervisor's
+        # fact-classified known failure may become an input-capacity response.
+        from .runtime_protocol import ProtocolError, PI_PROVIDER_CAPACITY_CODE
+        if (isinstance(error, ProtocolError) and error.code == PI_PROVIDER_CAPACITY_CODE
+                and bridge.first_close_status == "failed"
+                and bridge.close_attempts
+                and bridge.close_attempts[0]["code"] == "pi_provider_capacity_exceeded"):
+            raise service.AgentRuntimeError("pi_provider_capacity_exceeded", 422) from error
+        # Never retry or close again; unknown/unresolved effects stay generic.
         raise service.AgentRuntimeError("pi_runtime_failed", 503) from error
     with config.session_factory() as session:
         result = service.read_run_receipt(session, actor, payload.run_id)

@@ -67,6 +67,38 @@ def _digest(value: Any) -> str:
     return sha256(_canonical(value).encode("utf-8")).hexdigest()
 
 
+def _independent_review_limit(preview: dict, session_id: str, observed_ids: list[str]) -> str | None:
+    # A successful review advances the session version. That is the authority
+    # for currentness, independent of receipt display order or the wall clock.
+    unverified = "independent_review_acceptance_unverified"
+    version = preview["session_version"]
+    if type(version) is not int or version < 1:
+        return unverified
+    current = None
+    for receipt in preview["review_receipts"]:
+        if not isinstance(receipt, dict) or receipt.get("session_id") != session_id:
+            return unverified
+        receipt_version = receipt.get("session_version")
+        if type(receipt_version) is not int or not 1 <= receipt_version <= version:
+            return unverified
+        if receipt_version == version:
+            if current is not None:
+                return unverified
+            current = receipt
+    if current is None:
+        return "independent_review_not_current"
+    if (not observed_ids or current.get("decision") != "accepted_partial"
+            or not isinstance(current.get("receipt_ref"), str) or not current["receipt_ref"]):
+        return unverified
+    accepted = current.get("observation_ids")
+    if type(accepted) is not list or any(type(item) is not str or not item for item in accepted):
+        return unverified
+    leaves = set(observed_ids)
+    if len(accepted) != len(observed_ids) or len(leaves) != len(observed_ids) or set(accepted) != leaves:
+        return unverified
+    return None
+
+
 def read_evidence(session: Session, requester: AuthenticatedSubject,
                   payload: EvidenceInput) -> EvidenceOutput:
     """Read STK-004 preview; all source filters are taken from requester scope."""
@@ -191,8 +223,9 @@ def read_evidence(session: Session, requester: AuthenticatedSubject,
     } for g in preview["groups"]]
     if not all_lines:
         reasons.append("no_observations")
-    if not preview["review_current"]:
-        reasons.append("independent_review_not_current")
+    review_limit = _independent_review_limit(preview, payload.session_id, observed_ids)
+    if review_limit is not None:
+        reasons.append(review_limit)
     if preview["coverage_kind"] == "unknown":
         reasons.append("coverage_unknown")
     else:
@@ -213,7 +246,7 @@ def read_evidence(session: Session, requester: AuthenticatedSubject,
     # SKU, location, quantity or the whole-store ledger being correct.
     if not all_lines or any(x["reasons"] for x in all_lines):
         confidence = "insufficient"
-    elif not preview["review_current"]:
+    elif review_limit is not None:
         confidence = "needs_human_review"
     else:
         confidence = "supported_by_source_receipt"

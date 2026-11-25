@@ -186,9 +186,10 @@ def score_suite(cases: list[dict[str, Any]], results: dict[str, dict[str, Any]],
     if not isinstance(results, dict):
         results = {}
         meta_errors = [*meta_errors, "results_not_object"]
+    provenance_errors: list[str] = []
     if metadata.get("mode") == "online":
-        meta_errors = [*meta_errors,
-                       *validate_online(results, metadata, cases_digest(cases))]
+        provenance_errors = validate_online(results, metadata, cases_digest(cases))
+        meta_errors = [*meta_errors, *provenance_errors]
     scored = [score_case(case, results.get(case["id"], {}), metadata)
               for case in cases if isinstance(case, dict) and "id" in case]
     failed = [item for item in scored if not item["passed"]]
@@ -201,8 +202,7 @@ def score_suite(cases: list[dict[str, Any]], results: dict[str, dict[str, Any]],
         "toolset_version": metadata.get("toolset_version"),
         "case_errors": case_errors,
         "metadata_errors": meta_errors,
-        "provenance_verified": metadata.get("mode") != "online" or not any(
-            error.startswith("online_provenance") for error in meta_errors),
+        "provenance_verified": not provenance_errors,
         "cases": scored,
         "passed": sum(1 for item in scored if item["passed"]),
         "total": len(scored),

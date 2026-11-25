@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { businessPermission } from "../lib/auth/businessPermissions";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { getScopeVersion, subscribe as subscribeSession } from "../lib/auth/session";
+import { getCapabilityEpoch, subscribeCapabilities, useCapabilities } from "../lib/auth/capabilities";
 import { navigate } from "../app/router";
 import { searchCommandObjects, type CommandSearchResult } from "../lib/api/workspace";
-import { useWorkspaceState, openWorkbenchTab, selectWorkbenchTab, setLeftSection } from "../workspace/store";
-import { setShellMode } from "./shellMode";
-import { getPermittedWorkObjects, toRouteWorkbenchTab } from "./workObjects";
+import { openWorkbenchTab, selectWorkbenchTab, setLeftSection } from "../workspace/store";
+import { getPermittedWorkObjects, openWorkObjectRouteTab } from "./workObjects";
 import styles from "../styles/workbench.module.css";
 
 export interface CommandPaletteProps {
@@ -22,6 +24,15 @@ interface PaletteEntry {
   run: () => void;
 }
 
+// Object identity distinguishes A → B → A, even before the debounce or effects run.
+type SearchInput = { text: string };
+type SearchScope = {
+  input: SearchInput;
+  session: number;
+  epoch: number;
+};
+type SearchProof = SearchScope & { result: CommandSearchResult };
+
 export function CommandPalette({
   open,
   onClose,
@@ -29,63 +40,70 @@ export function CommandPalette({
   modelOffline,
   onCreateQuoteDraft,
 }: CommandPaletteProps) {
-  const [query, setQuery] = useState("");
+  const [input, setInput] = useState<SearchInput>({ text: "" });
+  const latestInput = useRef(input);
+  const active = useRef(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
-  const [remoteResult, setRemoteResult] = useState<CommandSearchResult | null>(null);
-  const [searching, setSearching] = useState(false);
+  const [proof, setProof] = useState<SearchProof | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const ws = useWorkspaceState();
+  const session = useSyncExternalStore(subscribeSession, getScopeVersion, getScopeVersion);
+  const epoch = useSyncExternalStore(subscribeCapabilities, getCapabilityEpoch, getCapabilityEpoch);
+  const { status } = useCapabilities();
+  const query = input.text;
+  const trimmed = query.trim();
+  const shouldSearch = open && status === "ready";
+  const result = proof?.input === input && proof.session === session &&
+    proof.epoch === epoch ? proof.result : null;
+  const searching = shouldSearch && !result;
+
+  const isCurrent = useCallback(() =>
+    active.current && latestInput.current === input && getScopeVersion() === session &&
+    getCapabilityEpoch() === epoch,
+  [input, session, epoch]);
+
+  const close = useCallback(() => {
+    active.current = false;
+    onClose();
+  }, [onClose]);
+
+  useLayoutEffect(() => {
+    active.current = open;
+    if (!open) {
+      const cleared = { text: "" };
+      latestInput.current = cleared;
+      setInput(cleared);
+      setSelectedIndex(0);
+      setProof(null);
+    }
+    return () => { active.current = false; };
+  }, [open]);
 
   useEffect(() => {
-    if (!open) {
-      setQuery("");
-      setSelectedIndex(0);
-      setRemoteResult(null);
-      return;
-    }
-    const timer = setTimeout(() => {
-      inputRef.current?.focus();
-    }, 10);
+    if (!open) return;
+    const timer = setTimeout(() => inputRef.current?.focus(), 10);
     return () => clearTimeout(timer);
   }, [open]);
 
   useEffect(() => {
-    if (!open) {
-      return;
-    }
-    let cancelled = false;
-    const trimmed = query.trim();
+    if (!shouldSearch) return;
+    const controller = new AbortController();
+    const publish = (result: CommandSearchResult) => {
+      if (!controller.signal.aborted && isCurrent()) setProof({ input, session, epoch, result });
+    };
     const timer = setTimeout(() => {
-      if (!trimmed && Object.keys(ws.artifactsById).length === 0) {
-        return;
-      }
-      setSearching(true);
-      void searchCommandObjects(trimmed)
-        .then((res) => {
-          if (!cancelled) {
-            setRemoteResult(res);
-          }
-        })
-        .catch(() => {
-          if (!cancelled) {
-            setRemoteResult({ products: [], artifacts: [], degraded: true });
-          }
-        })
-        .finally(() => {
-          if (!cancelled) {
-            setSearching(false);
-          }
-        });
+      if (!isCurrent()) return;
+      void searchCommandObjects(trimmed, controller.signal).then(publish, () => {
+        publish({ products: [], artifacts: [], degraded: true });
+      });
     }, 150);
-
     return () => {
-      cancelled = true;
+      controller.abort();
       clearTimeout(timer);
     };
-  }, [open, query, ws.artifactsById]);
+  }, [shouldSearch, trimmed, input, session, epoch, isCurrent]);
 
   const entries = useMemo<PaletteEntry[]>(() => {
-    const q = query.trim().toLowerCase();
+    const q = trimmed.toLowerCase();
     const list: PaletteEntry[] = [];
 
     // 1. Deterministic permitted module navigation
@@ -99,16 +117,15 @@ export function CommandPalette({
           label: `打开工作对象：${mod.title}`,
           hint: `${mod.path} · ${mod.tier}`,
           run: () => {
-            navigate(mod.path);
-            openWorkbenchTab(toRouteWorkbenchTab(mod));
-            onClose();
+            openWorkObjectRouteTab(mod.path);
+            close();
           },
         });
       }
     }
 
     // 2. Deterministic offline-capable quick commands (capability filtered)
-    if (capabilities.includes("sales.read") || capabilities.includes("sales.draft")) {
+    if (capabilities.includes(businessPermission.sales.write)) {
       const label = "新建 L1 报价草稿 Artifact";
       if (!q || `${label} quote 报价 草稿`.toLowerCase().includes(q)) {
         list.push({
@@ -118,40 +135,14 @@ export function CommandPalette({
           hint: "L1 共编草稿（模型离线可用）",
           run: () => {
             onCreateQuoteDraft();
-            onClose();
+            close();
           },
         });
       }
     }
 
-    // 3. Cached / open Artifacts
-    for (const art of Object.values(ws.artifactsById)) {
-      const text = `${art.title} ${art.kind} ${art.id}`.toLowerCase();
-      if (!q || text.includes(q)) {
-        list.push({
-          id: `local-art:${art.id}`,
-          group: "工作成果 Artifact",
-          label: art.title,
-          hint: `v${art.version} · ${art.status}`,
-          run: () => {
-            openWorkbenchTab({
-              id: `artifact:${art.id}`,
-              kind: "artifact",
-              title: art.title,
-              objectKind: art.kind,
-              objectId: art.id,
-              artifactId: art.id,
-              closable: true,
-            });
-            onClose();
-          },
-        });
-      }
-    }
-
-    // 4. Remote backend artifacts & catalog products
-    for (const art of remoteResult?.artifacts ?? []) {
-      if (ws.artifactsById[art.id]) continue;
+    // 3. Only the server list can prove that an artifact is visible in this epoch.
+    for (const art of result?.artifacts ?? []) {
       list.push({
         id: `remote-art:${art.id}`,
         group: "服务端 Artifact",
@@ -167,19 +158,19 @@ export function CommandPalette({
             artifactId: art.id,
             closable: true,
           });
-          onClose();
+          close();
         },
       });
     }
 
-    for (const prod of remoteResult?.products ?? []) {
+    for (const prod of result?.products ?? []) {
       list.push({
         id: `prod:${prod.id}`,
         group: "商品目录结果 (L0)",
         label: `${prod.name} (${prod.sku})`,
         hint: "点击创建关联报价草稿或定位商品",
         run: () => {
-          if (capabilities.includes("sales.read") || capabilities.includes("sales.draft")) {
+          if (capabilities.includes(businessPermission.sales.write)) {
             onCreateQuoteDraft({ sku: prod.sku, name: prod.name });
           } else {
             openWorkbenchTab({
@@ -191,12 +182,12 @@ export function CommandPalette({
             });
             navigate("/catalog");
           }
-          onClose();
+          close();
         },
       });
     }
 
-    // 5. Workbench shell commands
+    // 4. Workbench shell commands
     const extraCmds: PaletteEntry[] = [
       {
         id: "shell:today",
@@ -207,17 +198,7 @@ export function CommandPalette({
           selectWorkbenchTab("today");
           setLeftSection("today");
           navigate("/");
-          onClose();
-        },
-      },
-      {
-        id: "shell:legacy",
-        group: "工作台视图",
-        label: "切换到经典单页模式 (?shell=legacy)",
-        hint: "秒级回滚切换",
-        run: () => {
-          setShellMode("legacy");
-          onClose();
+          close();
         },
       },
     ];
@@ -228,13 +209,17 @@ export function CommandPalette({
     }
 
     return list;
-  }, [capabilities, onClose, onCreateQuoteDraft, query, remoteResult, ws.artifactsById]);
+  }, [capabilities, close, onCreateQuoteDraft, trimmed, result]);
 
   if (!open) {
     return null;
   }
 
-  const clampedIndex = Math.min(selectedIndex, Math.max(0, entries.length - 1));
+  const lastIndex = Math.max(0, entries.length - 1);
+  const clampedIndex = Math.min(selectedIndex, lastIndex);
+  const activate = (entry: PaletteEntry) => {
+    if (isCurrent()) entry.run();
+  };
 
   return (
     <div
@@ -242,7 +227,7 @@ export function CommandPalette({
       role="presentation"
       onClick={(e) => {
         if (e.target === e.currentTarget) {
-          onClose();
+          close();
         }
       }}
     >
@@ -255,22 +240,22 @@ export function CommandPalette({
         onKeyDown={(e) => {
           if (e.key === "Escape") {
             e.preventDefault();
-            onClose();
+            close();
           } else if (e.key === "ArrowDown") {
             e.preventDefault();
-            setSelectedIndex((prev) => Math.min(entries.length - 1, prev + 1));
+            setSelectedIndex((prev) => Math.min(lastIndex, prev + 1));
           } else if (e.key === "ArrowUp") {
             e.preventDefault();
             setSelectedIndex((prev) => Math.max(0, prev - 1));
           } else if (e.key === "Enter" && entries[clampedIndex]) {
             e.preventDefault();
-            entries[clampedIndex].run();
+            activate(entries[clampedIndex]);
           }
         }}
       >
         <div className={styles.panelHeader}>
           <h3 className={styles.panelTitle}>全局命令面板（Ctrl+K）</h3>
-          <button type="button" className={styles.modeButton} onClick={onClose}>
+          <button type="button" className={styles.modeButton} onClick={close}>
             关闭 Esc
           </button>
         </div>
@@ -283,7 +268,10 @@ export function CommandPalette({
           aria-label="搜索工作对象或命令"
           value={query}
           onChange={(e) => {
-            setQuery(e.target.value);
+            if (!active.current) return;
+            const next = { text: e.target.value };
+            latestInput.current = next;
+            setInput(next);
             setSelectedIndex(0);
           }}
         />
@@ -317,7 +305,7 @@ export function CommandPalette({
                       }
                     : undefined
                 }
-                onClick={entry.run}
+                onClick={() => activate(entry)}
               >
                 <div>
                   <div style={{ fontWeight: 600 }}>{entry.label}</div>

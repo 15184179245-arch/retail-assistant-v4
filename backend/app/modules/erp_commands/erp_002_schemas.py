@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 from backend.app.core.errors import ApiEnvelope
+from backend.app.core.iso_datetime import parse_bounded_iso_offset
 
 
 def _iso(value):
@@ -14,6 +15,13 @@ def _iso(value):
 
 
 IsoDatetime = Annotated[datetime, BeforeValidator(_iso)]
+
+
+def _parse_deadline(value):
+    return parse_bounded_iso_offset(value, invalid_offset="erp_deadline_utc_offset_invalid")
+
+
+DeadlineDatetime = Annotated[datetime, BeforeValidator(_parse_deadline)]
 
 
 class StrictDTO(BaseModel):
@@ -29,14 +37,14 @@ class ERPCommandPropose(StrictDTO):
     target_version: int = Field(ge=1)
     source_sha256: str = Field(min_length=64, max_length=64)
     business_parameters: dict
-    expires_at: IsoDatetime
+    expires_at: DeadlineDatetime
 
 
 class ERPCommandDecide(StrictDTO):
     request_digest: str = Field(min_length=64, max_length=64)
     decision: Literal["approved", "rejected"]
     reason: str = Field(min_length=1, max_length=1000)
-    expires_at: IsoDatetime
+    expires_at: DeadlineDatetime
 
 
 class ERPCommandStage(StrictDTO):

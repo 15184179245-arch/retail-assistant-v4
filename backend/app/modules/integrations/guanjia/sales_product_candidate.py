@@ -5,6 +5,7 @@ The caller must supply an authorized, complete, double-read source candidate.
 """
 from dataclasses import dataclass, field
 from decimal import Decimal, DecimalException, Inexact, Rounded, localcontext
+from heapq import nsmallest
 
 from .sales_ranking_contract import (
     MAX_ROWS, RankingCandidate, RankingRow, _assist_display, _decimal,
@@ -100,10 +101,14 @@ def aggregate_product_candidate(candidate: RankingCandidate) -> ProductCandidate
                 group[1].append(row.standard_id)
                 group[2] = _decimal(group[2] + row.qty)
                 group[3] = _decimal(group[3] + row.total)
-            rows = [ProductRow(product, *group[0], tuple(group[1]), group[2], group[3])
-                    for product, group in groups.items()]
-            rows.sort(key=lambda row: (-row.qty, row.product_id))
-        return ProductCandidate(candidate.store_id, tuple(rows[:20]),
+            # Group and validate the complete source first, then keep only
+            # the exact Top 20 with the original quantity and ID sort key.
+            leaders = nsmallest(20, groups, key=lambda product: (-groups[product][2], product))
+            rows = []
+            for product in leaders:
+                group = groups[product]
+                rows.append(ProductRow(product, *group[0], tuple(group[1]), group[2], group[3]))
+        return ProductCandidate(candidate.store_id, tuple(rows),
                                 candidate.total_count, len(groups))
     except (ValueError, TypeError, AttributeError, DecimalException):
         _deny()

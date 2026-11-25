@@ -243,8 +243,8 @@ def change_agent_permission(
     if deadline is not None and deadline <= current:
         raise ValueError("permission expiry must be in the future")
 
-    if mode == 'allow' and (deadline is None or (deadline-current).total_seconds() > 86400):
-        raise ValueError('Agent sales allow requires an expiry within 24 hours')
+    if mode == 'allow' and (deadline is None or (deadline-current).total_seconds() > 7 * 86400):
+        raise ValueError('Agent sales allow requires an expiry within 7 days')
     if mode == 'allow':
         agent_roles = load_scope(session, organization_id, store_id, agent.id)[3]
         grants = grants_for(session, organization_id, store_id, agent.id, agent_roles, permission)
