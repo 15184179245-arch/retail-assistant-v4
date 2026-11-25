@@ -1,0 +1,162 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 2,
+    "identityHash": "c5141bb4f953b82fc6b3ae101284e4ea",
+    "entities": [
+      {
+        "tableName": "catalog_cache_items",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`snapshotVersion` TEXT NOT NULL, `productId` TEXT NOT NULL, `code` TEXT NOT NULL, `barcode` TEXT, `name` TEXT NOT NULL, `searchText` TEXT NOT NULL, `sourceVersion` TEXT NOT NULL, PRIMARY KEY(`snapshotVersion`, `productId`))",
+        "fields": [
+          {
+            "fieldPath": "snapshotVersion",
+            "columnName": "snapshotVersion",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "productId",
+            "columnName": "productId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "code",
+            "columnName": "code",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "barcode",
+            "columnName": "barcode",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "searchText",
+            "columnName": "searchText",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceVersion",
+            "columnName": "sourceVersion",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "snapshotVersion",
+            "productId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_catalog_cache_items_snapshotVersion",
+            "unique": false,
+            "columnNames": [
+              "snapshotVersion"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_catalog_cache_items_snapshotVersion` ON `${TABLE_NAME}` (`snapshotVersion`)"
+          }
+        ]
+      },
+      {
+        "tableName": "catalog_cache_state",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER NOT NULL, `scopeDigest` TEXT NOT NULL, `activeVersion` TEXT, `activeObservedAtMs` INTEGER NOT NULL, `activeExpiresAtMs` INTEGER NOT NULL, `stagingVersion` TEXT, `stagingObservedAtMs` INTEGER NOT NULL DEFAULT 0, `stagingExpiresAtMs` INTEGER NOT NULL DEFAULT 0, `stagedCount` INTEGER NOT NULL, `expectedTotal` INTEGER NOT NULL, `nextCursor` TEXT, `lastVerifiedAtMs` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeDigest",
+            "columnName": "scopeDigest",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "activeVersion",
+            "columnName": "activeVersion",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "activeObservedAtMs",
+            "columnName": "activeObservedAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "activeExpiresAtMs",
+            "columnName": "activeExpiresAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stagingVersion",
+            "columnName": "stagingVersion",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "stagingObservedAtMs",
+            "columnName": "stagingObservedAtMs",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          },
+          {
+            "fieldPath": "stagingExpiresAtMs",
+            "columnName": "stagingExpiresAtMs",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          },
+          {
+            "fieldPath": "stagedCount",
+            "columnName": "stagedCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "expectedTotal",
+            "columnName": "expectedTotal",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nextCursor",
+            "columnName": "nextCursor",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "lastVerifiedAtMs",
+            "columnName": "lastVerifiedAtMs",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'c5141bb4f953b82fc6b3ae101284e4ea')"
+    ]
+  }
+}

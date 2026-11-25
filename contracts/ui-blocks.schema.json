@@ -1,0 +1,434 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://retail.example.invalid/contracts/ui-blocks.schema.json",
+  "title": "Retail Generative UI Block v1",
+  "description": "Strict whitelist schema for C2C-140 v1 Generative UI blocks. Requires {type, version, props, refs} and forbids raw HTML/JS and model-supplied unreferenced price/stock/amount fields.",
+  "type": "object",
+  "required": ["type", "version", "props", "refs"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": [
+        "product_card",
+        "product_list",
+        "compare_table",
+        "quote_draft",
+        "purchase_draft",
+        "stock_location",
+        "work_item_list",
+        "evidence_panel",
+        "action_card",
+        "form_request",
+        "artifact_link"
+      ]
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^v?1(\\.[0-9]+)*$"
+    },
+    "props": {
+      "type": "object"
+    },
+    "refs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/blockRef"
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/productCardBlock" },
+    { "$ref": "#/$defs/productListBlock" },
+    { "$ref": "#/$defs/compareTableBlock" },
+    { "$ref": "#/$defs/quoteDraftBlock" },
+    { "$ref": "#/$defs/purchaseDraftBlock" },
+    { "$ref": "#/$defs/stockLocationBlock" },
+    { "$ref": "#/$defs/workItemListBlock" },
+    { "$ref": "#/$defs/evidencePanelBlock" },
+    { "$ref": "#/$defs/actionCardBlock" },
+    { "$ref": "#/$defs/formRequestBlock" },
+    { "$ref": "#/$defs/artifactLinkBlock" }
+  ],
+  "$defs": {
+    "safeText": {
+      "type": "string",
+      "maxLength": 2000,
+      "not": {
+        "pattern": "<[a-zA-Z!/]|\\bon([Cc][Ll][Ii][Cc][Kk]|[Ll][Oo][Aa][Dd]|[Ee][Rr][Rr][Oo][Rr]|[Mm][Oo][Uu][Ss][Ee][Oo][Vv][Ee][Rr]|[Ff][Oo][Cc][Uu][Ss]|[Ss][Uu][Bb][Mm][Ii][Tt])[ \\t]*=|[Jj][Aa][Vv][Aa][Ss][Cc][Rr][Ii][Pp][Tt][ \\t]*:"
+      }
+    },
+    "forbiddenPropNames": {
+      "not": {
+        "enum": [
+          "price",
+          "unit_price",
+          "cost_price",
+          "sell_price",
+          "list_price",
+          "final_price",
+          "stock",
+          "stock_qty",
+          "stock_quantity",
+          "on_hand",
+          "available_qty",
+          "amount",
+          "total_amount",
+          "subtotal",
+          "discount_amount",
+          "balance",
+          "cost_amount",
+          "html",
+          "raw_html",
+          "inner_html",
+          "outer_html",
+          "dangerouslySetInnerHTML",
+          "dangerously_set_inner_html",
+          "script",
+          "js",
+          "javascript",
+          "markup",
+          "onclick",
+          "onload",
+          "onerror"
+        ]
+      }
+    },
+    "safeParamValue": {
+      "oneOf": [
+        { "$ref": "#/$defs/safeText" },
+        { "type": "number" },
+        { "type": "boolean" },
+        { "type": "null" },
+        {
+          "type": "array",
+          "items": { "$ref": "#/$defs/safeParamScalarOrNested" }
+        },
+        {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+          "additionalProperties": { "$ref": "#/$defs/safeParamScalarOrNested" }
+        }
+      ]
+    },
+    "safeParamScalarOrNested": {
+      "oneOf": [
+        { "$ref": "#/$defs/safeText" },
+        { "type": "number" },
+        { "type": "boolean" },
+        { "type": "null" }
+      ]
+    },
+    "blockRef": {
+      "type": "object",
+      "required": ["kind", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "product",
+            "price",
+            "quote",
+            "purchase",
+            "stock",
+            "location",
+            "work_item",
+            "evidence",
+            "artifact",
+            "receiving",
+            "stocktake",
+            "command"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "version": {
+          "type": ["string", "integer"]
+        },
+        "field": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "label": {
+          "$ref": "#/$defs/safeText"
+        }
+      }
+    },
+    "lineRef": {
+      "type": "object",
+      "required": ["ref_id", "qty"],
+      "additionalProperties": false,
+      "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+      "properties": {
+        "ref_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "qty": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "unit": {
+          "$ref": "#/$defs/safeText"
+        },
+        "note": {
+          "$ref": "#/$defs/safeText"
+        }
+      }
+    },
+    "formFieldSpec": {
+      "type": "object",
+      "required": ["name", "label", "field_type"],
+      "additionalProperties": false,
+      "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"
+        },
+        "label": { "$ref": "#/$defs/safeText" },
+        "field_type": {
+          "type": "string",
+          "enum": ["text", "number", "select", "boolean", "date"]
+        },
+        "required": { "type": "boolean" },
+        "options": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/safeText" }
+        },
+        "placeholder": { "$ref": "#/$defs/safeText" }
+      }
+    },
+    "productCardBlock": {
+      "properties": {
+        "type": { "const": "product_card" },
+        "refs": { "minItems": 1 },
+        "props": {
+          "type": "object",
+          "additionalProperties": false,
+          "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+          "properties": {
+            "title": { "$ref": "#/$defs/safeText" },
+            "highlight": { "$ref": "#/$defs/safeText" },
+            "compact": { "type": "boolean" },
+            "display_fields": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/safeText" }
+            }
+          }
+        }
+      }
+    },
+    "productListBlock": {
+      "properties": {
+        "type": { "const": "product_list" },
+        "refs": { "minItems": 1 },
+        "props": {
+          "type": "object",
+          "additionalProperties": false,
+          "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+          "properties": {
+            "title": { "$ref": "#/$defs/safeText" },
+            "empty_text": { "$ref": "#/$defs/safeText" },
+            "max_items": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "display_fields": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/safeText" }
+            }
+          }
+        }
+      }
+    },
+    "compareTableBlock": {
+      "properties": {
+        "type": { "const": "compare_table" },
+        "refs": { "minItems": 1 },
+        "props": {
+          "type": "object",
+          "required": ["columns"],
+          "additionalProperties": false,
+          "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+          "properties": {
+            "title": { "$ref": "#/$defs/safeText" },
+            "columns": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/safeText" }
+            },
+            "highlight_ref_id": { "type": "string", "maxLength": 200 }
+          }
+        }
+      }
+    },
+    "quoteDraftBlock": {
+      "properties": {
+        "type": { "const": "quote_draft" },
+        "refs": { "minItems": 1 },
+        "props": {
+          "type": "object",
+          "additionalProperties": false,
+          "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+          "properties": {
+            "title": { "$ref": "#/$defs/safeText" },
+            "artifact_id": { "type": "string", "maxLength": 100 },
+            "customer_label": { "$ref": "#/$defs/safeText" },
+            "stage": { "type": "string", "enum": ["draft", "ready"] },
+            "status": { "type": "string", "enum": ["pending", "paid"] },
+            "note": { "$ref": "#/$defs/safeText" },
+            "line_refs": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/lineRef" }
+            }
+          }
+        }
+      }
+    },
+    "purchaseDraftBlock": {
+      "properties": {
+        "type": { "const": "purchase_draft" },
+        "refs": { "minItems": 1 },
+        "props": {
+          "type": "object",
+          "additionalProperties": false,
+          "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+          "properties": {
+            "title": { "$ref": "#/$defs/safeText" },
+            "artifact_id": { "type": "string", "maxLength": 100 },
+            "supplier_label": { "$ref": "#/$defs/safeText" },
+            "note": { "$ref": "#/$defs/safeText" },
+            "line_refs": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/lineRef" }
+            }
+          }
+        }
+      }
+    },
+    "stockLocationBlock": {
+      "properties": {
+        "type": { "const": "stock_location" },
+        "refs": { "minItems": 1 },
+        "props": {
+          "type": "object",
+          "additionalProperties": false,
+          "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+          "properties": {
+            "title": { "$ref": "#/$defs/safeText" },
+            "filter_zone": { "$ref": "#/$defs/safeText" },
+            "show_siblings": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "workItemListBlock": {
+      "properties": {
+        "type": { "const": "work_item_list" },
+        "refs": { "minItems": 1 },
+        "props": {
+          "type": "object",
+          "additionalProperties": false,
+          "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+          "properties": {
+            "title": { "$ref": "#/$defs/safeText" },
+            "status_filter": { "$ref": "#/$defs/safeText" },
+            "max_items": { "type": "integer", "minimum": 1, "maximum": 100 }
+          }
+        }
+      }
+    },
+    "evidencePanelBlock": {
+      "properties": {
+        "type": { "const": "evidence_panel" },
+        "refs": { "minItems": 1 },
+        "props": {
+          "type": "object",
+          "additionalProperties": false,
+          "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+          "properties": {
+            "title": { "$ref": "#/$defs/safeText" },
+            "summary": { "$ref": "#/$defs/safeText" },
+            "show_provenance": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "actionCardBlock": {
+      "properties": {
+        "type": { "const": "action_card" },
+        "props": {
+          "type": "object",
+          "required": ["title", "action_key"],
+          "additionalProperties": false,
+          "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+          "properties": {
+            "title": { "$ref": "#/$defs/safeText" },
+            "description": { "$ref": "#/$defs/safeText" },
+            "action_key": { "type": "string", "minLength": 1, "maxLength": 120 },
+            "confirm_required": { "type": "boolean" },
+            "target_artifact_id": { "type": "string", "maxLength": 100 },
+            "parameters": {
+              "type": "object",
+              "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+              "additionalProperties": { "$ref": "#/$defs/safeParamValue" }
+            }
+          }
+        }
+      }
+    },
+    "formRequestBlock": {
+      "properties": {
+        "type": { "const": "form_request" },
+        "props": {
+          "type": "object",
+          "required": ["title", "form_id", "fields"],
+          "additionalProperties": false,
+          "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+          "properties": {
+            "title": { "$ref": "#/$defs/safeText" },
+            "form_id": { "type": "string", "minLength": 1, "maxLength": 100 },
+            "submit_label": { "$ref": "#/$defs/safeText" },
+            "fields": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/formFieldSpec" }
+            }
+          }
+        }
+      }
+    },
+    "artifactLinkBlock": {
+      "properties": {
+        "type": { "const": "artifact_link" },
+        "refs": { "minItems": 1 },
+        "props": {
+          "type": "object",
+          "required": ["artifact_id", "artifact_kind"],
+          "additionalProperties": false,
+          "propertyNames": { "$ref": "#/$defs/forbiddenPropNames" },
+          "properties": {
+            "title": { "$ref": "#/$defs/safeText" },
+            "artifact_id": { "type": "string", "minLength": 1, "maxLength": 100 },
+            "artifact_kind": {
+              "type": "string",
+              "enum": [
+                "quote_draft",
+                "purchase_draft",
+                "stocktake_review",
+                "receiving_batch",
+                "work_item_sheet"
+              ]
+            },
+            "action_label": { "$ref": "#/$defs/safeText" }
+          }
+        }
+      }
+    }
+  }
+}

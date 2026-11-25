@@ -1,0 +1,197 @@
+/* C2C-140 Templates A–D CSS Module
+ * Uses tokens.css variables; 1024px / 768px / 320px safe with zero horizontal overflow.
+ */
+
+.templateRoot {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4, 16px);
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.toolbarRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2, 8px);
+  padding: var(--space-3, 12px);
+  border: 1px solid var(--border, #e4e9e8);
+  border-radius: var(--radius-lg, 14px);
+  background: var(--surface, #ffffff);
+  min-width: 0;
+}
+
+/* ---------- Template A: List-Detail Split View ---------- */
+.splitGrid {
+  display: grid;
+  grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+  gap: var(--space-4, 16px);
+  align-items: start;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.listColumn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 8px);
+  min-width: 0;
+}
+
+.listItemBtn {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-height: var(--min-touch-target, 44px);
+  padding: var(--space-3, 12px);
+  border: 1px solid var(--border, #e4e9e8);
+  border-radius: var(--radius-md, 10px);
+  background: var(--surface, #ffffff);
+  color: var(--ink, #17232b);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  box-sizing: border-box;
+  overflow-wrap: anywhere;
+}
+
+.listItemBtn:hover {
+  border-color: var(--brand-primary, #173f35);
+}
+
+.listItemBtn:focus-visible {
+  outline: var(--focus-ring, 2px solid #8fc7b5);
+  outline-offset: var(--focus-offset, 1px);
+}
+
+.listItemActive {
+  border-color: var(--brand-primary, #173f35);
+  background: var(--brand-primary-subtle, #eff7f3);
+}
+
+.detailColumn {
+  min-width: 0;
+  padding: var(--space-4, 16px);
+  border: 1px solid var(--border, #e4e9e8);
+  border-radius: var(--radius-lg, 14px);
+  background: var(--surface, #ffffff);
+  box-sizing: border-box;
+}
+
+/* ---------- Template C: Main + Evidence Sidebar ---------- */
+.evidenceGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: var(--space-4, 16px);
+  align-items: start;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.evidenceMain {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3, 12px);
+}
+
+.evidenceSidebar {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3, 12px);
+}
+
+.sideBox {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 8px);
+  padding: var(--space-3, 12px);
+  border: 1px solid var(--border, #e4e9e8);
+  border-radius: var(--radius-md, 10px);
+  background: var(--surface, #ffffff);
+  font-size: var(--font-size-small, 13px);
+  color: var(--ink, #17232b);
+  overflow-wrap: anywhere;
+}
+
+.sideEyebrow {
+  margin: 0;
+  font-size: var(--font-size-eyebrow, 11px);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--ink-eyebrow, #6b7b78);
+  text-transform: uppercase;
+}
+
+.auditItem {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--space-2, 8px);
+  border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--border, #e4e9e8);
+  background: var(--surface-subtle, #f4f6f8);
+  font-size: var(--font-size-caption, 12px);
+}
+
+.auditItemAgent {
+  border-color: var(--info-border, #b9d8ea);
+  background: var(--info-bg, #eaf4fb);
+}
+
+.conflictNotice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2, 8px);
+  padding: var(--space-3, 12px);
+  border-radius: var(--radius-md, 10px);
+  border: 1px solid var(--warning-border, #e7c57c);
+  background: var(--warning-bg, #fff5dd);
+  color: var(--warning-ink, #7a4d00);
+  font-size: var(--font-size-small, 13px);
+}
+
+/* ---------- Template D: Command Preview Card ---------- */
+.commandCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3, 12px);
+  padding: var(--space-4, 16px);
+  border: 1px solid var(--warning-border, #e7c57c);
+  border-radius: var(--radius-lg, 14px);
+  background: var(--warning-bg, #fff5dd);
+  color: var(--ink, #17232b);
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.commandSummaryGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--space-2, 8px);
+}
+
+.commandCell {
+  padding: var(--space-2, 8px) var(--space-3, 12px);
+  border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--border, #e4e9e8);
+  background: var(--surface, #ffffff);
+  font-size: var(--font-size-caption, 12px);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 1023px) {
+  .splitGrid,
+  .evidenceGrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

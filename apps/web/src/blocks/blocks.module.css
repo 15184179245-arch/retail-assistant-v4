@@ -1,0 +1,363 @@
+/* C2C-140 Generative UI Blocks & L1 Co-editing CSS Module
+ * Strictly uses tokens.css; 320px safe; --success never used for AI edit, lock, or unverified states.
+ */
+
+.blockCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3, 12px);
+  padding: var(--space-4, 16px);
+  border: 1px solid var(--border, #e4e9e8);
+  border-radius: var(--radius-lg, 14px);
+  background: var(--surface, #ffffff);
+  color: var(--ink, #17232b);
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow-wrap: anywhere;
+}
+
+.blockCardAction {
+  border-color: var(--warning-border, #e7c57c);
+  background: var(--warning-bg, #fff5dd);
+}
+
+.blockCardFallback {
+  border-color: var(--warning-border, #e7c57c);
+  background: var(--warning-bg, #fff5dd);
+  color: var(--warning-ink, #7a4d00);
+}
+
+.blockHeader {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2, 8px);
+}
+
+.blockTitleGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.blockTierRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.tierTag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill, 999px);
+  font-size: var(--font-size-eyebrow, 11px);
+  font-weight: 700;
+  border: 1px solid var(--neutral-border, #d7dedb);
+  background: var(--neutral-bg, #f1f4f3);
+  color: var(--neutral-ink, #3c4a46);
+}
+
+.tierL0 {
+  border-color: var(--info-border, #b9d8ea);
+  background: var(--info-bg, #eaf4fb);
+  color: var(--info-ink, #1f5f86);
+}
+
+.tierL1 {
+  border-color: var(--border-subtle, #d7dedb);
+  background: var(--brand-primary-subtle, #eff7f3);
+  color: var(--brand-primary, #173f35);
+}
+
+.tierL2 {
+  border-color: var(--warning-border, #e7c57c);
+  background: var(--warning-bg, #fff5dd);
+  color: var(--warning-ink, #7a4d00);
+}
+
+.blockTitle {
+  margin: 0;
+  font-size: var(--font-size-h2, 16px);
+  font-weight: 700;
+  color: var(--ink, #17232b);
+}
+
+.provenanceBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2, 8px);
+  font-size: var(--font-size-caption, 12px);
+  color: var(--muted, #65736f);
+}
+
+.blockBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 8px);
+  font-size: var(--font-size-small, 13px);
+  line-height: 1.55;
+  min-width: 0;
+}
+
+.kvGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-2, 8px);
+}
+
+.kvCell {
+  padding: var(--space-2, 8px);
+  border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--border, #e4e9e8);
+  background: var(--surface-subtle, #f4f6f8);
+  min-width: 0;
+}
+
+.kvLabel {
+  display: block;
+  font-size: var(--font-size-eyebrow, 11px);
+  color: var(--muted, #65736f);
+}
+
+.kvValue {
+  display: block;
+  margin-top: 2px;
+  font-weight: 700;
+  color: var(--ink, #17232b);
+}
+
+.itemList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 8px);
+}
+
+.itemRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2, 8px);
+  padding: var(--space-2, 8px) var(--space-3, 12px);
+  border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--border, #e4e9e8);
+  background: var(--surface-subtle, #f4f6f8);
+}
+
+.tableWrap {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border, #e4e9e8);
+  border-radius: var(--radius-sm, 6px);
+}
+
+.blockTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-caption, 12px);
+}
+
+.blockTable th,
+.blockTable td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border, #e4e9e8);
+  text-align: left;
+  vertical-align: top;
+}
+
+.blockTable th {
+  background: var(--surface-subtle, #f4f6f8);
+  font-weight: 700;
+  color: var(--ink-secondary, #4c5a56);
+}
+
+.blockActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2, 8px);
+  padding-top: var(--space-1, 4px);
+}
+
+.plainTextPre {
+  margin: 0;
+  padding: var(--space-2, 8px);
+  border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--border-subtle, #d7dedb);
+  background: var(--surface, #ffffff);
+  color: var(--ink, #17232b);
+  font-family: ui-monospace, monospace;
+  font-size: var(--font-size-caption, 12px);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- Streaming Skeleton ---------- */
+.skeletonLine {
+  height: 14px;
+  border-radius: var(--radius-sm, 6px);
+  background: var(--neutral-bg, #f1f4f3);
+}
+
+.skeletonShort {
+  width: 45%;
+}
+
+.skeletonMid {
+  width: 75%;
+}
+
+/* ---------- L1 Co-editing Field ---------- */
+.coeditField {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 8px);
+  padding: var(--space-3, 12px);
+  border: 1px solid var(--border, #e4e9e8);
+  border-radius: var(--radius-md, 10px);
+  background: var(--surface, #ffffff);
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+/* Triple encoding for AI edits: icon + label + subtle brand/info background */
+.coeditAiEdited {
+  border-color: var(--info-border, #b9d8ea);
+  background: var(--info-bg, #eaf4fb);
+}
+
+/* Human lock container: neutral/subtle visual guard */
+.coeditLocked {
+  border-color: var(--border-subtle, #d7dedb);
+  background: var(--brand-primary-subtle, #eff7f3);
+}
+
+.coeditHeader {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2, 8px);
+}
+
+.coeditLabel {
+  font-size: var(--font-size-small, 13px);
+  font-weight: 700;
+  color: var(--ink, #17232b);
+}
+
+.coeditBadges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.aiBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill, 999px);
+  border: 1px solid var(--info-border, #b9d8ea);
+  background: var(--surface, #ffffff);
+  color: var(--info-ink, #1f5f86);
+  font-size: var(--font-size-caption, 12px);
+  font-weight: 700;
+}
+
+.lockBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill, 999px);
+  border: 1px solid var(--border-subtle, #d7dedb);
+  background: var(--neutral-bg, #f1f4f3);
+  color: var(--neutral-ink, #3c4a46);
+  font-size: var(--font-size-caption, 12px);
+  font-weight: 700;
+}
+
+.coeditControlRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2, 8px);
+}
+
+.coeditInput {
+  flex: 1;
+  min-width: 120px;
+  min-height: var(--min-touch-target, 44px);
+  padding: 8px 12px;
+  border: 1px solid var(--border-subtle, #d7dedb);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--surface, #ffffff);
+  color: var(--ink, #17232b);
+  font: inherit;
+  font-size: var(--font-size-body, 14px);
+  box-sizing: border-box;
+}
+
+.coeditInput:focus-visible {
+  outline: var(--focus-ring, 2px solid #8fc7b5);
+  outline-offset: var(--focus-offset, 1px);
+}
+
+.suggestionCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 8px);
+  padding: var(--space-3, 12px);
+  border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--warning-border, #e7c57c);
+  background: var(--warning-bg, #fff5dd);
+  color: var(--warning-ink, #7a4d00);
+  font-size: var(--font-size-caption, 12px);
+}
+
+.partialUndoBanner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2, 8px);
+  padding: var(--space-2, 8px) var(--space-3, 12px);
+  border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--warning-border, #e7c57c);
+  background: var(--warning-bg, #fff5dd);
+  color: var(--warning-ink, #7a4d00);
+  font-size: var(--font-size-caption, 12px);
+  font-weight: 600;
+}
+
+.formRequestField {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.formRequestInput {
+  width: 100%;
+  min-height: var(--min-touch-target, 44px);
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle, #d7dedb);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--surface, #ffffff);
+  color: var(--ink, #17232b);
+  font: inherit;
+  box-sizing: border-box;
+}

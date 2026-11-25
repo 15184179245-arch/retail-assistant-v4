@@ -1,0 +1,1568 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:v4:pi-memory:1",
+  "title": "AGT-046 Host-bound Pi shared-memory wire, recovery A",
+  "description": "Strict bounded UTF8/LF protocol. Native IDs, attempts, pin and committed Host receipts are bound per Run. No resume, result replay, business replay or old experimental protocol fallback. Lexical and state-machine checks supplement JSON Schema.",
+  "x-limits": {
+    "frame_bytes_including_lf": 262144,
+    "direction_bytes": 8388608,
+    "direction_frames": 256,
+    "json_depth": 32,
+    "stderr_bytes": 262144,
+    "handshake_seconds": 3,
+    "partial_frame_seconds_absolute": 5,
+    "session_seconds": 45
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "nonce",
+    "run_id",
+    "epoch",
+    "seq",
+    "type",
+    "reply_to",
+    "body"
+  ],
+  "properties": {
+    "protocol": {
+      "const": "v4.pi-memory/1"
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "run_id": {
+      "$ref": "#/$defs/id"
+    },
+    "epoch": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,29})$"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 256
+    },
+    "type": {
+      "enum": [
+        "hello",
+        "ready",
+        "start",
+        "request",
+        "response",
+        "session_end",
+        "error"
+      ]
+    },
+    "reply_to": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 256
+    },
+    "body": {}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "hello",
+              "ready"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "$ref": "#/$defs/handshake"
+          },
+          "reply_to": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "start"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "$ref": "#/$defs/start"
+          },
+          "reply_to": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "request"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "$ref": "#/$defs/request"
+          },
+          "reply_to": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "response"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "$ref": "#/$defs/response"
+          },
+          "reply_to": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "session_end"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "enum": [
+                  "ok",
+                  "error"
+                ]
+              }
+            }
+          },
+          "reply_to": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "error"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "$ref": "#/$defs/code"
+              }
+            }
+          },
+          "reply_to": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ],
+  "x-stateful-requirements": [
+    "exact role/direction and next sequence",
+    "same nonce/run/epoch",
+    "single pending request and matching reply_to/op",
+    "unique tool names within start subset",
+    "attempt_id equals step_id",
+    "same pinned toolset and native ID at Host dispatch",
+    "no automatic resume or reemit"
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.:-]+$"
+    },
+    "safeint": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "code": {
+      "enum": [
+        "host_operation_failed",
+        "protocol_error",
+        "runtime_failed"
+      ]
+    },
+    "sdk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine",
+        "version",
+        "adapter_contract"
+      ],
+      "properties": {
+        "engine": {
+          "const": "@earendil-works/pi-coding-agent"
+        },
+        "version": {
+          "const": "1.4.0"
+        },
+        "adapter_contract": {
+          "const": "host-run-receipt-v1"
+        }
+      }
+    },
+    "handshake": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sdk",
+        "profile"
+      ],
+      "properties": {
+        "sdk": {
+          "$ref": "#/$defs/sdk"
+        },
+        "profile": {
+          "const": "pi-memory-v1"
+        }
+      }
+    },
+    "start": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool_profile",
+        "toolset_version",
+        "tools",
+        "prompt"
+      ],
+      "properties": {
+        "tool_profile": {
+          "const": "pi-memory-v1"
+        },
+        "toolset_version": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "tools": {
+          "type": "array",
+          "maxItems": 7,
+          "items": {
+            "$ref": "#/$defs/tool"
+          }
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "content",
+        "usage",
+        "stopReason"
+      ],
+      "properties": {
+        "role": {
+          "const": "assistant"
+        },
+        "content": {
+          "type": "array"
+        },
+        "stopReason": {
+          "enum": [
+            "toolUse",
+            "stop",
+            "error",
+            "aborted"
+          ]
+        },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "input",
+            "output"
+          ],
+          "properties": {
+            "input": {
+              "$ref": "#/$defs/safeint"
+            },
+            "output": {
+              "$ref": "#/$defs/safeint"
+            }
+          }
+        }
+      }
+    },
+    "request": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "arguments"
+          ],
+          "properties": {
+            "op": {
+              "const": "model_begin"
+            },
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "purpose",
+                "input_digest",
+                "toolset_version"
+              ],
+              "properties": {
+                "purpose": {
+                  "enum": [
+                    "inference",
+                    "retry",
+                    "compaction"
+                  ]
+                },
+                "input_digest": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "toolset_version": {
+                  "type": "string",
+                  "pattern": "^sha256:[a-f0-9]{64}$"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "arguments"
+          ],
+          "properties": {
+            "op": {
+              "const": "model_complete"
+            },
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "attempt_id",
+                "permit",
+                "step_id",
+                "message"
+              ],
+              "properties": {
+                "attempt_id": {
+                  "$ref": "#/$defs/id"
+                },
+                "permit": {
+                  "$ref": "#/$defs/id"
+                },
+                "step_id": {
+                  "$ref": "#/$defs/id"
+                },
+                "message": {
+                  "$ref": "#/$defs/message"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "arguments"
+          ],
+          "properties": {
+            "op": {
+              "const": "tool_request"
+            },
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "call_id",
+                "name",
+                "version",
+                "toolset_version",
+                "arguments"
+              ],
+              "properties": {
+                "call_id": {
+                  "$ref": "#/$defs/native_id"
+                },
+                "name": {
+                  "enum": [
+                    "v4_tasks_list_mine_v1",
+                    "v4_knowledge_search_v1",
+                    "v4_catalog_search_v1",
+                    "v4_memory_search_v1",
+                    "v4_memory_save_v1",
+                    "v4_memory_correct_v1",
+                    "v4_memory_withdraw_v1"
+                  ]
+                },
+                "version": {
+                  "const": "1"
+                },
+                "toolset_version": {
+                  "type": "string",
+                  "pattern": "^sha256:[a-f0-9]{64}$"
+                },
+                "arguments": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "response": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "ok",
+            "result",
+            "code"
+          ],
+          "properties": {
+            "op": {
+              "const": "model_begin"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "attempt_id",
+                "step_id",
+                "permit",
+                "limits"
+              ],
+              "properties": {
+                "attempt_id": {
+                  "$ref": "#/$defs/id"
+                },
+                "step_id": {
+                  "$ref": "#/$defs/id"
+                },
+                "permit": {
+                  "$ref": "#/$defs/id"
+                },
+                "limits": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "input",
+                    "output"
+                  ],
+                  "properties": {
+                    "input": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    },
+                    "output": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    }
+                  }
+                }
+              }
+            },
+            "code": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "ok",
+            "result",
+            "code"
+          ],
+          "properties": {
+            "op": {
+              "const": "model_complete"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "committed",
+                "finished"
+              ],
+              "properties": {
+                "committed": {
+                  "const": true
+                },
+                "finished": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "code": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "ok",
+            "result",
+            "code"
+          ],
+          "properties": {
+            "op": {
+              "const": "tool_request"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "call_id",
+                "name",
+                "version",
+                "toolset_version",
+                "receipt_id",
+                "step_id",
+                "output_ref",
+                "result"
+              ],
+              "properties": {
+                "call_id": {
+                  "$ref": "#/$defs/native_id"
+                },
+                "name": {
+                  "enum": [
+                    "v4_tasks_list_mine_v1",
+                    "v4_knowledge_search_v1",
+                    "v4_catalog_search_v1",
+                    "v4_memory_search_v1",
+                    "v4_memory_save_v1",
+                    "v4_memory_correct_v1",
+                    "v4_memory_withdraw_v1"
+                  ]
+                },
+                "version": {
+                  "const": "1"
+                },
+                "toolset_version": {
+                  "type": "string",
+                  "pattern": "^sha256:[a-f0-9]{64}$"
+                },
+                "receipt_id": {
+                  "$ref": "#/$defs/id"
+                },
+                "step_id": {
+                  "$ref": "#/$defs/id"
+                },
+                "output_ref": {
+                  "type": "string",
+                  "pattern": "^sha256:[a-f0-9]{64}$"
+                },
+                "result": {
+                  "type": "object"
+                }
+              }
+            },
+            "code": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "ok",
+            "result",
+            "code"
+          ],
+          "properties": {
+            "op": {
+              "enum": [
+                "model_begin",
+                "model_complete",
+                "tool_request"
+              ]
+            },
+            "ok": {
+              "const": false
+            },
+            "result": {
+              "type": "null"
+            },
+            "code": {
+              "$ref": "#/$defs/code"
+            }
+          }
+        }
+      ]
+    },
+    "native_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,100}$"
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "description",
+        "parameters"
+      ],
+      "properties": {
+        "name": {
+          "enum": [
+            "v4_tasks_list_mine_v1",
+            "v4_knowledge_search_v1",
+            "v4_catalog_search_v1",
+            "v4_memory_search_v1",
+            "v4_memory_save_v1",
+            "v4_memory_correct_v1",
+            "v4_memory_withdraw_v1"
+          ]
+        },
+        "version": {
+          "const": "1"
+        },
+        "description": {
+          "type": "string"
+        },
+        "parameters": {
+          "type": "object"
+        }
+      }
+    },
+    "online_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.:-]+$"
+    },
+    "online_safeint": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "online_code": {
+      "enum": [
+        "host_operation_failed",
+        "protocol_error",
+        "runtime_failed"
+      ]
+    },
+    "online_sdk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine",
+        "version",
+        "adapter_contract"
+      ],
+      "properties": {
+        "engine": {
+          "const": "@earendil-works/pi-coding-agent"
+        },
+        "version": {
+          "const": "1.4.0"
+        },
+        "adapter_contract": {
+          "const": "host-run-receipt-v1"
+        }
+      }
+    },
+    "online_handshake": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sdk",
+        "profile"
+      ],
+      "properties": {
+        "sdk": {
+          "$ref": "#/$defs/online_sdk"
+        },
+        "profile": {
+          "const": "pi-memory-online-v1"
+        }
+      }
+    },
+    "online_start": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool_profile",
+        "toolset_version",
+        "tools",
+        "prompt"
+      ],
+      "properties": {
+        "tool_profile": {
+          "const": "pi-memory-v1"
+        },
+        "toolset_version": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "tools": {
+          "type": "array",
+          "maxItems": 7,
+          "items": {
+            "$ref": "#/$defs/online_tool"
+          }
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2048
+        }
+      }
+    },
+    "online_message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "content",
+        "usage",
+        "stopReason"
+      ],
+      "properties": {
+        "role": {
+          "const": "assistant"
+        },
+        "content": {
+          "type": "array"
+        },
+        "stopReason": {
+          "enum": [
+            "toolUse",
+            "stop",
+            "error",
+            "aborted"
+          ]
+        },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "input",
+            "output",
+            "cacheRead",
+            "cacheWrite"
+          ],
+          "properties": {
+            "input": {
+              "$ref": "#/$defs/online_safeint"
+            },
+            "output": {
+              "$ref": "#/$defs/online_safeint"
+            },
+            "cacheRead": {
+              "$ref": "#/$defs/online_safeint"
+            },
+            "cacheWrite": {
+              "$ref": "#/$defs/online_safeint"
+            }
+          }
+        }
+      }
+    },
+    "online_request": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "arguments"
+          ],
+          "properties": {
+            "op": {
+              "const": "model_begin"
+            },
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "purpose",
+                "input_digest",
+                "toolset_version",
+                "request_digest"
+              ],
+              "properties": {
+                "purpose": {
+                  "enum": [
+                    "inference",
+                    "retry",
+                    "compaction"
+                  ]
+                },
+                "input_digest": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "toolset_version": {
+                  "type": "string",
+                  "pattern": "^sha256:[a-f0-9]{64}$"
+                },
+                "request_digest": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "arguments"
+          ],
+          "properties": {
+            "op": {
+              "const": "model_complete"
+            },
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "attempt_id",
+                "permit",
+                "step_id",
+                "message"
+              ],
+              "properties": {
+                "attempt_id": {
+                  "$ref": "#/$defs/online_id"
+                },
+                "permit": {
+                  "$ref": "#/$defs/online_id"
+                },
+                "step_id": {
+                  "$ref": "#/$defs/online_id"
+                },
+                "message": {
+                  "$ref": "#/$defs/online_message"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "arguments"
+          ],
+          "properties": {
+            "op": {
+              "const": "tool_request"
+            },
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "call_id",
+                "name",
+                "version",
+                "toolset_version",
+                "arguments"
+              ],
+              "properties": {
+                "call_id": {
+                  "$ref": "#/$defs/online_native_id"
+                },
+                "name": {
+                  "enum": [
+                    "v4_tasks_list_mine_v1",
+                    "v4_knowledge_search_v1",
+                    "v4_catalog_search_v1",
+                    "v4_memory_search_v1",
+                    "v4_memory_save_v1",
+                    "v4_memory_correct_v1",
+                    "v4_memory_withdraw_v1"
+                  ]
+                },
+                "version": {
+                  "const": "1"
+                },
+                "toolset_version": {
+                  "type": "string",
+                  "pattern": "^sha256:[a-f0-9]{64}$"
+                },
+                "arguments": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "arguments"
+          ],
+          "properties": {
+            "op": {
+              "const": "provider_call"
+            },
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "attempt_id",
+                "step_id",
+                "permit",
+                "input_digest",
+                "request",
+                "request_digest"
+              ],
+              "properties": {
+                "attempt_id": {
+                  "$ref": "#/$defs/id"
+                },
+                "step_id": {
+                  "$ref": "#/$defs/id"
+                },
+                "permit": {
+                  "$ref": "#/$defs/id"
+                },
+                "input_digest": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "request": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "method",
+                    "path",
+                    "body"
+                  ],
+                  "properties": {
+                    "method": {
+                      "const": "POST"
+                    },
+                    "path": {
+                      "const": "/inference/go/openai/v1/chat/completions"
+                    },
+                    "body": {
+                      "type": "string",
+                      "minLength": 2,
+                      "maxLength": 131072,
+                      "description": "Raw UTF-8 JSON object text; request_digest hashes these exact bytes. Finite decimal/exponent numbers allowed inside this string; duplicate keys, nonfinite/overflow numbers and transport controls rejected. Outer wire remains safe-integer-only. Host verifies digest and semantic policy before send."
+                    }
+                  }
+                },
+                "request_digest": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "online_response": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "ok",
+            "result",
+            "code"
+          ],
+          "properties": {
+            "op": {
+              "const": "model_begin"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "attempt_id",
+                "step_id",
+                "permit",
+                "limits"
+              ],
+              "properties": {
+                "attempt_id": {
+                  "$ref": "#/$defs/online_id"
+                },
+                "step_id": {
+                  "$ref": "#/$defs/online_id"
+                },
+                "permit": {
+                  "$ref": "#/$defs/online_id"
+                },
+                "limits": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "input",
+                    "output"
+                  ],
+                  "properties": {
+                    "input": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    },
+                    "output": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    }
+                  }
+                }
+              }
+            },
+            "code": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "ok",
+            "result",
+            "code"
+          ],
+          "properties": {
+            "op": {
+              "const": "model_complete"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "committed",
+                "finished"
+              ],
+              "properties": {
+                "committed": {
+                  "const": true
+                },
+                "finished": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "code": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "ok",
+            "result",
+            "code"
+          ],
+          "properties": {
+            "op": {
+              "const": "tool_request"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "call_id",
+                "name",
+                "version",
+                "toolset_version",
+                "receipt_id",
+                "step_id",
+                "output_ref",
+                "result"
+              ],
+              "properties": {
+                "call_id": {
+                  "$ref": "#/$defs/online_native_id"
+                },
+                "name": {
+                  "enum": [
+                    "v4_tasks_list_mine_v1",
+                    "v4_knowledge_search_v1",
+                    "v4_catalog_search_v1",
+                    "v4_memory_search_v1",
+                    "v4_memory_save_v1",
+                    "v4_memory_correct_v1",
+                    "v4_memory_withdraw_v1"
+                  ]
+                },
+                "version": {
+                  "const": "1"
+                },
+                "toolset_version": {
+                  "type": "string",
+                  "pattern": "^sha256:[a-f0-9]{64}$"
+                },
+                "receipt_id": {
+                  "$ref": "#/$defs/online_id"
+                },
+                "step_id": {
+                  "$ref": "#/$defs/online_id"
+                },
+                "output_ref": {
+                  "type": "string",
+                  "pattern": "^sha256:[a-f0-9]{64}$"
+                },
+                "result": {
+                  "type": "object"
+                }
+              }
+            },
+            "code": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "ok",
+            "result",
+            "code"
+          ],
+          "properties": {
+            "op": {
+              "enum": [
+                "model_begin",
+                "model_complete",
+                "tool_request",
+                "provider_call"
+              ]
+            },
+            "ok": {
+              "const": false
+            },
+            "result": {
+              "type": "null"
+            },
+            "code": {
+              "$ref": "#/$defs/online_code"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "ok",
+            "result",
+            "code"
+          ],
+          "properties": {
+            "op": {
+              "const": "provider_call"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "status",
+                "request_id",
+                "body"
+              ],
+              "properties": {
+                "status": {
+                  "type": "integer",
+                  "minimum": 200,
+                  "maximum": 599
+                },
+                "request_id": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/$defs/id"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "body": {
+                  "type": "string",
+                  "maxLength": 131072
+                }
+              }
+            },
+            "code": {
+              "type": "null"
+            }
+          }
+        }
+      ]
+    },
+    "online_native_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,100}$"
+    },
+    "online_tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "description",
+        "parameters"
+      ],
+      "properties": {
+        "name": {
+          "enum": [
+            "v4_tasks_list_mine_v1",
+            "v4_knowledge_search_v1",
+            "v4_catalog_search_v1",
+            "v4_memory_search_v1",
+            "v4_memory_save_v1",
+            "v4_memory_correct_v1",
+            "v4_memory_withdraw_v1"
+          ]
+        },
+        "version": {
+          "const": "1"
+        },
+        "description": {
+          "type": "string"
+        },
+        "parameters": {
+          "type": "object"
+        }
+      }
+    },
+    "online": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "AGT-044 explicit v2 online wire",
+      "description": "Strict bounded UTF8/LF protocol. Native IDs, attempts, pin and committed Host receipts are bound per Run. No resume, result replay, business replay or old experimental protocol fallback. Lexical and state-machine checks supplement JSON Schema.",
+      "x-limits": {
+        "frame_bytes_including_lf": 262144,
+        "direction_bytes": 8388608,
+        "direction_frames": 256,
+        "json_depth": 32,
+        "stderr_bytes": 262144,
+        "handshake_seconds": 3,
+        "partial_frame_seconds_absolute": 5,
+        "session_seconds": 45
+      },
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "nonce",
+        "run_id",
+        "epoch",
+        "seq",
+        "type",
+        "reply_to",
+        "body"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "v4.pi-memory/2"
+        },
+        "nonce": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "run_id": {
+          "$ref": "#/$defs/online_id"
+        },
+        "epoch": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,29})$"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "type": {
+          "enum": [
+            "hello",
+            "ready",
+            "start",
+            "request",
+            "response",
+            "session_end",
+            "error"
+          ]
+        },
+        "reply_to": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 256
+        },
+        "body": {}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "enum": [
+                  "hello",
+                  "ready"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "body": {
+                "$ref": "#/$defs/online_handshake"
+              },
+              "reply_to": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "start"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "body": {
+                "$ref": "#/$defs/online_start"
+              },
+              "reply_to": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "request"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "body": {
+                "$ref": "#/$defs/online_request"
+              },
+              "reply_to": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "response"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "body": {
+                "$ref": "#/$defs/online_response"
+              },
+              "reply_to": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "session_end"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "body": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "ok",
+                      "error"
+                    ]
+                  }
+                }
+              },
+              "reply_to": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "error"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "body": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "code"
+                ],
+                "properties": {
+                  "code": {
+                    "$ref": "#/$defs/online_code"
+                  }
+                }
+              },
+              "reply_to": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ],
+      "x-stateful-requirements": [
+        "exact role/direction and next sequence",
+        "same nonce/run/epoch",
+        "single pending request and matching reply_to/op",
+        "unique tool names within start subset",
+        "attempt_id equals step_id",
+        "same pinned toolset and native ID at Host dispatch",
+        "no automatic resume or reemit"
+      ]
+    }
+  },
+  "x-online-limits": {
+    "provider_request_body_utf8_bytes": 131072,
+    "provider_response_sse_utf8_bytes": 131072,
+    "note": "Codecs additionally reject recursive transport-control keys, enforce safe integer JSON, UTF-8 byte bounds and attempt_id == step_id. SSE semantics and Host authorization are separate gates."
+  },
+  "x-online-schema": "#/$defs/online"
+}

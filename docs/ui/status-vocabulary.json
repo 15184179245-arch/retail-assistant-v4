@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": 1,
+  "updated_on": "2026-10-30",
+  "description": "零售门店智能经营系统双端跨端状态词表，Web端StatusBadge与Android端StatusBadge/Tokens同源读取比对。",
+  "rules": {
+    "success_tone_restriction": "仅 verified 状态允许使用成功色（--success / #26725e）；unverified、suggestion 等绝不得使用成功色或完成对勾 ✓；settled 仅在具有已核验证据时呈现特定状态，默认不使用成功色。",
+    "environment_separation": "development 与 production 必须严格区分，合成数据绝不冒充正式营业事实。"
+  },
+  "statuses": {
+    "development": {
+      "kind": "development",
+      "label": "开发版",
+      "description": "非营业环境",
+      "tone": "warning",
+      "icon": "⚙",
+      "allow_success_tone": false,
+      "rule": "非营业环境；与 production 严格区分，必须明确标识开发版/合成环境。"
+    },
+    "production": {
+      "kind": "production",
+      "label": "营业环境",
+      "description": "正式环境，仍需来源与时点",
+      "tone": "neutral",
+      "icon": "●",
+      "allow_success_tone": false,
+      "rule": "正式环境，必须随附来源与时点信息，不得脱离审计上下文展示。"
+    },
+    "suggestion": {
+      "kind": "suggestion",
+      "label": "建议",
+      "description": "候选或推断，需人工确认",
+      "tone": "neutral",
+      "icon": "◇",
+      "allow_success_tone": false,
+      "rule": "AI/搜索候选、图片识别、规则建议，必须标明待人工确认，禁止使用完成态绿勾。"
+    },
+    "fact": {
+      "kind": "fact",
+      "label": "已确认事实",
+      "description": "有人工确认或权威来源",
+      "tone": "info",
+      "icon": "◆",
+      "allow_success_tone": false,
+      "rule": "已有人工确认或权威来源系统凭据，作为确定性事实展示。"
+    },
+    "pending_sync": {
+      "kind": "pending_sync",
+      "label": "待同步",
+      "description": "尚未到达外部系统，不等于完成",
+      "tone": "info",
+      "icon": "↻",
+      "allow_success_tone": false,
+      "rule": "尚未到达外部系统或管家婆，本地已保存草稿但绝不等于正式营业完成。"
+    },
+    "settled": {
+      "kind": "settled",
+      "label": "已结算（外部）",
+      "description": "有外部回执或唯一核验",
+      "tone": "info",
+      "icon": "¤",
+      "allow_success_tone": false,
+      "rule": "必须具有外部系统回执或唯一核验凭据；默认使用信息色，未完成三方账实核对时不设为成功色。"
+    },
+    "verified": {
+      "kind": "verified",
+      "label": "已核验",
+      "description": "有来源、时点和核验依据",
+      "tone": "success",
+      "icon": "✓",
+      "allow_success_tone": true,
+      "rule": "有确凿来源、时点、核验人或审计回执，是全系统唯一允许使用成功色（--success）的状态。"
+    },
+    "unverified": {
+      "kind": "unverified",
+      "label": "待核实",
+      "description": "尚无核验依据，不能视为完成",
+      "tone": "warning",
+      "icon": "?",
+      "allow_success_tone": false,
+      "rule": "尚无核验依据，严禁使用成功色（--success）或完成符号（✓），必须使用警示色或问号。"
+    },
+    "waiting": {
+      "kind": "waiting",
+      "label": "等待中",
+      "description": "等待外部或人工处理",
+      "tone": "info",
+      "icon": "…",
+      "allow_success_tone": false,
+      "rule": "等待外部接口响应或人工审批，可重试但未完成。"
+    },
+    "error": {
+      "kind": "error",
+      "label": "失败",
+      "description": "有可读错误和下一步",
+      "tone": "danger",
+      "icon": "!",
+      "allow_success_tone": false,
+      "rule": "处理失败，必须提供可读中文错误说明与可行的下一步排查建议。"
+    }
+  }
+}

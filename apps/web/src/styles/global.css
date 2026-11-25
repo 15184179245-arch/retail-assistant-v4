@@ -1,0 +1,255 @@
+@import "./tokens.css";
+@import "./agent-chat.css";
+
+:root {
+  font-family: var(--font-family-base);
+  color: var(--ink);
+  background: var(--surface-subtle);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+.workspace {
+  width: min(1120px, calc(100% - 48px));
+  margin: 0 auto;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3, 14px);
+  padding: var(--space-8, 30px) 0;
+}
+
+.brand-mark {
+  display: grid;
+  width: 46px;
+  height: 46px;
+  place-items: center;
+  border-radius: var(--radius-lg, 14px);
+  background: var(--brand-primary, #173f35);
+  color: #ffffff;
+  font-size: 23px;
+  font-weight: 700;
+}
+
+.eyebrow {
+  margin: 0 0 5px;
+  color: var(--ink-eyebrow, #6b7b78);
+  font-size: var(--font-size-eyebrow, 11px);
+  font-weight: 700;
+  letter-spacing: .12em;
+}
+
+h1 {
+  margin: 0;
+  font-size: var(--font-size-h1, 18px);
+}
+
+.dev-badge {
+  margin-left: auto;
+  padding: 7px 12px;
+  border: 1px solid var(--warning-border, #e7c57c);
+  border-radius: var(--radius-pill, 999px);
+  background: var(--warning-bg, #fff6df);
+  color: var(--warning-ink, #765714);
+  font-size: var(--font-size-caption, 12px);
+  font-weight: 700;
+}
+
+.identity {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3, 12px);
+  margin-left: var(--space-3, 12px);
+  color: var(--ink-secondary, #4c5a56);
+  font-size: var(--font-size-small, 13px);
+}
+
+.link-button {
+  border: 0;
+  background: none;
+  color: #1f6f5b;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  min-height: var(--min-touch-target, 44px);
+  display: inline-flex;
+  align-items: center;
+}
+
+.welcome-card {
+  max-width: 760px;
+  margin-top: 64px;
+  padding: 48px;
+  border: 1px solid var(--border, #e4e9e8);
+  border-radius: var(--radius-xl, 20px);
+  background: var(--surface, #ffffff);
+  box-shadow: 0 14px 44px rgb(24 48 42 / 5%);
+}
+
+.welcome-card .eyebrow {
+  color: var(--success, #26725e);
+}
+
+h2 {
+  margin: 12px 0;
+  font-size: var(--font-size-display);
+  letter-spacing: -.04em;
+}
+
+.welcome-copy {
+  max-width: 520px;
+  color: var(--muted, #65736f);
+  line-height: 1.8;
+}
+
+.status-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 22px;
+  padding: 10px 13px;
+  border-radius: var(--radius-md, 10px);
+  background: var(--brand-primary-subtle, #eff7f3);
+  color: #285e4d;
+  font-size: var(--font-size-small, 13px);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #42a479;
+}
+
+.login-form {
+  display: grid;
+  gap: var(--space-4, 16px);
+  max-width: 360px;
+  margin-top: 26px;
+}
+
+.field {
+  display: grid;
+  gap: 7px;
+  color: var(--ink-secondary, #4c5a56);
+  font-size: var(--font-size-small, 13px);
+  font-weight: 600;
+}
+
+.field input {
+  width: 100%;
+  padding: 12px 13px;
+  border: 1px solid var(--border-subtle, #d7dedb);
+  border-radius: var(--radius-md, 10px);
+  background: #fbfcfc;
+  color: var(--ink, #17232b);
+  font: inherit;
+  min-height: var(--min-touch-target, 44px);
+}
+
+.field input:focus {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-offset);
+}
+
+.login-button {
+  padding: 13px 16px;
+  border: 0;
+  border-radius: var(--radius-md, 10px);
+  background: var(--brand-primary, #173f35);
+  color: #ffffff;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  min-height: var(--min-touch-target, 44px);
+}
+
+.login-button:disabled {
+  opacity: .6;
+  cursor: progress;
+}
+
+.login-error {
+  margin: 0;
+  padding: 11px 13px;
+  border-radius: 9px;
+  background: var(--danger-bg, #fdf0ed);
+  color: var(--danger, #8a3324);
+  font-size: var(--font-size-small, 13px);
+}
+
+.workspace-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2, 8px);
+  margin: 16px 0 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border-subtle, #d7dedb);
+}
+
+.workspace-nav button {
+  padding: 8px 14px;
+  border: 1px solid var(--border-subtle, #d7dedb);
+  border-radius: var(--radius-sm, 8px);
+  background: var(--surface, #ffffff);
+  color: var(--ink, #17232b);
+  font: inherit;
+  font-size: var(--font-size-small, 13px);
+  font-weight: 600;
+  cursor: pointer;
+  min-height: var(--min-touch-target, 44px);
+}
+
+.workspace-nav button:hover {
+  background: #f0f4f2;
+}
+
+.workspace-nav button.nav-active {
+  border-color: var(--brand-primary, #173f35);
+  background: var(--brand-primary, #173f35);
+  color: #ffffff;
+}
+
+footer {
+  margin: 72px 0 24px;
+  color: #88938f;
+  font-size: var(--font-size-caption, 12px);
+}
+
+@media (max-width: 600px) {
+  .workspace { width: calc(100% - 32px); }
+  .topbar { padding: 22px 0; }
+  .welcome-card { margin-top: 38px; padding: 30px 24px; }
+  footer { margin-top: 48px; }
+}
+
+/* Office Exceptions Styles (Extracted from OFC007Page) */
+.office-exceptions { color: var(--ink, #17232b); line-height: 1.6; padding-bottom: 30px; }
+.office-exceptions h2 { font-size: 28px; }
+.office-exceptions h3 { font-size: 18px; }
+.office-exceptions section { margin: 20px 0; padding: 18px; border: 1px solid var(--border, #dfe7e3); border-radius: var(--radius-md, 12px); background: #ffffff; }
+.office-exceptions section[aria-label="队列筛选"] { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; }
+.office-exceptions label { display: inline-flex; flex-direction: column; gap: 5px; margin: 5px 12px 8px 0; font-size: 14px; }
+.office-exceptions input, .office-exceptions select { border: 1px solid var(--border-subtle, #c8d5ce); border-radius: var(--radius-sm, 6px); padding: 8px; font: inherit; max-width: 100%; }
+.office-exceptions button { border: 1px solid var(--border-subtle, #b9cfc4); border-radius: var(--radius-sm, 6px); padding: 8px 12px; margin: 3px; color: var(--brand-primary, #173f35); background: var(--brand-primary-subtle, #f2f8f5); cursor: pointer; }
+.office-exceptions button:disabled { cursor: default; opacity: .48; }
+.office-exceptions ul { padding-left: 20px; }
+.office-exceptions table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+.office-exceptions th, .office-exceptions td { text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--border, #e4eae6); }
+.office-exceptions th { background: var(--surface-subtle, #f4f7f5); white-space: nowrap; }
+.office-exceptions code { font-size: 12px; }
+.office-exceptions details { margin: 12px 0; }
+

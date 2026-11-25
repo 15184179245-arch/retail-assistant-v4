@@ -1,0 +1,590 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "adapter_id": "synthetic.erp.v1",
+  "capabilities": {
+    "additionalProperties": false,
+    "properties": {
+      "adapter_id": {
+        "const": "synthetic.erp.v1",
+        "default": "synthetic.erp.v1",
+        "title": "Adapter Id",
+        "type": "string"
+      },
+      "contract_id": {
+        "const": "retail.erp-sandbox",
+        "default": "retail.erp-sandbox",
+        "title": "Contract Id",
+        "type": "string"
+      },
+      "mode": {
+        "const": "synthetic",
+        "default": "synthetic",
+        "title": "Mode",
+        "type": "string"
+      },
+      "nonce": {
+        "pattern": "^[0-9a-f]{32}$",
+        "title": "Nonce",
+        "type": "string"
+      },
+      "organization_id": {
+        "maxLength": 36,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+        "title": "Organization Id",
+        "type": "string"
+      },
+      "protocol_version": {
+        "const": 1,
+        "default": 1,
+        "title": "Protocol Version",
+        "type": "integer"
+      },
+      "signature": {
+        "pattern": "^[0-9a-f]{64}$",
+        "title": "Signature",
+        "type": "string"
+      },
+      "store_id": {
+        "maxLength": 36,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+        "title": "Store Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "organization_id",
+      "store_id",
+      "nonce",
+      "signature"
+    ],
+    "title": "SandboxCapabilities",
+    "type": "object"
+  },
+  "contract_id": "retail.erp-sandbox",
+  "description": "Generated from backend/app/modules/erp_commands/erp_003_wire.py. Synthetic loopback-only protocol; it is not a Guanjiapo official API.",
+  "dispatch_ack": {
+    "additionalProperties": false,
+    "properties": {
+      "acknowledged": {
+        "title": "Acknowledged",
+        "type": "boolean"
+      },
+      "adapter_id": {
+        "const": "synthetic.erp.v1",
+        "default": "synthetic.erp.v1",
+        "title": "Adapter Id",
+        "type": "string"
+      },
+      "batch_id": {
+        "maxLength": 36,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+        "title": "Batch Id",
+        "type": "string"
+      },
+      "contract_id": {
+        "const": "retail.erp-sandbox",
+        "default": "retail.erp-sandbox",
+        "title": "Contract Id",
+        "type": "string"
+      },
+      "input_digest": {
+        "pattern": "^[0-9a-f]{64}$",
+        "title": "Input Digest",
+        "type": "string"
+      },
+      "mode": {
+        "const": "synthetic",
+        "default": "synthetic",
+        "title": "Mode",
+        "type": "string"
+      },
+      "nonce": {
+        "pattern": "^[0-9a-f]{32}$",
+        "title": "Nonce",
+        "type": "string"
+      },
+      "organization_id": {
+        "maxLength": 36,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+        "title": "Organization Id",
+        "type": "string"
+      },
+      "protocol_version": {
+        "const": 1,
+        "default": 1,
+        "title": "Protocol Version",
+        "type": "integer"
+      },
+      "signature": {
+        "pattern": "^[0-9a-f]{64}$",
+        "title": "Signature",
+        "type": "string"
+      },
+      "store_id": {
+        "maxLength": 36,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+        "title": "Store Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "organization_id",
+      "store_id",
+      "batch_id",
+      "input_digest",
+      "acknowledged",
+      "nonce",
+      "signature"
+    ],
+    "title": "SandboxDispatchAck",
+    "type": "object"
+  },
+  "dispatch_request": {
+    "$defs": {
+      "CatalogFieldParameters": {
+        "additionalProperties": false,
+        "properties": {
+          "field_name": {
+            "enum": [
+              "display_label",
+              "specification_note"
+            ],
+            "title": "Field Name",
+            "type": "string"
+          },
+          "proposed_value": {
+            "maxLength": 400,
+            "minLength": 1,
+            "title": "Proposed Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field_name",
+          "proposed_value"
+        ],
+        "title": "CatalogFieldParameters",
+        "type": "object"
+      },
+      "PurchaseDocumentParameters": {
+        "additionalProperties": false,
+        "properties": {
+          "memo": {
+            "maxLength": 400,
+            "minLength": 1,
+            "title": "Memo",
+            "type": "string"
+          }
+        },
+        "required": [
+          "memo"
+        ],
+        "title": "PurchaseDocumentParameters",
+        "type": "object"
+      },
+      "SalesReturnParameters": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "maxLength": 400,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "SalesReturnParameters",
+        "type": "object"
+      },
+      "SandboxLineRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "catalog_field_proposal",
+              "purchase_document_proposal",
+              "sales_return_proposal"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "command_id": {
+            "maxLength": 36,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "input_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Input Digest",
+            "type": "string"
+          },
+          "intent_id": {
+            "maxLength": 36,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+            "title": "Intent Id",
+            "type": "string"
+          },
+          "line_id": {
+            "maxLength": 36,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+            "title": "Line Id",
+            "type": "string"
+          },
+          "line_no": {
+            "maximum": 50,
+            "minimum": 1,
+            "title": "Line No",
+            "type": "integer"
+          },
+          "parameters": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CatalogFieldParameters"
+              },
+              {
+                "$ref": "#/$defs/PurchaseDocumentParameters"
+              },
+              {
+                "$ref": "#/$defs/SalesReturnParameters"
+              }
+            ],
+            "title": "Parameters"
+          },
+          "parameters_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Parameters Digest",
+            "type": "string"
+          },
+          "request_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Request Digest",
+            "type": "string"
+          },
+          "source_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Sha256",
+            "type": "string"
+          },
+          "target_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Target Digest",
+            "type": "string"
+          },
+          "target_id": {
+            "maxLength": 36,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+            "title": "Target Id",
+            "type": "string"
+          },
+          "target_kind": {
+            "enum": [
+              "catalog_product",
+              "purchase_intent",
+              "sales_draft"
+            ],
+            "title": "Target Kind",
+            "type": "string"
+          },
+          "target_version": {
+            "maximum": 2147483647,
+            "minimum": 1,
+            "title": "Target Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "line_id",
+          "line_no",
+          "intent_id",
+          "command_id",
+          "request_digest",
+          "action",
+          "target_kind",
+          "target_id",
+          "target_version",
+          "target_digest",
+          "source_sha256",
+          "parameters",
+          "parameters_digest",
+          "input_digest"
+        ],
+        "title": "SandboxLineRequest",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "properties": {
+      "adapter_id": {
+        "const": "synthetic.erp.v1",
+        "default": "synthetic.erp.v1",
+        "title": "Adapter Id",
+        "type": "string"
+      },
+      "batch_id": {
+        "maxLength": 36,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+        "title": "Batch Id",
+        "type": "string"
+      },
+      "contract_id": {
+        "const": "retail.erp-sandbox",
+        "default": "retail.erp-sandbox",
+        "title": "Contract Id",
+        "type": "string"
+      },
+      "input_digest": {
+        "pattern": "^[0-9a-f]{64}$",
+        "title": "Input Digest",
+        "type": "string"
+      },
+      "lines": {
+        "items": {
+          "$ref": "#/$defs/SandboxLineRequest"
+        },
+        "maxItems": 50,
+        "minItems": 1,
+        "title": "Lines",
+        "type": "array"
+      },
+      "mode": {
+        "const": "synthetic",
+        "default": "synthetic",
+        "title": "Mode",
+        "type": "string"
+      },
+      "organization_id": {
+        "maxLength": 36,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+        "title": "Organization Id",
+        "type": "string"
+      },
+      "protocol_version": {
+        "const": 1,
+        "default": 1,
+        "title": "Protocol Version",
+        "type": "integer"
+      },
+      "store_id": {
+        "maxLength": 36,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+        "title": "Store Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "organization_id",
+      "store_id",
+      "batch_id",
+      "input_digest",
+      "lines"
+    ],
+    "title": "SandboxDispatchRequest",
+    "type": "object"
+  },
+  "envelope_fields": [
+    "success",
+    "data",
+    "code",
+    "error",
+    "user_message",
+    "hint"
+  ],
+  "mode": "synthetic",
+  "protocol_version": 1,
+  "readback_receipt": {
+    "$defs": {
+      "SandboxReadbackLine": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "maxLength": 36,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^[A-Z][A-Z0-9_]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Code"
+          },
+          "external_ref": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "External Ref"
+          },
+          "input_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Input Digest",
+            "type": "string"
+          },
+          "intent_id": {
+            "maxLength": 36,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+            "title": "Intent Id",
+            "type": "string"
+          },
+          "line_id": {
+            "maxLength": 36,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+            "title": "Line Id",
+            "type": "string"
+          },
+          "line_no": {
+            "maximum": 50,
+            "minimum": 1,
+            "title": "Line No",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "accepted",
+              "rejected",
+              "unknown"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "line_id",
+          "line_no",
+          "intent_id",
+          "command_id",
+          "input_digest",
+          "status"
+        ],
+        "title": "SandboxReadbackLine",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "properties": {
+      "adapter_id": {
+        "const": "synthetic.erp.v1",
+        "default": "synthetic.erp.v1",
+        "title": "Adapter Id",
+        "type": "string"
+      },
+      "batch_id": {
+        "maxLength": 36,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+        "title": "Batch Id",
+        "type": "string"
+      },
+      "contract_id": {
+        "const": "retail.erp-sandbox",
+        "default": "retail.erp-sandbox",
+        "title": "Contract Id",
+        "type": "string"
+      },
+      "input_digest": {
+        "pattern": "^[0-9a-f]{64}$",
+        "title": "Input Digest",
+        "type": "string"
+      },
+      "lines": {
+        "items": {
+          "$ref": "#/$defs/SandboxReadbackLine"
+        },
+        "maxItems": 50,
+        "minItems": 1,
+        "title": "Lines",
+        "type": "array"
+      },
+      "mode": {
+        "const": "synthetic",
+        "default": "synthetic",
+        "title": "Mode",
+        "type": "string"
+      },
+      "nonce": {
+        "pattern": "^[0-9a-f]{32}$",
+        "title": "Nonce",
+        "type": "string"
+      },
+      "organization_id": {
+        "maxLength": 36,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+        "title": "Organization Id",
+        "type": "string"
+      },
+      "protocol_version": {
+        "const": 1,
+        "default": 1,
+        "title": "Protocol Version",
+        "type": "integer"
+      },
+      "signature": {
+        "pattern": "^[0-9a-f]{64}$",
+        "title": "Signature",
+        "type": "string"
+      },
+      "store_id": {
+        "maxLength": 36,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+        "title": "Store Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "organization_id",
+      "store_id",
+      "batch_id",
+      "input_digest",
+      "lines",
+      "nonce",
+      "signature"
+    ],
+    "title": "SandboxReadbackReceipt",
+    "type": "object"
+  },
+  "signature_algorithm": {
+    "comparison": "constant-time",
+    "name": "HMAC-SHA256",
+    "nonce_header": "X-Sandbox-Nonce",
+    "secret_header": "X-Sandbox-Key",
+    "signature_format": "lowercase hex, 64 characters",
+    "signed_bytes": "UTF-8 canonical JSON of response data with the signature key removed (sorted keys, compact separators, no NaN)"
+  },
+  "title": "ERP-003 synthetic ERP sandbox wire contract v1"
+}

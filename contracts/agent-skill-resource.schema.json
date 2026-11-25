@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:v4:agent-skill-resource:1",
+  "title": "P1-A immutable resource DRAFT manifest (not executable)",
+  "$comment": "Host additionally rejects duplicate JSON keys, invalid UTF-8/NUL/blank strings and bool-as-int; validates UTF-8 byte limits (description 512, canonical C 16384), current approved public source/whole-ancestor provenance and raw SHA. This schema alone is never authorization or SDK acceptance.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "organization_id",
+    "store_id",
+    "skill_key",
+    "release_tag",
+    "sdk_name",
+    "description",
+    "resources"
+  ],
+  "properties": {
+    "contract": {
+      "const": "pi-skill-resource/1"
+    },
+    "organization_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 36
+    },
+    "store_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 36
+    },
+    "skill_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "pattern": "^pi-resource\\.[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "release_tag": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "sdk_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "resources": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "logical_path",
+          "knowledge_entry_id",
+          "revision_id",
+          "raw_utf8_bytes",
+          "raw_sha256"
+        ],
+        "properties": {
+          "logical_path": {
+            "const": "SKILL.md"
+          },
+          "knowledge_entry_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 36
+          },
+          "revision_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 36
+          },
+          "raw_utf8_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 32768
+          },
+          "raw_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OPS-008 CANDIDATE Linux catalog/search declaration",
+  "description": "Offline declaration contract only. No release authority, evidence authenticity, approval, environment verification or platform/device conditional gate coverage. The stdlib CLI is not a general JSON Schema engine.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "capabilities",
+    "source_sha256",
+    "build_sha256",
+    "config_sha256",
+    "environment",
+    "gate_evidence"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "const": "catalog_search"
+      }
+    },
+    "source_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "build_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "config_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "target_os"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "\\S"
+        },
+        "target_os": {
+          "const": "linux"
+        }
+      }
+    },
+    "gate_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_host",
+        "target_pg",
+        "identity_permissions",
+        "backup_restore",
+        "reproducible_version",
+        "health_monitoring",
+        "rollback",
+        "cat004_authorized_samples_and_sources",
+        "srch003_store_queries_and_offline",
+        "catalog_search_permissions_and_data_scope"
+      ],
+      "properties": {
+        "target_host": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "\\S"
+          },
+          "description": "Target-host evidence declaration; actual host identity is not verified."
+        },
+        "target_pg": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "\\S"
+          },
+          "description": "Target PostgreSQL evidence declaration."
+        },
+        "identity_permissions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "\\S"
+          },
+          "description": "Identity and permissions evidence declaration."
+        },
+        "backup_restore": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "\\S"
+          },
+          "description": "Backup and restoration evidence declaration."
+        },
+        "reproducible_version": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "\\S"
+          },
+          "description": "Reproducible version evidence including ALL applicable reproducible builds; version strings/digests alone do not replace this gate."
+        },
+        "health_monitoring": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "\\S"
+          },
+          "description": "Health-monitoring evidence declaration."
+        },
+        "rollback": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "\\S"
+          },
+          "description": "Rollback evidence declaration."
+        },
+        "cat004_authorized_samples_and_sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "\\S"
+          },
+          "description": "CAT-004 authorized real samples and source validation evidence declaration."
+        },
+        "srch003_store_queries_and_offline": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "\\S"
+          },
+          "description": "SRCH-003 in-store queries and offline behavior evidence declaration."
+        },
+        "catalog_search_permissions_and_data_scope": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "\\S"
+          },
+          "description": "Actual catalog/search permissions and data-scope evidence declaration."
+        }
+      }
+    }
+  },
+  "$comment": "Candidate CLI additionally enforces bounded regular-file reading, rejects duplicate JSON keys and non-finite constants, and requires schema_version to decode as int (not float or bool). A general JSON Schema engine has not been executed."
+}

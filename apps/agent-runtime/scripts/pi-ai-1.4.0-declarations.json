@@ -1,0 +1,170 @@
+{
+  "amazon-bedrock.models.d.ts": {
+    "original": "f9bbaccb4dfb604835a05addfe9e114b7ab554142ba14965da96756630ce0fb9",
+    "patched": "cc755f9bdfcaaf54ac06c164337e2a122f19ac0659f69d9e7786e62898ebf1e2"
+  },
+  "ant-ling.models.d.ts": {
+    "original": "6c42e276e84e815b2a96fe59dde716fa853ef6ffe9e91b1f33bcbd3170a67161",
+    "patched": "041acadfa64a5ae022024f6474d6ebcfbe032ae222306f98849e15f40c3e125c"
+  },
+  "anthropic.models.d.ts": {
+    "original": "5716a56c158d2ed854c4ea54e2d586a356886351ad7b628b611ecabaff283571",
+    "patched": "d84b4e10a56fcdd2009f2fdd00304ade4924d3927e8cec89f381ece85683e587"
+  },
+  "azure.models.d.ts": {
+    "original": "ddfca18728b322b0d396b958f4ac2a1bd3705f9283bdba8280bfb2acafeaff7f",
+    "patched": "5d517b8eca4369d0d75a74c7610d448d5c6586a338c46da91f900a23dd43db80"
+  },
+  "baseten.models.d.ts": {
+    "original": "348ab441fd1f9aad6c2fa0a41803383d1c4492802d433a479b18683991f35bd4",
+    "patched": "fab605dea2ca3cf8d9dfc23784a4df3d7f3e71e1dc3e8a25b7d439ea6c700c9a"
+  },
+  "cerebras.models.d.ts": {
+    "original": "7405e41f021629f7b79645b3f940c0686488339935332df5f8e5c205b61c94bf",
+    "patched": "ba681bbeddd47fa1f6efbecac82fa74b7fe4ac5cb3f8be20a1772e074943e093"
+  },
+  "cloudflare-ai-gateway.models.d.ts": {
+    "original": "304d9663628935d84749c52e4390013680b57b839f9603975b914e7b350a5f3e",
+    "patched": "a4c8ab2d2fdb51cfadae8c807567c97cb245ad3031481107b3be276398c22f69"
+  },
+  "cloudflare-workers-ai.models.d.ts": {
+    "original": "16a86e738a9bd3f081ba4d74a0d20cc252599260e4f59f76ea32cc5042dac7ee",
+    "patched": "d8fde80d0e3cffcb70b5a3765b05d022fcd7f196b3147cf6b87850ff56564cc4"
+  },
+  "deepseek.models.d.ts": {
+    "original": "84c756d33897450e1349ceec787387dbdd2b3b20f07f4e5837d2896cce2590bd",
+    "patched": "8eabf5ad71e18dec49f14207703b7b864bf6b2ccf2cff929da2ba9668b818251"
+  },
+  "fireworks.models.d.ts": {
+    "original": "3d80673b01670d38bdf3ab5d7623d4be221f35c2ce88af967fe12e4f345cb2fb",
+    "patched": "e726f1a231f2a46369f56c24470b20c1ca8219912be7f051eece1826f13bcb14"
+  },
+  "github-copilot.models.d.ts": {
+    "original": "9bf419386222c85540b548d23c98ce0b201896dc729fb2738386f3811bb8a347",
+    "patched": "aa636561f670605f4e15582f9b6787d40da06d253505ba82f5694e13ef71e6ec"
+  },
+  "google-vertex.models.d.ts": {
+    "original": "5aa5cb075dfa0df9dc59a656273fc9e11ead1d6dc9ff429c280051dad71c5817",
+    "patched": "02509cb7a5ce609cacebd3cf5e2d7cd1f17ec263f3ed3a7d89842584885474fc"
+  },
+  "google.models.d.ts": {
+    "original": "3f66b4a6446cfb7d3c3daa32b1db7aa1cbe4e532bed1786b49d30cdda78e2a7d",
+    "patched": "ecc1c0a7327c707ad379ed958c90f44da7b360a164d1d56c6ba87b7379f7591c"
+  },
+  "groq.models.d.ts": {
+    "original": "4463d153d9b7934ed68fb3669da55caf2d58f8cbf7ebf1c5907f1b2013cf484a",
+    "patched": "a76d33cfc591cf8c438adf33353d3d567da626ff20563a2c334906985f92b617"
+  },
+  "huggingface.models.d.ts": {
+    "original": "cb2a8d6ed22849cf37f5fce197e332827562b02491a95347a33c7d93d037300a",
+    "patched": "ddb88969bc28410404d082ac5639ca6a950aa857beb18d0df8ef24d5fe6f7ad0"
+  },
+  "kimi-coding.models.d.ts": {
+    "original": "f32a4f4881f8dfbf36029210ca95c8d79a13a8ed547e150aee1dca41497769c2",
+    "patched": "0d34193857579b4010dd545d20d08c39946bf6a5ee1cc967f299198a3cd0543c"
+  },
+  "meta.models.d.ts": {
+    "original": "b306641f42d52cb61a8795fffff6f5c27eff3023aba0b216b50b35a7e1af6550",
+    "patched": "b2f3ce346446b571385797db866f1e4e5431d0c99ae94dfc1cdd71accb9b15aa"
+  },
+  "minimax-cn.models.d.ts": {
+    "original": "3ab4c501ea2ceaac0942885e04f950c8d8331701bdb919b1b4737cad63341703",
+    "patched": "48262e1845c4589f9bb611d5bef1f03ce94d7b5828ab36a11010e37a2d42a034"
+  },
+  "minimax.models.d.ts": {
+    "original": "9259fb772bc21b7083d426474f71bc92d8712aabb0062ecb3b1660f47fa8d9a3",
+    "patched": "841ea3b113ec501d996587326aeb65f19063b5770fb9641179bf47e2b38261a7"
+  },
+  "mistral.models.d.ts": {
+    "original": "edd4c3edb2d4fbcc9aa7a6380409fe40ac1d92ab4291b6ddfe796e4ab5b92788",
+    "patched": "0749fcb44510664fa7026adb85714ecb4f6927bb6ead882d72a6bda6d5fb2dab"
+  },
+  "moonshotai-cn.models.d.ts": {
+    "original": "940d9549758b6aafb152493458182d2cac316a7bec8f094dc8a2e2f4383816d8",
+    "patched": "0ae31b13e6152a3cd779656daf7f68f7aaae2c2694c52728af41faf6d5291671"
+  },
+  "moonshotai.models.d.ts": {
+    "original": "26f9e98bcaa1d33ca3db230f389d67f23c266ae5e8591f0aa333dc4bc1e12767",
+    "patched": "27166a981d95c7b44a6ef19e16db0f416eba6042bb75636361374a9a120dcf24"
+  },
+  "nvidia.models.d.ts": {
+    "original": "4dc7bef5ac3ec5fe682e916066578bc12bfcc494c5f4562e8ffb006dd246e16b",
+    "patched": "ab1fb8edf0c97f9454e83ddb6d5fedf7b80d43069385e73be6e5acef7fdae14a"
+  },
+  "openai-codex.models.d.ts": {
+    "original": "a52d465ce5857d1af2d35c5c834e1c02ddf2e3a11c5a1220a70937d3b3b80a31",
+    "patched": "acb25b3cfe5ea5e47bceb7a685303786a5eac8ac6039ada6a023b54027c3296b"
+  },
+  "openai.models.d.ts": {
+    "original": "439137a5bb74930434a12c513bb0139c7a9015afdf74bced0b7767312b68a3e4",
+    "patched": "662e15021db148ce5d8c558abfd137799361e9e79569cf0edd57b9b00ba678bb"
+  },
+  "opencode-go.models.d.ts": {
+    "original": "e53f4cad7785fa3401eb1af9344caec11804a245cebde85339a1efe265f78129",
+    "patched": "db237a3096045ce1b3a58d3a3a291c7fb951faef8afd823b5b6e47a5bc27a412"
+  },
+  "opencode.models.d.ts": {
+    "original": "8f56b0578368eb7d3e36bae2937e28957cd20ca93362af1e8f247759a3d4b4b7",
+    "patched": "ad59e35377515084c6738c46ec930c272e7bba06de26633d79948e24d5386937"
+  },
+  "openrouter.models.d.ts": {
+    "original": "2dc5979e9b14905bd652f63c47dab776e300b33d10b1042a3072ca2a89adef1d",
+    "patched": "007e7ddddbbc7bd78da32d92f0ccd117adb1d6a16ef690759a1ed449e344bd52"
+  },
+  "qwen-token-plan-cn.models.d.ts": {
+    "original": "40b9907385a7536e592fcffb5784f6a7f85760242b859c5b32f51daeb41f9f2d",
+    "patched": "020c4095e5dbc33d122b3375f8777f36dacb99a166661610a4d878d1c7edf885"
+  },
+  "qwen-token-plan-individual.models.d.ts": {
+    "original": "f8aeba3b60a82e5b73a1d08c32bf1408fd0f30b35761b09d794886a3d7237088",
+    "patched": "723b9c0125ae3f4fc163f98e02f03b60df90e82fd3be86b03f684d1e339d5977"
+  },
+  "qwen-token-plan.models.d.ts": {
+    "original": "cf556ae5857082817e3faa6ca83ba45cc9fd75bd697da0a4e0ca589676810622",
+    "patched": "95a64c03e1b1ff4cdd4de20cdd37525ca7f3b677aa877ce1a3710fdf4de1bfea"
+  },
+  "radius.models.d.ts": {
+    "original": "7edc96239f4789846118fba9276796dacbeb9d662629043a3aa46fd184126a22",
+    "patched": "9293b3420e229a5ad49fd64979a06330ed896cfaab4fe9ac858526e52fde88b2"
+  },
+  "together.models.d.ts": {
+    "original": "5f1f01af7dbfc461b328d97e72d80c09383350475ef61663cf6dd248bfa1ba57",
+    "patched": "12ef99bd02efd23f41d616696b06fb31db0abccb6e6dc7258edbed37cbe2874e"
+  },
+  "typesafe.models.d.ts": {
+    "original": "b8579a2f3bf2dd435ea3f71fcde89a2a91cdd5651f85e8279d80618453aad541",
+    "patched": "af4ef1a6b87c1354c5dfe349002c1f9c8bfda286ab432d6d7dd34e0c64afe5b7"
+  },
+  "vercel-ai-gateway.models.d.ts": {
+    "original": "5d55ff0da91c7f7da0ba9e33412cafd45b6636bbb58147abb157b7c3c5ab1121",
+    "patched": "1396d5adce099cd2ce984f98f12542ec8606d74ac99b12b9ba64184107e6ddbc"
+  },
+  "xai.models.d.ts": {
+    "original": "533c26f75a6f497cb9c541baee26ecbe5db3b1882b218e9f007e91f289996c6c",
+    "patched": "fee69c359fe7a9b2ecb881f5393340c7b2d62ca089689b990236ba74e2f5ebad"
+  },
+  "xiaomi-token-plan-ams.models.d.ts": {
+    "original": "ff645be4cc571e4481d8d2ea4b7d66f66bf77eeda046ee743eb26febfde56031",
+    "patched": "5959d15e98bb0c9acde77371fb6f6b82416d431c75f22c90b2ff2a580e8c0663"
+  },
+  "xiaomi-token-plan-cn.models.d.ts": {
+    "original": "8ee6488388fc7f031ac725bd5f199fa5d8b45e937c4619f99be547c7c2760085",
+    "patched": "48f2e90d500e7369eb710adca3fa3b020175b0f423c7ab0cf4dd30ecd2cc2aa9"
+  },
+  "xiaomi-token-plan-sgp.models.d.ts": {
+    "original": "565d4e3b1da1b6a6e59ae5b82e8ce8b7b2e3b463d95175b5292d263ada9ee8c4",
+    "patched": "191175d2a663a37016f69a26109f996e6ad0145ea0942ad8d36dfc440168efc4"
+  },
+  "xiaomi.models.d.ts": {
+    "original": "01a4127bcf26e6486117401b9b0dc84b029c9a47513757e8936ad509b128d5b9",
+    "patched": "62d419c51c7e0b55746c60c7fed12d8bda7fee0257ba7f61285408d61bfcd97a"
+  },
+  "zai-coding-cn.models.d.ts": {
+    "original": "f4beb944fa7fecb2997561640601d0bb86422f6ada631f70bb150bb7525e4fae",
+    "patched": "59a9d9f5a9d805cd65f68eb954854140663b64ab6a5974660ba9b8c75164b7c9"
+  },
+  "zai.models.d.ts": {
+    "original": "1571a7c377bc97e033766aad30d74888d4928689aa10e8364c4302b184527d2c",
+    "patched": "45e071166be0cbf036fe89cf8d05fa64012de51bd50fff4697a2a28f0beb3bb5"
+  }
+}
